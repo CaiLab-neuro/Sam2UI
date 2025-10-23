@@ -77,6 +77,7 @@ class SAM2VideoUI:
         self.object_colors = {}  # Dynamic color assignment
         self.refinement_mode = False
         self.selected_frames_for_refinement = set()
+        self.point_removal_mode = False
         
         # Multi-frame annotation mode (always enabled)
         self.multi_frame_annotation_mode = True
@@ -314,8 +315,19 @@ class SAM2VideoUI:
                   command=self.segment_video, width=15).pack(fill=tk.X, pady=2)
         ttk.Button(seg_frame, text="Refine Segment", 
                   command=self.toggle_refinement_mode, width=15).pack(fill=tk.X, pady=2)
-        ttk.Button(seg_frame, text="Clear All Points", 
-                  command=self.clear_points, width=15).pack(fill=tk.X, pady=2)
+        
+        # Point management buttons
+        point_mgmt_frame = ttk.Frame(seg_frame)
+        point_mgmt_frame.pack(fill=tk.X, pady=2)
+        
+        ttk.Button(point_mgmt_frame, text="Remove Point", 
+                  command=self.toggle_point_removal_mode, width=12).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(point_mgmt_frame, text="Clear All", 
+                  command=self.clear_points, width=12).pack(side=tk.LEFT)
+        
+        ttk.Button(seg_frame, text="Show Frame Points", 
+                  command=self.show_frame_points, width=15).pack(fill=tk.X, pady=2)
+        
         ttk.Button(seg_frame, text="Export Annotations", 
                   command=self.export_annotations, width=15).pack(fill=tk.X, pady=2)
         ttk.Button(seg_frame, text="Import Annotations", 
@@ -328,6 +340,10 @@ class SAM2VideoUI:
         # Refinement mode indicator
         self.refinement_label = ttk.Label(seg_frame, text="", foreground='orange')
         self.refinement_label.pack(pady=2)
+        
+        # Point removal mode indicator
+        self.point_removal_label = ttk.Label(seg_frame, text="", foreground='red')
+        self.point_removal_label.pack(pady=2)
         
         # Export controls
         export_frame = ttk.LabelFrame(scrollable_frame, text="Export", padding=10)
@@ -760,8 +776,8 @@ class SAM2VideoUI:
     def toggle_multi_frame_annotation(self):
         """Multi-frame annotation mode is always enabled"""
         # Multi-frame annotation is always active, no need to toggle
-            self.multi_frame_label.config(text="MULTI-FRAME ANNOTATION ACTIVE")
-            self.status_label.config(text="Multi-frame mode: Navigate to different frames and add points, then segment")
+        self.multi_frame_label.config(text="MULTI-FRAME ANNOTATION ACTIVE")
+        self.status_label.config(text="Multi-frame mode: Navigate to different frames and add points, then segment")
     
     def toggle_refinement_mode(self):
         """Toggle refinement mode for improving segmentation"""
@@ -779,6 +795,67 @@ class SAM2VideoUI:
             self.status_label.config(text="Refinement mode disabled")
             if hasattr(self, 'select_frame_button'):
                 self.select_frame_button.state(["disabled"])  # disable
+    
+    def toggle_point_removal_mode(self):
+        """Toggle point removal mode for removing individual annotation points"""
+        self.point_removal_mode = not self.point_removal_mode
+        
+        if self.point_removal_mode:
+            self.point_removal_label.config(text="POINT REMOVAL MODE ACTIVE")
+            self.status_label.config(text="Point removal mode: Click on annotation points to remove them")
+            # Disable other modes
+            self.refinement_mode = False
+            self.refinement_label.config(text="")
+        else:
+            self.point_removal_label.config(text="")
+            self.status_label.config(text="Point removal mode disabled")
+    
+    def remove_point_at_location(self, x, y, frame_idx):
+        """Remove the closest annotation point to the given location"""
+        if not self.click_points:
+            return False
+        
+        # Find points on the current frame
+        frame_points = [(i, point) for i, point in enumerate(self.click_points) 
+                       if point[4] == frame_idx]  # point[4] is frame_idx
+        
+        if not frame_points:
+            return False
+        
+        # Find the closest point to the click location
+        min_distance = float('inf')
+        closest_point_idx = None
+        
+        for point_idx, (px, py, is_pos, obj_id, f_idx) in frame_points:
+            # Calculate distance from click to point
+            distance = ((x - px) ** 2 + (y - py) ** 2) ** 0.5
+            
+            if distance < min_distance:
+                min_distance = distance
+                closest_point_idx = point_idx
+        
+        # Only remove if click is close enough to a point (within 20 pixels)
+        if closest_point_idx is not None and min_distance <= 20:
+            removed_point = self.click_points.pop(closest_point_idx)
+            px, py, is_pos, obj_id, f_idx = removed_point
+            
+            # Update annotated frames if no more points on this frame
+            remaining_points_on_frame = [p for p in self.click_points if p[4] == frame_idx]
+            if not remaining_points_on_frame:
+                self.annotated_frames.discard(frame_idx)
+            
+            # Update object list and display
+            self.update_object_list()
+            self.display_current_frame()
+            
+            # Show confirmation
+            point_type = "positive" if is_pos else "negative"
+            obj_name = self.object_names.get(obj_id, f"Object_{obj_id}")
+            self.status_label.config(text=f"Removed {point_type} point for {obj_name} at ({px:.0f}, {py:.0f})")
+            
+            return True
+        
+        return False
             
     def toggle_frame_selection(self):
         """Toggle current frame selection for refinement"""
@@ -1166,12 +1243,50 @@ class SAM2VideoUI:
         self.frame_label.config(text=frame_text)
         
     def on_canvas_click(self, event):
-        """Handle left mouse click (positive point)"""
-        self.add_click_point(event, is_positive=True)
+        """Handle left mouse click (positive point or point removal)"""
+        if self.point_removal_mode:
+            self.handle_point_removal_click(event)
+        else:
+            self.add_click_point(event, is_positive=True)
         
     def on_canvas_right_click(self, event):
-        """Handle right mouse click (negative point)"""
-        self.add_click_point(event, is_positive=False)
+        """Handle right mouse click (negative point or point removal)"""
+        if self.point_removal_mode:
+            self.handle_point_removal_click(event)
+        else:
+            self.add_click_point(event, is_positive=False)
+    
+    def handle_point_removal_click(self, event):
+        """Handle click in point removal mode"""
+        if not self.frames or not self.current_frame_idx < len(self.frames):
+            return
+            
+        # Get canvas coordinates
+        canvas_x = self.canvas.canvasx(event.x)
+        canvas_y = self.canvas.canvasy(event.y)
+        
+        # Convert to image coordinates
+        if self.scale_factor > 0:
+            canvas_width = self.canvas.winfo_width()
+            canvas_height = self.canvas.winfo_height()
+            
+            # Account for centering
+            img_display_width = int(self.current_frame.shape[1] * self.scale_factor)
+            img_display_height = int(self.current_frame.shape[0] * self.scale_factor)
+            
+            offset_x = (canvas_width - img_display_width) // 2
+            offset_y = (canvas_height - img_display_height) // 2
+            
+            img_x = (canvas_x - offset_x) / self.scale_factor
+            img_y = (canvas_y - offset_y) / self.scale_factor
+            
+            # Check if click is within image bounds
+            if 0 <= img_x < self.current_frame.shape[1] and 0 <= img_y < self.current_frame.shape[0]:
+                # Try to remove a point at this location
+                if not self.remove_point_at_location(img_x, img_y, self.current_frame_idx):
+                    self.status_label.config(text="No annotation point found near this location")
+        else:
+            self.status_label.config(text="Cannot remove points: invalid scale factor")
         
     def add_click_point(self, event, is_positive=True):
         """Add click point for segmentation"""
@@ -1475,9 +1590,143 @@ class SAM2VideoUI:
                                     setattr(self.sam2_model, attr_name, attr.to(dtype=torch.float32))
                             except:
                                 pass  # Skip if not convertible
+                
+                # Force the entire model to float32 recursively
+                self._recursive_float32_conversion(self.sam2_model)
                                 
         except Exception as e:
             print(f"Warning: Could not force model to float32: {e}")
+    
+    def _recursive_float32_conversion(self, obj):
+        """Recursively convert all tensors in an object to float32"""
+        try:
+            if hasattr(obj, 'to') and hasattr(obj, 'dtype'):
+                if obj.dtype != torch.float32:
+                    obj.data = obj.data.to(dtype=torch.float32)
+            elif hasattr(obj, '__dict__'):
+                for attr_name, attr_value in obj.__dict__.items():
+                    if not attr_name.startswith('_'):
+                        self._recursive_float32_conversion(attr_value)
+            elif isinstance(obj, (list, tuple)):
+                for item in obj:
+                    self._recursive_float32_conversion(item)
+            elif isinstance(obj, dict):
+                for value in obj.values():
+                    self._recursive_float32_conversion(value)
+        except Exception as e:
+            pass  # Skip if conversion fails
+    
+    def _patch_model_for_float32(self):
+        """Patch the model to force float32 operations"""
+        try:
+            if hasattr(self, 'sam2_model') and self.sam2_model is not None:
+                # Patch the model's forward method to force float32
+                if hasattr(self.sam2_model, 'model'):
+                    original_forward = self.sam2_model.model.forward
+                    
+                    def float32_forward(*args, **kwargs):
+                        # Convert all tensor inputs to float32
+                        new_args = []
+                        for arg in args:
+                            if isinstance(arg, torch.Tensor):
+                                if arg.dtype != torch.float32:
+                                    new_args.append(arg.to(dtype=torch.float32))
+                                else:
+                                    new_args.append(arg)
+                            else:
+                                new_args.append(arg)
+                        
+                        # Convert tensor kwargs to float32
+                        new_kwargs = {}
+                        for key, value in kwargs.items():
+                            if isinstance(value, torch.Tensor):
+                                if value.dtype != torch.float32:
+                                    new_kwargs[key] = value.to(dtype=torch.float32)
+                                else:
+                                    new_kwargs[key] = value
+                            else:
+                                new_kwargs[key] = value
+                        
+                        # Call original forward with float32 tensors
+                        return original_forward(*new_args, **new_kwargs)
+                    
+                    # Replace the forward method
+                    self.sam2_model.model.forward = float32_forward
+                    
+                    print("Model forward method patched for float32")
+                    
+        except Exception as e:
+            print(f"Warning: Could not patch model for float32: {e}")
+    
+    def _disable_mixed_precision_globally(self):
+        """Disable mixed precision globally to prevent dtype issues"""
+        try:
+            # Set environment variables to disable mixed precision
+            import os
+            os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128'
+            
+            # Disable autocast globally
+            if hasattr(torch, 'autocast'):
+                torch.backends.cudnn.allow_tf32 = False
+                torch.backends.cuda.matmul.allow_tf32 = False
+                torch.backends.cudnn.benchmark = False
+                
+            print("Mixed precision disabled globally")
+            
+        except Exception as e:
+            print(f"Warning: Could not disable mixed precision globally: {e}")
+    
+    def _force_float32_context(self):
+        """Context manager that forces all operations to float32"""
+        class Float32Context:
+            def __init__(self, parent):
+                self.parent = parent
+                self.original_autocast = None
+                
+            def __enter__(self):
+                # Disable autocast completely
+                if hasattr(torch, 'autocast'):
+                    self.original_autocast = torch.autocast(enabled=False)
+                    self.original_autocast.__enter__()
+                
+                # Force model to float32
+                self.parent._force_model_float32()
+                
+                return self
+                
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                # Restore autocast
+                if self.original_autocast:
+                    self.original_autocast.__exit__(exc_type, exc_val, exc_tb)
+        
+        return Float32Context(self)
+    
+    def show_frame_points(self):
+        """Show a list of annotation points on the current frame"""
+        if not self.click_points:
+            messagebox.showinfo("No Points", "No annotation points found on any frame.")
+            return
+        
+        # Get points on current frame
+        current_frame_points = [point for point in self.click_points 
+                              if point[4] == self.current_frame_idx]
+        
+        if not current_frame_points:
+            messagebox.showinfo("No Points", f"No annotation points found on frame {self.current_frame_idx + 1}.")
+            return
+        
+        # Create a simple dialog showing the points
+        points_info = f"Annotation points on frame {self.current_frame_idx + 1}:\n\n"
+        
+        for i, (x, y, is_pos, obj_id, frame_idx) in enumerate(current_frame_points):
+            point_type = "Positive" if is_pos else "Negative"
+            obj_name = self.object_names.get(obj_id, f"Object_{obj_id}")
+            points_info += f"{i+1}. {point_type} point for {obj_name} at ({x:.0f}, {y:.0f})\n"
+        
+        points_info += f"\nTotal: {len(current_frame_points)} points on this frame"
+        points_info += f"\nTotal: {len(self.click_points)} points on all frames"
+        
+        messagebox.showinfo("Frame Points", points_info)
     
     def _prepare_tensors_for_inference(self, points, labels):
         """Prepare points and labels tensors with consistent dtype and device"""
@@ -1691,14 +1940,56 @@ class SAM2VideoUI:
                             
                             # Disable autocast to prevent dtype mismatches
                             with self._disable_autocast_for_inference():
-                                # Add points for this object at this frame
-                                _ = self.sam2_model.add_new_points(
-                                    inference_state=self.inference_state,
-                                    frame_idx=ann_frame,
-                                    obj_id=obj_id,
-                                    points=points_tensor,
-                                    labels=labels_tensor,
-                                )
+                                # Force model to float32 before inference
+                                self._force_model_float32()
+                                
+                                # Add points for this object at this frame with dtype error handling
+                                try:
+                                    # Use custom context manager to force float32
+                                    with self._force_float32_context():
+                                        _ = self.sam2_model.add_new_points(
+                                            inference_state=self.inference_state,
+                                            frame_idx=ann_frame,
+                                            obj_id=obj_id,
+                                            points=points_tensor,
+                                            labels=labels_tensor,
+                                        )
+                                except RuntimeError as e:
+                                    if "dtype" in str(e).lower() or "bfloat16" in str(e).lower():
+                                        print(f"Dtype error detected, attempting recovery...")
+                                        # Try with explicit float32 conversion and model patching
+                                        self._force_model_float32()
+                                        points_tensor = points_tensor.float()
+                                        labels_tensor = labels_tensor.long()
+                                        with self._force_float32_context():
+                                            _ = self.sam2_model.add_new_points(
+                                                inference_state=self.inference_state,
+                                                frame_idx=ann_frame,
+                                                obj_id=obj_id,
+                                                points=points_tensor,
+                                                labels=labels_tensor,
+                                            )
+                                    else:
+                                        # If all else fails, try on CPU
+                                        print(f"Attempting CPU fallback for dtype error...")
+                                        try:
+                                            points_cpu = points_tensor.cpu().float()
+                                            labels_cpu = labels_tensor.cpu().long()
+                                            # Temporarily move model to CPU
+                                            original_device = next(self.sam2_model.model.parameters()).device
+                                            self.sam2_model.model = self.sam2_model.model.cpu()
+                                            _ = self.sam2_model.add_new_points(
+                                                inference_state=self.inference_state,
+                                                frame_idx=ann_frame,
+                                                obj_id=obj_id,
+                                                points=points_cpu,
+                                                labels=labels_cpu,
+                                            )
+                                            # Move model back to original device
+                                            self.sam2_model.model = self.sam2_model.model.to(original_device)
+                                        except Exception as cpu_e:
+                                            print(f"CPU fallback also failed: {cpu_e}")
+                                            raise e
                         except Exception as e:
                             print(f"Error adding points for {obj_name} on frame {ann_frame}: {e}")
                             continue
@@ -3980,10 +4271,10 @@ class SAM2VideoUI:
                 else:
                     self.status_label.config(text=f"Using GPU {gpu_id} for inference...")
             elif device == "cuda":
-            if torch and torch.cuda.is_available():
-                self.status_label.config(text="Using CUDA GPU for inference...")
-            else:
-                device = "cpu"
+                if torch and torch.cuda.is_available():
+                    self.status_label.config(text="Using CUDA GPU for inference...")
+                else:
+                    device = "cpu"
                     self.status_label.config(text="CUDA not available, using CPU...")
             else:  # cpu
                 self.status_label.config(text="Using CPU for inference (slower)...")
@@ -4010,6 +4301,12 @@ class SAM2VideoUI:
             
             # Force all model components to float32
             self._force_model_float32()
+            
+            # Patch model to force float32 operations
+            self._patch_model_for_float32()
+            
+            # Disable mixed precision globally
+            self._disable_mixed_precision_globally()
 
             self.model_loaded = True
 
