@@ -760,8 +760,8 @@ class SAM2VideoUI:
     def toggle_multi_frame_annotation(self):
         """Multi-frame annotation mode is always enabled"""
         # Multi-frame annotation is always active, no need to toggle
-            self.multi_frame_label.config(text="MULTI-FRAME ANNOTATION ACTIVE")
-            self.status_label.config(text="Multi-frame mode: Navigate to different frames and add points, then segment")
+        self.multi_frame_label.config(text="MULTI-FRAME ANNOTATION ACTIVE")
+        self.status_label.config(text="Multi-frame mode: Navigate to different frames and add points, then segment")
     
     def toggle_refinement_mode(self):
         """Toggle refinement mode for improving segmentation"""
