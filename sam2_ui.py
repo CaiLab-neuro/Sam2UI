@@ -71,7 +71,8 @@ class SAM2VideoUI:
         self.inference_state = None
         self.current_object_id = 1  # Currently selected object ID
         self.max_object_id = 1  # Track highest object ID used (now up to 30)
-        
+        self.max_total_objects = 100 # maximal number of objects allowed.
+
         # Enhanced object management
         self.object_names = {}  # Maps obj_id to custom name
         self.object_colors = {}  # Dynamic color assignment
@@ -127,14 +128,18 @@ class SAM2VideoUI:
         self.setup_ui()
         
     def _initialize_objects(self):
-        """Initialize object colors and default names for up to 30 objects"""
+        """Initialize object colors and default names for up to 100 objects"""
         # Generate distinct colors for 30 objects using HSV space
-        for i in range(1, 31):
+        for i in range(1, self.max_total_objects + 1):
             # Use HSV for better color distribution
-            hue = (i * 137.5) % 360  # Golden angle approximation for good distribution
-            saturation = 0.8 + (i % 3) * 0.1  # Vary saturation slightly
-            value = 0.9 - (i % 2) * 0.2  # Vary brightness slightly
-            
+            # Three-level cycling for maximum variation
+            cycle_major = (i - 1) // 20  # 5 major cycles (0-4)
+            cycle_minor = (i - 1) % 20    # 20 colors per cycle
+            hue = (cycle_minor * 137.508 + cycle_major * 72) % 360  # Golden angle approximation for good distribution
+            saturation = 0.5 + ((i - 1) % 5) * 0.1  # Vary saturation slightly
+            value = 0.9 - ((i - 1) % 4) * 0.15  # Vary brightness slightly
+            if i > 50:
+                hue = (hue + 180) % 360  # Shift second half of colors
             # Convert HSV to RGB
             import colorsys
             r, g, b = colorsys.hsv_to_rgb(hue/360, saturation, value)
@@ -565,7 +570,7 @@ class SAM2VideoUI:
                     if 'id' in row and 'name' in row:
                         try:
                             obj_id = int(row['id'])
-                            if 1 <= obj_id <= 30:
+                            if 1 <= obj_id <= self.max_total_objects:
                                 self.object_names[obj_id] = row['name'].strip()
                                 imported_count += 1
                         except ValueError:
@@ -654,7 +659,7 @@ class SAM2VideoUI:
                     "is_positive": is_positive,
                     "object_id": obj_id,
                     "object_name": self.object_names.get(obj_id, f"Object_{obj_id}"),
-                    "timestamp": frame_idx / 30.0 if len(self.frames) > 0 else 0  # Assuming 30 FPS
+                    # "timestamp": frame_idx / 30.0 if len(self.frames) > 0 else 0  # Assuming 30 FPS
                 }
                 annotation_data["annotations"].append(annotation)
             
@@ -878,7 +883,7 @@ class SAM2VideoUI:
             
     def add_new_object(self):
         """Add a new object for segmentation"""
-        if self.max_object_id < 30:
+        if self.max_object_id < self.max_total_objects:
             self.max_object_id += 1
             self.current_object_id = self.max_object_id
             self.object_var.set(self.current_object_id)
@@ -888,7 +893,7 @@ class SAM2VideoUI:
             self.update_object_list()
             self.status_label.config(text=f"Added object {self.current_object_id}: {self.object_names[self.current_object_id]}")
         else:
-            messagebox.showwarning("Limit Reached", "Maximum 30 objects supported.")
+            messagebox.showwarning("Limit Reached", "Maximum {} objects supported.".format(self.max_total_objects))
             
     def load_video(self):
         """Load video file and extract frames"""
