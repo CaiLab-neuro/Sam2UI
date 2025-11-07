@@ -70,9 +70,9 @@ class SAM2VideoUI:
         self.playing = False
         self.inference_state = None
         self.current_object_id = 1  # Currently selected object ID
-        self.max_object_id = 1  # Track highest object ID used (now up to 30)
-        self.max_total_objects = 100 # maximal number of objects allowed.
-
+        self.max_object_id = 1  # Track highest object ID used
+        self.max_total_objects = 100  # Maximum number of objects supported
+        
         # Enhanced object management
         self.object_names = {}  # Maps obj_id to custom name
         self.object_colors = {}  # Dynamic color assignment
@@ -128,18 +128,14 @@ class SAM2VideoUI:
         self.setup_ui()
         
     def _initialize_objects(self):
-        """Initialize object colors and default names for up to 100 objects"""
-        # Generate distinct colors for 30 objects using HSV space
+        """Initialize object colors and default names for up to max_total_objects"""
+        # Generate distinct colors using HSV space
         for i in range(1, self.max_total_objects + 1):
             # Use HSV for better color distribution
-            # Three-level cycling for maximum variation
-            cycle_major = (i - 1) // 20  # 5 major cycles (0-4)
-            cycle_minor = (i - 1) % 20    # 20 colors per cycle
-            hue = (cycle_minor * 137.508 + cycle_major * 72) % 360  # Golden angle approximation for good distribution
-            saturation = 0.5 + ((i - 1) % 5) * 0.1  # Vary saturation slightly
-            value = 0.9 - ((i - 1) % 4) * 0.15  # Vary brightness slightly
-            if i > 50:
-                hue = (hue + 180) % 360  # Shift second half of colors
+            hue = (i * 137.5) % 360  # Golden angle approximation for good distribution
+            saturation = 0.8 + (i % 3) * 0.1  # Vary saturation slightly
+            value = 0.9 - (i % 2) * 0.2  # Vary brightness slightly
+            
             # Convert HSV to RGB
             import colorsys
             r, g, b = colorsys.hsv_to_rgb(hue/360, saturation, value)
@@ -253,7 +249,7 @@ class SAM2VideoUI:
         ttk.Label(current_obj_frame, text="Current:").pack(side=tk.LEFT)
         
         self.object_var = tk.IntVar(value=1)
-        self.object_spinbox = tk.Spinbox(current_obj_frame, from_=1, to=30, 
+        self.object_spinbox = tk.Spinbox(current_obj_frame, from_=1, to=self.max_total_objects, 
                                         textvariable=self.object_var, width=5, 
                                         command=self.on_object_change,
                                         bg='#404040', fg='white', insertbackground='white')
@@ -602,15 +598,16 @@ class SAM2VideoUI:
                 writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
                 writer.writeheader()
                 
-                for obj_id in range(1, 31):
-                    color = self.object_colors[obj_id]
-                    writer.writerow({
-                        'id': obj_id,
-                        'name': self.object_names[obj_id],
-                        'color_r': color[0],
-                        'color_g': color[1],
-                        'color_b': color[2]
-                    })
+                for obj_id in range(1, self.max_total_objects + 1):
+                    if obj_id in self.object_colors:
+                        color = self.object_colors[obj_id]
+                        writer.writerow({
+                            'id': obj_id,
+                            'name': self.object_names.get(obj_id, f"Object_{obj_id}"),
+                            'color_r': color[0],
+                            'color_g': color[1],
+                            'color_b': color[2]
+                        })
                     
             messagebox.showinfo("Export Complete", f"Object list exported to {file_path}")
             
@@ -658,8 +655,7 @@ class SAM2VideoUI:
                     "y": int(img_y),
                     "is_positive": is_positive,
                     "object_id": obj_id,
-                    "object_name": self.object_names.get(obj_id, f"Object_{obj_id}"),
-                    # "timestamp": frame_idx / 30.0 if len(self.frames) > 0 else 0  # Assuming 30 FPS
+                    "object_name": self.object_names.get(obj_id, f"Object_{obj_id}")
                 }
                 annotation_data["annotations"].append(annotation)
             
@@ -887,13 +883,13 @@ class SAM2VideoUI:
             self.max_object_id += 1
             self.current_object_id = self.max_object_id
             self.object_var.set(self.current_object_id)
-            self.object_spinbox.config(to=self.max_object_id)
+            self.object_spinbox.config(to=min(self.max_object_id, self.max_total_objects))
             self.object_name_var.set(self.object_names[self.current_object_id])
             self.update_object_color_display()
             self.update_object_list()
             self.status_label.config(text=f"Added object {self.current_object_id}: {self.object_names[self.current_object_id]}")
         else:
-            messagebox.showwarning("Limit Reached", "Maximum {} objects supported.".format(self.max_total_objects))
+            messagebox.showwarning("Limit Reached", f"Maximum {self.max_total_objects} objects supported.")
             
     def load_video(self):
         """Load video file and extract frames"""
@@ -1199,9 +1195,17 @@ class SAM2VideoUI:
                 cv2.circle(display_frame, (int(x), int(y)), 8, color, -1)
                 cv2.circle(display_frame, (int(x), int(y)), 10, (255, 255, 255), 2)
                 
-                # Draw symbol
-                cv2.putText(display_frame, symbol, (int(x)-5, int(y)+5), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                # Draw symbol - center it properly
+                # OpenCV putText uses bottom-left corner as reference, so we need to center it
+                font = cv2.FONT_HERSHEY_SIMPLEX
+                font_scale = 0.7
+                thickness = 2
+                (text_width, text_height), baseline = cv2.getTextSize(symbol, font, font_scale, thickness)
+                # Center the text: x - text_width/2, y + text_height/2 (since y is bottom-left reference)
+                text_x = int(x - text_width / 2)
+                text_y = int(y + text_height / 2)
+                cv2.putText(display_frame, symbol, (text_x, text_y), 
+                           font, font_scale, (255, 255, 255), thickness)
                 
                 # Draw object name instead of just ID
                 obj_name = self.object_names.get(obj_id, f"Obj{obj_id}")[:8]  # Truncate long names
@@ -1361,9 +1365,14 @@ class SAM2VideoUI:
         self.points_label.config(text=points_text)
             
     def clear_points(self):
-        """Clear all click points"""
-        self.click_points = []
-        self.annotated_frames.clear()
+        """Clear all click points for the current object only"""
+        # Filter out points for current object
+        self.click_points = [p for p in self.click_points if p[3] != self.current_object_id]
+        
+        # Update annotated frames set - remove frames that no longer have any points
+        remaining_frames = {p[4] for p in self.click_points}
+        self.annotated_frames = self.annotated_frames.intersection(remaining_frames)
+        
         self.update_points_display()
         self.update_object_list()
         if self.frames:
@@ -2239,16 +2248,16 @@ class SAM2VideoUI:
             }
             
             # Object information with names and colors
-            for obj_id in range(1, 31):
+            for obj_id in range(1, self.max_total_objects + 1):
                 if any(obj_id in frame_masks for frame_masks in self.masks.values()):
                     mask_count = sum(1 for frame_masks in self.masks.values() if obj_id in frame_masks)
                     point_count = sum(1 for _, _, _, oid in self.click_points if oid == obj_id)
                     
                     metadata["objects"][obj_id] = {
-                        "name": self.object_names[obj_id],
+                        "name": self.object_names.get(obj_id, f"Object_{obj_id}"),
                         "mask_count": mask_count,
                         "point_count": point_count,
-                        "color": self.object_colors[obj_id]
+                        "color": self.object_colors.get(obj_id, [255, 255, 255])
                     }
             
             # Click points grouped by object
@@ -2344,16 +2353,25 @@ class SAM2VideoUI:
             }
             
             # Object information with names and colors
-            for obj_id in range(1, 31):
+            # Note: max_total_objects should be available in the export task context
+            # For background export, we'll iterate through actual objects used
+            used_obj_ids = set()
+            for frame_masks in masks.values():
+                used_obj_ids.update(frame_masks.keys())
+            for point in click_points:
+                if len(point) >= 4:
+                    used_obj_ids.add(point[3])  # obj_id is at index 3
+            
+            for obj_id in sorted(used_obj_ids):
                 if any(obj_id in frame_masks for frame_masks in masks.values()):
                     mask_count = sum(1 for frame_masks in masks.values() if obj_id in frame_masks)
-                    point_count = sum(1 for _, _, _, oid, _ in click_points if oid == obj_id)
+                    point_count = sum(1 for point in click_points if len(point) >= 4 and point[3] == obj_id)
                     
                     metadata["objects"][obj_id] = {
-                        "name": object_names[obj_id],
+                        "name": object_names.get(obj_id, f"Object_{obj_id}"),
                         "mask_count": mask_count,
                         "point_count": point_count,
-                        "color": object_colors[obj_id]
+                        "color": object_colors.get(obj_id, [255, 255, 255])
                     }
             
             # Click points grouped by object
