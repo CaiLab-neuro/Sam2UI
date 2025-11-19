@@ -6,7 +6,7 @@ Two scripts for SAM2 Video UI:
 
 **Purpose**: Install everything needed for SAM2 Video UI
 
-**Usage**:
+**Usage** (ideally in a virtual environment built for using this package by conda or venv etc.):
 ```bash
 python setup.py
 ```
@@ -116,7 +116,10 @@ python process_annotations.py annotations.json video.mp4 \
 ### Setup Issues
 - **Python version**: Requires Python 3.8+
 - **Internet connection**: Needed to download models
-- **Permissions**: May need admin rights, or you can set up within your own virtual environment created by conda
+- **Permissions**: May need admin rights, or you can set up within your own virtual environment created by conda or venv
+- **Failed to install some packages**: try downgrading your python from the newest one, and rerun setup.py. If it still fails, try installing the failed package with conda, and then rerun setup.py.
+- **Failed to install pycocotools-windows**: modify setup.py to install pycocotools instead.
+- **Failed to load pytorch_python dll**: try removing torch and torchvision 
 
 ### Processing Issues
 - **Model not found**: Run `setup.py` first
@@ -129,3 +132,4 @@ python process_annotations.py annotations.json video.mp4 \
 3. **Verify formats**: Use JSON files exported from SAM2 Video UI
 
 4. **Check dependencies**: Ensure all packages are installed
+
