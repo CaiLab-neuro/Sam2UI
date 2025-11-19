@@ -116,7 +116,7 @@ python process_annotations.py annotations.json video.mp4 \
 ### Setup Issues
 - **Python version**: Requires Python 3.8+
 - **Internet connection**: Needed to download models
-- **Permissions**: May need admin rights
+- **Permissions**: May need admin rights, or you can set up within your own virtual environment created by conda
 
 ### Processing Issues
 - **Model not found**: Run `setup.py` first
@@ -127,4 +127,5 @@ python process_annotations.py annotations.json video.mp4 \
 1. **Re-run setup**: `python setup.py`
 2. **Check file paths**: Ensure annotation and video files exist
 3. **Verify formats**: Use JSON files exported from SAM2 Video UI
+
 4. **Check dependencies**: Ensure all packages are installed
