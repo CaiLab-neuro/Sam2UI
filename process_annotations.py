@@ -37,14 +37,13 @@ except ImportError as e:
 class SAM2Processor:
     def __init__(self, config_path="configs/sam2.1/sam2.1_hiera_base_plus.pt"):
         self.config_path = config_path
-        self.sam2_model = None
         self.video_predictor = None
         
     def load_model(self):
         """Load SAM2 model"""
         print(f"Loading SAM2 model from {self.config_path}...")
         try:
-            self.sam2_model = build_sam2_video_predictor(self.config_path, device="cuda" if torch.cuda.is_available() else "cpu")
+            self.video_predictor = build_sam2_video_predictor(self.config_path, device="cuda" if torch.cuda.is_available() else "cpu")
             print("OK: Model loaded successfully")
             return True
         except Exception as e:
@@ -115,10 +114,13 @@ class SAM2Processor:
         
         # Group annotations by frame
         frame_annotations = self.group_annotations_by_frame(annotations_data["annotations"])
-        
+        print(frames[0])
+        print(frames)
         # Initialize SAM2 state
         print("Initializing SAM2 state...")
-        self.video_predictor.init_state(frames[0])
+        # self.video_predictor.init_state(frames[0])
+        if not hasattr(self, 'inference_state') or self.inference_state is None:
+            self.inference_state = self.video_predictor.init_state(video_path=temp_dir)
         
         # Process each annotated frame
         masks_by_frame = {}

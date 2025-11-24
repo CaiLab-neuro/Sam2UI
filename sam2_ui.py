@@ -23,7 +23,7 @@ def get_project_root():
     current_dir = os.path.dirname(current_file)
     
     # Look for project root indicators
-    indicators = ['sam2', 'checkpoints', 'configs', 'pyproject.toml', 'setup.py']
+    indicators = ['sam2', 'checkpoints', 'configs', 'setup.py'] # 'pyproject.toml',
     
     # Start from current file and go up directories
     search_dir = current_dir
@@ -4275,6 +4275,8 @@ class SAM2VideoUI:
                 raise FileNotFoundError(f"Checkpoint not found: {sam2_checkpoint}")
             if not os.path.exists(model_cfg):
                 raise FileNotFoundError(f"Config not found: {model_cfg}")
+            if model_cfg.startswith('/'):
+                model_cfg = '/' + model_cfg 
 
             # Import the correct builder for VIDEO segmentation
             from sam2.build_sam import build_sam2_video_predictor
