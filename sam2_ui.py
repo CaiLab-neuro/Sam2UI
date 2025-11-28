@@ -709,6 +709,38 @@ class SAM2VideoUI:
                 messagebox.showerror("Import Error", "Invalid annotation file format. Missing 'annotations' field.")
                 return
             
+            # Check if video is loaded
+            if not self.frames:
+                messagebox.showwarning("No Video", "Please load a video first before importing annotations.")
+                return
+            
+            # Check for frame count mismatch
+            saved_total_frames = annotation_data.get("total_frames", 0)
+            current_total_frames = len(self.frames)
+            
+            if saved_total_frames != current_total_frames:
+                result = messagebox.askyesnocancel(
+                    "Frame Count Mismatch",
+                    f"Warning: Annotation file has {saved_total_frames} frames, "
+                    f"but current video has {current_total_frames} frames.\n\n"
+                    f"This may happen if:\n"
+                    f"- Video was loaded with different optimization settings\n"
+                    f"- Video was loaded with frame skipping enabled\n"
+                    f"- Different video file is loaded\n\n"
+                    f"Do you want to continue?\n\n"
+                    f"Yes: Attempt to import (may skip invalid frame indices)\n"
+                    f"No: Cancel import\n"
+                    f"Cancel: Show more options"
+                )
+                
+                if result is None:  # Cancel - show options
+                    # Show dialog with options to handle mismatch
+                    self._handle_annotation_frame_mismatch(annotation_data)
+                    return
+                elif not result:  # No - cancel
+                    return
+                # Yes - continue with warning
+            
             # Ask user if they want to clear existing annotations
             if self.click_points:
                 result = messagebox.askyesnocancel(
@@ -728,8 +760,10 @@ class SAM2VideoUI:
                     self.object_colors.clear()
                     self.annotated_frames.clear()
             
-            # Import annotations
+            # Import annotations with frame validation
             imported_count = 0
+            skipped_count = 0
+            
             for annotation in annotation_data["annotations"]:
                 try:
                     frame_idx = annotation["frame_index"]
@@ -739,6 +773,11 @@ class SAM2VideoUI:
                     obj_id = annotation["object_id"]
                     obj_name = annotation.get("object_name", f"Object_{obj_id}")
                     
+                    # Validate frame index is within current video bounds
+                    if frame_idx >= len(self.frames):
+                        skipped_count += 1
+                        continue
+                    
                     # Add the annotation point
                     self.click_points.append((x, y, is_positive, obj_id, frame_idx))
                     
@@ -747,7 +786,11 @@ class SAM2VideoUI:
                         self.object_names[obj_id] = obj_name
                         # Assign a color if not already assigned
                         if obj_id not in self.object_colors:
-                            self.object_colors[obj_id] = self._get_next_color()
+                            # Try to load color from annotation data if available
+                            if "object_colors" in annotation_data and str(obj_id) in annotation_data["object_colors"]:
+                                self.object_colors[obj_id] = annotation_data["object_colors"][str(obj_id)]
+                            else:
+                                self.object_colors[obj_id] = self._get_next_color()
                     
                     # Track annotated frames
                     self.annotated_frames.add(frame_idx)
@@ -756,6 +799,7 @@ class SAM2VideoUI:
                     
                 except KeyError as e:
                     print(f"Warning: Skipping invalid annotation: {e}")
+                    skipped_count += 1
                     continue
             
             # Update UI
@@ -763,17 +807,177 @@ class SAM2VideoUI:
             self.update_object_list()
             self.display_current_frame()
             
-            # Show success message
-            messagebox.showinfo("Import Complete", 
-                              f"Annotations imported successfully!\n\n"
-                              f"File: {file_path}\n"
-                              f"Imported annotations: {imported_count}\n"
-                              f"Total annotations: {len(self.click_points)}\n"
-                              f"Objects: {len(self.object_names)}")
+            # Show success message with warnings if applicable
+            message = f"Annotations imported successfully!\n\n" \
+                    f"File: {file_path}\n" \
+                    f"Imported annotations: {imported_count}\n"
+            
+            if skipped_count > 0:
+                message += f"Skipped annotations: {skipped_count} (invalid frame indices)\n"
+            
+            message += f"Total annotations: {len(self.click_points)}\n" \
+                    f"Objects: {len(self.object_names)}"
+            
+            messagebox.showinfo("Import Complete", message)
             
         except Exception as e:
             messagebox.showerror("Import Error", f"Failed to import annotations: {str(e)}")
-    
+
+    def _handle_annotation_frame_mismatch(self, annotation_data):
+        """Handle frame count mismatch between saved annotations and current video"""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Handle Frame Mismatch")
+        dialog.geometry("500x350")
+        dialog.configure(bg='#2b2b2b')
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        main_frame = ttk.Frame(dialog)
+        main_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
+
+        saved_frames = annotation_data.get("total_frames", 0)
+        current_frames = len(self.frames)
+
+        ttk.Label(main_frame, text="Frame Count Mismatch Options", 
+                    font=('Arial', 14, 'bold')).pack(pady=(0, 15))
+
+        info_text = f"Saved annotations: {saved_frames} frames\n" \
+                    f"Current video: {current_frames} frames\n\n" \
+                    f"Choose how to handle this mismatch:"
+
+        ttk.Label(main_frame, text=info_text, justify=tk.LEFT).pack(pady=(0, 15))
+
+        option_var = tk.StringVar(value="skip")
+
+        ttk.Radiobutton(main_frame, text="Skip invalid frame indices (safest)", 
+                        variable=option_var, value="skip").pack(anchor=tk.W, pady=2)
+        ttk.Radiobutton(main_frame, text="Scale frame indices proportionally", 
+                        variable=option_var, value="scale").pack(anchor=tk.W, pady=2)
+        ttk.Radiobutton(main_frame, text="Cancel import", 
+                        variable=option_var, value="cancel").pack(anchor=tk.W, pady=2)
+
+        def apply_option():
+            option = option_var.get()
+            dialog.destroy()
+            
+            if option == "cancel":
+                return
+            elif option == "skip":
+                self._import_annotations_skip_invalid(annotation_data)
+            elif option == "scale":
+                self._import_annotations_scale_indices(annotation_data)
+
+        ttk.Button(main_frame, text="Apply", command=apply_option).pack(pady=(20, 0))
+
+    def _import_annotations_skip_invalid(self, annotation_data):
+        """Import annotations, skipping those with invalid frame indices"""
+        imported_count = 0
+        skipped_count = 0
+        
+        for annotation in annotation_data["annotations"]:
+            try:
+                frame_idx = annotation["frame_index"]
+                
+                # Skip if frame index is out of bounds
+                if frame_idx >= len(self.frames):
+                    skipped_count += 1
+                    continue
+                
+                x = annotation["x"]
+                y = annotation["y"]
+                is_positive = annotation["is_positive"]
+                obj_id = annotation["object_id"]
+                obj_name = annotation.get("object_name", f"Object_{obj_id}")
+                
+                # Add the annotation point
+                self.click_points.append((x, y, is_positive, obj_id, frame_idx))
+                
+                # Update object names and colors
+                if obj_id not in self.object_names:
+                    self.object_names[obj_id] = obj_name
+                    if obj_id not in self.object_colors:
+                        if "object_colors" in annotation_data and str(obj_id) in annotation_data["object_colors"]:
+                            self.object_colors[obj_id] = annotation_data["object_colors"][str(obj_id)]
+                        else:
+                            self.object_colors[obj_id] = self._get_next_color()
+                
+                # Track annotated frames
+                self.annotated_frames.add(frame_idx)
+                imported_count += 1
+                
+            except KeyError as e:
+                skipped_count += 1
+                continue
+        
+        # Update UI
+        self.update_points_display()
+        self.update_object_list()
+        self.display_current_frame()
+        
+        messagebox.showinfo("Import Complete", 
+                        f"Imported {imported_count} annotations\n"
+                        f"Skipped {skipped_count} annotations with invalid frame indices")
+
+    def _import_annotations_scale_indices(self, annotation_data):
+        """Import annotations, scaling frame indices proportionally"""
+        saved_frames = annotation_data.get("total_frames", 1)
+        current_frames = len(self.frames)
+        scale_factor = current_frames / saved_frames
+        
+        imported_count = 0
+        
+        for annotation in annotation_data["annotations"]:
+            try:
+                original_frame_idx = annotation["frame_index"]
+                # Scale the frame index
+                scaled_frame_idx = int(original_frame_idx * scale_factor)
+                
+                # Clamp to valid range
+                scaled_frame_idx = max(0, min(scaled_frame_idx, current_frames - 1))
+                
+                x = annotation["x"]
+                y = annotation["y"]
+                is_positive = annotation["is_positive"]
+                obj_id = annotation["object_id"]
+                obj_name = annotation.get("object_name", f"Object_{obj_id}")
+                
+                # Add the annotation point with scaled frame index
+                self.click_points.append((x, y, is_positive, obj_id, scaled_frame_idx))
+                
+                # Update object names and colors
+                if obj_id not in self.object_names:
+                    self.object_names[obj_id] = obj_name
+                    if obj_id not in self.object_colors:
+                        if "object_colors" in annotation_data and str(obj_id) in annotation_data["object_colors"]:
+                            self.object_colors[obj_id] = annotation_data["object_colors"][str(obj_id)]
+                        else:
+                            self.object_colors[obj_id] = self._get_next_color()
+                
+                # Track annotated frames
+                self.annotated_frames.add(scaled_frame_idx)
+                imported_count += 1
+                
+            except KeyError:
+                continue
+        
+        # Update UI
+        self.update_points_display()
+        self.update_object_list()
+        self.display_current_frame()
+        
+        messagebox.showinfo("Import Complete", 
+                        f"Imported {imported_count} annotations with scaled frame indices\n"
+                        f"Scale factor: {scale_factor:.3f}")
+
+    def _get_next_color(self):
+        """Get next available color for a new object"""
+        # Find first unused object ID to get its color
+        for obj_id in range(1, self.max_total_objects + 1):
+            if obj_id not in self.object_colors:
+                return self.object_colors.get(obj_id, [255, 255, 255])
+        # Fallback to white if all colors used
+        return [255, 255, 255]
+
     def toggle_multi_frame_annotation(self):
         """Multi-frame annotation mode is always enabled"""
         # Multi-frame annotation is always active, no need to toggle
@@ -1570,13 +1774,23 @@ class SAM2VideoUI:
     def _disable_autocast_for_inference(self):
         """Disable autocast during inference to prevent dtype mismatches"""
         try:
+            # Get the device type for autocast
+            device = self._get_selected_device()
+            device_type = 'cuda' if 'cuda' in device else 'cpu'
+            
             # Create a context manager that disables autocast
             if hasattr(torch, 'autocast'):
-                return torch.autocast(enabled=False, device_type='cuda' if torch.cuda.is_available() else 'cpu')
+                # In PyTorch 1.10+, use torch.autocast with device_type
+                return torch.autocast(device_type=device_type, enabled=False)
+            elif hasattr(torch.cuda, 'amp') and hasattr(torch.cuda.amp, 'autocast'):
+                # Fallback for older PyTorch versions with CUDA autocast
+                return torch.cuda.amp.autocast(enabled=False)
             else:
+                # Fallback to no_grad
                 return torch.no_grad()
         except Exception as e:
-            print(f"Warning: Could not disable autocast: {e}")
+            print(f"Warning: Could not create autocast context: {e}")
+            # Return a simple no_grad context as fallback
             return torch.no_grad()
     
     def _force_model_float32(self):
@@ -1811,6 +2025,18 @@ class SAM2VideoUI:
             messagebox.showwarning("Warning", "Please add some click points first")
             return
         
+        # Validate annotations
+        is_valid, error_msg = self._validate_annotations_before_segmentation()
+        if not is_valid:
+            messagebox.showerror("Invalid Annotations", 
+                            f"{error_msg}\n\n"
+                            f"This usually happens when:\n"
+                            f"1. Annotations were saved with different video settings\n"
+                            f"2. Video was reloaded with frame skipping enabled\n\n"
+                            f"Please reload the video with the same settings used when creating annotations, "
+                            f"or create new annotations for the current video.")
+            return
+        
         # Ask about processing mode before segmentation
         processing_choice = messagebox.askyesnocancel(
             "Segmentation Processing Options",
@@ -1946,67 +2172,34 @@ class SAM2VideoUI:
                         self.root.update()
                         
                         try:
-                            # Debug dtype information
-                            self._debug_dtype_mismatch(points, labels, ann_frame, obj_id)
+                            # Get device
+                            device = self._get_selected_device()
                             
-                            # Ensure points and labels are in correct dtype and device
-                            points_tensor, labels_tensor = self._prepare_tensors_for_inference(points, labels)
+                            # Convert to tensors with Float32 (autocast will handle BFloat16 conversion)
+                            points_tensor = torch.from_numpy(points).to(dtype=torch.float32, device=device)
+                            labels_tensor = torch.from_numpy(labels).to(dtype=torch.int64, device=device)
                             
-                            # Disable autocast to prevent dtype mismatches
-                            with self._disable_autocast_for_inference():
-                                # Force model to float32 before inference
-                                self._force_model_float32()
-                                
-                                # Add points for this object at this frame with dtype error handling
-                                try:
-                                    # Use custom context manager to force float32
-                                    with self._force_float32_context():
-                                        _ = self.sam2_model.add_new_points(
-                                            inference_state=self.inference_state,
-                                            frame_idx=ann_frame,
-                                            obj_id=obj_id,
-                                            points=points_tensor,
-                                            labels=labels_tensor,
-                                        )
-                                except RuntimeError as e:
-                                    if "dtype" in str(e).lower() or "bfloat16" in str(e).lower():
-                                        print(f"Dtype error detected, attempting recovery...")
-                                        # Try with explicit float32 conversion and model patching
-                                        self._force_model_float32()
-                                        points_tensor = points_tensor.float()
-                                        labels_tensor = labels_tensor.long()
-                                        with self._force_float32_context():
-                                            _ = self.sam2_model.add_new_points(
-                                                inference_state=self.inference_state,
-                                                frame_idx=ann_frame,
-                                                obj_id=obj_id,
-                                                points=points_tensor,
-                                                labels=labels_tensor,
-                                            )
-                                    else:
-                                        # If all else fails, try on CPU
-                                        print(f"Attempting CPU fallback for dtype error...")
-                                        try:
-                                            points_cpu = points_tensor.cpu().float()
-                                            labels_cpu = labels_tensor.cpu().long()
-                                            # Temporarily move model to CPU
-                                            original_device = next(self.sam2_model.model.parameters()).device
-                                            self.sam2_model.model = self.sam2_model.model.cpu()
-                                            _ = self.sam2_model.add_new_points(
-                                                inference_state=self.inference_state,
-                                                frame_idx=ann_frame,
-                                                obj_id=obj_id,
-                                                points=points_cpu,
-                                                labels=labels_cpu,
-                                            )
-                                            # Move model back to original device
-                                            self.sam2_model.model = self.sam2_model.model.to(original_device)
-                                        except Exception as cpu_e:
-                                            print(f"CPU fallback also failed: {cpu_e}")
-                                            raise e
+                            # Make sure tensors are contiguous
+                            points_tensor = points_tensor.contiguous()
+                            labels_tensor = labels_tensor.contiguous()
+                            
+                            # Add points (autocast context handles dtype conversion automatically)
+                            _ = self.sam2_model.add_new_points(
+                                inference_state=self.inference_state,
+                                frame_idx=ann_frame,
+                                obj_id=obj_id,
+                                points=points_tensor,
+                                labels=labels_tensor,
+                            )
+                                    
+                            print(f"Successfully added {len(points)} points for {obj_name} on frame {ann_frame}")
+                            
                         except Exception as e:
-                            print(f"Error adding points for {obj_name} on frame {ann_frame}: {e}")
-                            continue
+                            error_msg = f"Error adding points for {obj_name} on frame {ann_frame}: {e}"
+                            print(error_msg)
+                            traceback.print_exc()
+                            messagebox.showerror("Segmentation Error", error_msg)
+                            return
                 
                 # Propagate through video (or just selected frames in refinement)
                 if is_refinement:
@@ -2060,9 +2253,10 @@ class SAM2VideoUI:
                             if any(out_obj_id in obj_dict for obj_dict in points_by_frame_and_object.values()):
                                 mask_logits = out_mask_logits[i]
                                 
-                                # Handle torch tensors
+                                # Convert from BFloat16 to Float32 only when moving to CPU for numpy
                                 if hasattr(mask_logits, 'cpu'):
-                                    mask_logits = mask_logits.cpu()
+                                    # Convert to float32 for CPU operations (numpy doesn't support bfloat16)
+                                    mask_logits = mask_logits.float().cpu()
                                 if hasattr(mask_logits, 'numpy'):
                                     mask_logits = mask_logits.numpy()
                                 
@@ -2086,8 +2280,9 @@ class SAM2VideoUI:
                             
                 except Exception as e:
                     print(f"Error during propagation: {e}")
+                    traceback.print_exc()
                     messagebox.showwarning("Propagation Warning", 
-                                         f"Encountered issue: {str(e)}")
+                                        f"Encountered issue: {str(e)}")
                 
                 self.progress_bar.pack_forget()
                 
@@ -2136,6 +2331,21 @@ class SAM2VideoUI:
             self.status_label.config(text="Segmentation failed")
             traceback.print_exc()
             messagebox.showerror("Segmentation Error", f"Segmentation failed: {str(e)}")
+
+    def _validate_annotations_before_segmentation(self):
+        """Validate that annotations have valid frame indices for current video"""
+        if not self.click_points:
+            return False, "No annotation points found"
+        
+        invalid_points = []
+        for i, (x, y, is_pos, obj_id, frame_idx) in enumerate(self.click_points):
+            if frame_idx >= len(self.frames):
+                invalid_points.append((i, frame_idx))
+        
+        if invalid_points:
+            return False, f"Found {len(invalid_points)} annotations with invalid frame indices"
+        
+        return True, "All annotations valid"
 
     def export_masks(self):
         """Export masks with enhanced metadata including object names"""
@@ -4304,39 +4514,39 @@ class SAM2VideoUI:
             else:  # cpu
                 self.status_label.config(text="Using CPU for inference (slower)...")
 
-            # Build the VIDEO predictor (not the base model)
-            with self._disable_autocast_for_inference():
-                self.sam2_model = build_sam2_video_predictor(
-                    config_file=model_cfg,
-                    ckpt_path=sam2_checkpoint,
-                    device=device
-                )
+            # Build the VIDEO predictor
+            self.sam2_model = build_sam2_video_predictor(
+                config_file=model_cfg,
+                ckpt_path=sam2_checkpoint,
+                device=device
+            )
             
-            # Ensure consistent dtype handling
-            if hasattr(self.sam2_model, 'model') and hasattr(self.sam2_model.model, 'to'):
-                # Convert model to float32 to avoid dtype mismatches
-                self.sam2_model.model = self.sam2_model.model.to(dtype=torch.float32)
-            
-            # Set model to evaluation mode
-            if hasattr(self.sam2_model, 'model'):
-                self.sam2_model.model.eval()
-            
-            # Ensure dtype consistency to prevent BFloat16/Float mismatches
-            self._ensure_model_dtype_consistency()
-            
-            # Force all model components to float32
-            self._force_model_float32()
-            
-            # Patch model to force float32 operations
-            self._patch_model_for_float32()
-            
-            # Disable mixed precision globally
-            self._disable_mixed_precision_globally()
+            # CRITICAL: Setup autocast context for BFloat16 (following SAM2 notebook pattern)
+            if device != "cpu" and torch.cuda.is_available():
+                # Enable autocast for BFloat16 as per SAM2 official notebook
+                self.autocast_context = torch.autocast("cuda", dtype=torch.bfloat16)
+                self.autocast_context.__enter__()
+                
+                # Enable TF32 for Ampere GPUs (compute capability >= 8.0)
+                try:
+                    gpu_id = 0 if device == "cuda" else int(device.split(":")[1])
+                    if torch.cuda.get_device_properties(gpu_id).major >= 8:
+                        torch.backends.cuda.matmul.allow_tf32 = True
+                        torch.backends.cudnn.allow_tf32 = True
+                        print(f"Enabled TF32 for Ampere GPU (compute capability {torch.cuda.get_device_properties(gpu_id).major}.x)")
+                except Exception as e:
+                    print(f"Could not enable TF32: {e}")
+                
+                print(f"Model loaded on {device} with BFloat16 autocast enabled")
+            else:
+                self.autocast_context = None
+                print(f"Model loaded on {device} (CPU mode, no autocast)")
 
             self.model_loaded = True
 
             model_name = os.path.basename(sam2_checkpoint).replace('.pt', '')
-            self.model_status_label.config(text=f"{model_name} ({device.upper()})", foreground='green')
+            dtype_str = "BF16+TF32" if self.autocast_context else "FP32"
+            self.model_status_label.config(text=f"{model_name} ({device.upper()}/{dtype_str})", foreground='green')
             self.status_label.config(text=f"SAM2 video predictor loaded successfully on {device.upper()}")
         
             # Test that the model has the required methods
