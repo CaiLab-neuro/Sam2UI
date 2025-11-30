@@ -102,6 +102,11 @@ class SAM2VideoUI:
         self.lazy_load_var = tk.BooleanVar(value=False)  # Load frames on demand
         self.video_cap_lazy = None  # Keep video capture open for lazy loading
         
+        # Track original video dimensions for coordinate system consistency
+        self.original_video_width = None
+        self.original_video_height = None
+        self.current_video_scale = 1.0  # Current scale applied to loaded frames
+
         # Initialize default colors and names
         self._initialize_objects()
         
@@ -155,48 +160,86 @@ class SAM2VideoUI:
                  background=[('active', '#505050'), ('pressed', '#303030')])
         
     def setup_ui(self):
-        # Main container with better layout
         main_container = ttk.Frame(self.root)
         main_container.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
         
-        # Create paned window for resizable layout
+        # Better initial proportions - reduce left panel width
         paned = ttk.PanedWindow(main_container, orient=tk.HORIZONTAL)
         paned.pack(fill=tk.BOTH, expand=True)
         
-        # Left panel for controls
-        left_panel = ttk.Frame(paned)
+        # Reduced width for left panel (was 400, now 240)
+        left_panel = ttk.Frame(paned, width=240)
         paned.add(left_panel, weight=1)
         
-        # Right panel for video display
-        right_panel = ttk.Frame(paned)
-        paned.add(right_panel, weight=3)
+        # Right panel gets more initial space
+        right_panel = ttk.Frame(paned, width=1200)
+        paned.add(right_panel, weight=5)  # Increased weight from 3 to 5
         
         self.setup_left_panel(left_panel)
         self.setup_right_panel(right_panel)
         
     def setup_left_panel(self, parent):
-        """Setup the left control panel with enhanced object management"""
-        # Create scrollable frame
         canvas = tk.Canvas(parent, bg='#2b2b2b', highlightthickness=0)
         scrollbar = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
         scrollable_frame = ttk.Frame(canvas)
         
-        scrollable_frame.bind(
-            "<Configure>",
-            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
-        )
+        # Configure canvas to expand scrollable_frame to canvas width
+        def configure_scroll_frame(event):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+            # Make the scrollable_frame match the canvas width
+            canvas_width = event.width
+            canvas.itemconfig(canvas_window, width=canvas_width)
         
-        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.bind("<Configure>", configure_scroll_frame)
+        scrollable_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        
+        canvas_window = canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
         canvas.configure(yscrollcommand=scrollbar.set)
         
-        # Pack canvas and scrollbar
-        canvas.pack(side="left", fill="both", expand=True)
+        # Pack scrollbar FIRST, then canvas - this ensures scrollbar stays visible
         scrollbar.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
         
-        # Bind mousewheel to canvas
+        # Mouse wheel scrolling setup
         def _on_mousewheel(event):
+            # Scroll the main canvas
             canvas.yview_scroll(int(-1*(event.delta/120)), "units")
-        canvas.bind("<MouseWheel>", _on_mousewheel)
+            # Return "break" to stop event propagation
+            return "break"
+        
+        # Track if mouse is over a scrollable widget (like object tree)
+        self._mouse_over_scrollable = False
+        
+        def _on_enter_scrollable(event):
+            """Called when mouse enters a widget with its own scrollbar"""
+            self._mouse_over_scrollable = True
+        
+        def _on_leave_scrollable(event):
+            """Called when mouse leaves a widget with its own scrollbar"""
+            self._mouse_over_scrollable = False
+        
+        def _on_mousewheel_conditional(event):
+            """Only scroll main canvas if not over a scrollable subsection"""
+            if not self._mouse_over_scrollable:
+                canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+                return "break"
+        
+        # Bind mousewheel globally when mouse enters the left panel area
+        def _bind_mousewheel(event):
+            """Bind mousewheel when mouse enters left panel"""
+            canvas.bind_all("<MouseWheel>", _on_mousewheel_conditional)
+        
+        def _unbind_mousewheel(event):
+            """Unbind mousewheel when mouse leaves left panel"""
+            canvas.unbind_all("<MouseWheel>")
+        
+        # Bind to canvas entry/exit
+        canvas.bind("<Enter>", _bind_mousewheel)
+        canvas.bind("<Leave>", _unbind_mousewheel)
+        
+        # Also bind to scrollable_frame
+        scrollable_frame.bind("<Enter>", _bind_mousewheel)
+        scrollable_frame.bind("<Leave>", _unbind_mousewheel)
         
         # Title
         title_label = ttk.Label(scrollable_frame, text="SAM2 Enhanced", 
@@ -308,6 +351,11 @@ class SAM2VideoUI:
         
         self.object_tree.bind('<ButtonRelease-1>', self.on_object_tree_select)
         
+        # ADDED: Mark this widget as having its own scrollbar
+        # When mouse is over this widget, it should handle its own scrolling
+        self.object_tree.bind('<Enter>', lambda e: setattr(self, '_mouse_over_scrollable', True))
+        self.object_tree.bind('<Leave>', lambda e: setattr(self, '_mouse_over_scrollable', False))
+        
         # Segmentation controls
         seg_frame = ttk.LabelFrame(scrollable_frame, text="Segmentation", padding=10)
         seg_frame.pack(fill=tk.X, pady=(0, 10))
@@ -369,11 +417,29 @@ class SAM2VideoUI:
         # Display options
         display_frame = ttk.LabelFrame(scrollable_frame, text="Display Options", padding=10)
         display_frame.pack(fill=tk.X, pady=(0, 10))
-        
+
+        # Show/Hide masks checkbox
         self.show_masks_var = tk.BooleanVar()
         ttk.Checkbutton(display_frame, text="Show Masks", 
-                       variable=self.show_masks_var,
-                       command=self.toggle_mask_display).pack(anchor=tk.W)
+                    variable=self.show_masks_var,
+                    command=self.toggle_mask_display).pack(anchor=tk.W, pady=(0, 5))
+
+        # Mask opacity slider
+        opacity_frame = ttk.Frame(display_frame)
+        opacity_frame.pack(fill=tk.X, pady=(5, 0))
+
+        ttk.Label(opacity_frame, text="Mask Opacity:").pack(anchor=tk.W)
+
+        self.mask_opacity_var = tk.DoubleVar(value=0.4)  # Default 40%
+        opacity_slider = ttk.Scale(opacity_frame, from_=0.0, to=1.0, 
+                                variable=self.mask_opacity_var, 
+                                orient=tk.HORIZONTAL,
+                                command=self.on_mask_opacity_change)
+        opacity_slider.pack(fill=tk.X, padx=(0, 5))
+
+        # Opacity percentage label
+        self.opacity_label = ttk.Label(opacity_frame, text="40%", foreground='gray')
+        self.opacity_label.pack(anchor=tk.W)
         
         # Status info
         status_frame = ttk.LabelFrame(scrollable_frame, text="Status", padding=10)
@@ -643,16 +709,27 @@ class SAM2VideoUI:
                 "annotated_frames": sorted(list(self.annotated_frames)),
                 "object_names": self.object_names,
                 "object_colors": {str(k): v for k, v in self.object_colors.items()},
+                
+                # ADDED: Store original video dimensions and current scale
+                "video_metadata": {
+                    "original_width": self.original_video_width,
+                    "original_height": self.original_video_height,
+                    "current_scale": self.current_video_scale,
+                    "frame_skip": self.frame_skip_var.get() if self.downsample_frames_var.get() else 1,
+                    "lazy_load": self.lazy_load_var.get()
+                },
+                
                 "annotations": []
             }
             
             # Convert click points to export format
+            # NOTE: Points are already in ORIGINAL coordinate system
             for point in self.click_points:
                 img_x, img_y, is_positive, obj_id, frame_idx = point
                 annotation = {
                     "frame_index": frame_idx,
-                    "x": int(img_x),
-                    "y": int(img_y),
+                    "x": float(img_x),  # These are in ORIGINAL video coordinates
+                    "y": float(img_y),
                     "is_positive": is_positive,
                     "object_id": obj_id,
                     "object_name": self.object_names.get(obj_id, f"Object_{obj_id}")
@@ -665,7 +742,8 @@ class SAM2VideoUI:
             # Add metadata
             annotation_data["export_info"] = {
                 "export_time": time.strftime("%Y-%m-%d %H:%M:%S"),
-                "app_version": "SAM2 Video UI Enhanced",
+                "app_version": "SAM2 Video UI Enhanced v2.0",
+                "coordinate_system": "original",  # ADDED: Indicate coordinate system
                 "multi_frame_mode": self.multi_frame_annotation_mode,
                 "refinement_mode": self.refinement_mode
             }
@@ -714,6 +792,31 @@ class SAM2VideoUI:
                 messagebox.showwarning("No Video", "Please load a video first before importing annotations.")
                 return
             
+            # ADDED: Check for coordinate system compatibility
+            saved_metadata = annotation_data.get("video_metadata", {})
+            saved_width = saved_metadata.get("original_width")
+            saved_height = saved_metadata.get("original_height")
+            saved_scale = saved_metadata.get("current_scale", 1.0)
+            
+            coordinate_system = annotation_data.get("export_info", {}).get("coordinate_system", "unknown")
+            
+            # Check if we need to warn about coordinate system
+            needs_scaling_warning = False
+            scale_correction_factor = 1.0
+            
+            if saved_width and saved_height and self.original_video_width:
+                # Check if original video dimensions match
+                if saved_width != self.original_video_width or saved_height != self.original_video_height:
+                    needs_scaling_warning = True
+                    messagebox.showwarning(
+                        "Video Dimension Mismatch",
+                        f"Warning: Annotations were created for a video with different dimensions!\n\n"
+                        f"Saved annotations: {saved_width}x{saved_height}\n"
+                        f"Current video: {self.original_video_width}x{self.original_video_height}\n\n"
+                        f"Annotations may not appear in the correct locations.\n"
+                        f"Please use the same source video."
+                    )
+            
             # Check for frame count mismatch
             saved_total_frames = annotation_data.get("total_frames", 0)
             current_total_frames = len(self.frames)
@@ -727,19 +830,14 @@ class SAM2VideoUI:
                     f"- Video was loaded with different optimization settings\n"
                     f"- Video was loaded with frame skipping enabled\n"
                     f"- Different video file is loaded\n\n"
+                    f"Coordinate system: {coordinate_system}\n\n"
                     f"Do you want to continue?\n\n"
                     f"Yes: Attempt to import (may skip invalid frame indices)\n"
-                    f"No: Cancel import\n"
-                    f"Cancel: Show more options"
+                    f"No: Cancel import"
                 )
                 
-                if result is None:  # Cancel - show options
-                    # Show dialog with options to handle mismatch
-                    self._handle_annotation_frame_mismatch(annotation_data)
+                if not result:  # No or Cancel
                     return
-                elif not result:  # No - cancel
-                    return
-                # Yes - continue with warning
             
             # Ask user if they want to clear existing annotations
             if self.click_points:
@@ -767,7 +865,7 @@ class SAM2VideoUI:
             for annotation in annotation_data["annotations"]:
                 try:
                     frame_idx = annotation["frame_index"]
-                    x = annotation["x"]
+                    x = annotation["x"]  # These are in ORIGINAL coordinates
                     y = annotation["y"]
                     is_positive = annotation["is_positive"]
                     obj_id = annotation["object_id"]
@@ -778,7 +876,11 @@ class SAM2VideoUI:
                         skipped_count += 1
                         continue
                     
-                    # Add the annotation point
+                    # ADDED: Coordinates are already in ORIGINAL system, 
+                    # they will be scaled during display automatically
+                    # No conversion needed here!
+                    
+                    # Add the annotation point (coordinates are in ORIGINAL scale)
                     self.click_points.append((x, y, is_positive, obj_id, frame_idx))
                     
                     # Update object names and colors
@@ -815,7 +917,10 @@ class SAM2VideoUI:
             if skipped_count > 0:
                 message += f"Skipped annotations: {skipped_count} (invalid frame indices)\n"
             
-            message += f"Total annotations: {len(self.click_points)}\n" \
+            if coordinate_system == "original":
+                message += f"\n✓ Using original coordinate system (compatible with video scaling)"
+            
+            message += f"\nTotal annotations: {len(self.click_points)}\n" \
                     f"Objects: {len(self.object_names)}"
             
             messagebox.showinfo("Import Complete", message)
@@ -1138,6 +1243,17 @@ class SAM2VideoUI:
             original_width = int(self.video_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             original_height = int(self.video_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
             
+            # ADDED: Store original dimensions for coordinate consistency
+            self.original_video_width = original_width
+            self.original_video_height = original_height
+            
+            # Calculate current scale factor
+            skip_frames = self.frame_skip_var.get() if self.downsample_frames_var.get() else 1
+            scale_factor = self.video_scale_factor.get() if self.scale_video_var.get() else 1.0
+            
+            # ADDED: Store current scale for coordinate conversions
+            self.current_video_scale = scale_factor
+            
             # Calculate memory usage estimate
             bytes_per_frame = original_width * original_height * 3  # RGB
             estimated_memory_mb = (total_frames * bytes_per_frame) / (1024 * 1024)
@@ -1250,6 +1366,11 @@ class SAM2VideoUI:
             self.video_cap_lazy = cv2.VideoCapture(self.video_path)
             if not self.video_cap_lazy.isOpened():
                 raise ValueError("Could not open video file for lazy loading")
+            
+            # ADDED: Store original dimensions
+            self.original_video_width = original_width
+            self.original_video_height = original_height
+            self.current_video_scale = scale_factor
             
             # Store video properties for lazy loading
             self.video_props = {
@@ -1381,8 +1502,8 @@ class SAM2VideoUI:
                     overlay = np.zeros_like(display_frame)
                     overlay[mask > 0] = obj_color
                     
-                    # Blend with current frame
-                    alpha = 0.4
+                    # Blend with current frame using opacity from slider
+                    alpha = self.mask_opacity_var.get() if hasattr(self, 'mask_opacity_var') else 0.4
                     display_frame = cv2.addWeighted(display_frame, 1-alpha, overlay, alpha, 0)
         
         # Draw click points only for the current frame
@@ -1391,29 +1512,35 @@ class SAM2VideoUI:
                 continue
             # Only draw points for current object or if showing all
             if obj_id == self.current_object_id or not hasattr(self, 'current_object_id'):
+                # ADDED: Convert from ORIGINAL coordinates to CURRENT frame coordinates
+                if self.current_video_scale != 1.0 and self.original_video_width:
+                    scaled_x = x * self.current_video_scale
+                    scaled_y = y * self.current_video_scale
+                else:
+                    scaled_x = x
+                    scaled_y = y
+                
                 obj_color = self.object_colors.get(obj_id, [255, 255, 255])
-                color = tuple(obj_color) if is_positive else (255, 0, 0)  # Object color for positive, red for negative
+                color = tuple(obj_color) if is_positive else (255, 0, 0)
                 symbol = "+" if is_positive else "-"
                 
-                # Draw circle
-                cv2.circle(display_frame, (int(x), int(y)), 8, color, -1)
-                cv2.circle(display_frame, (int(x), int(y)), 10, (255, 255, 255), 2)
+                # Draw circle using SCALED coordinates
+                cv2.circle(display_frame, (int(scaled_x), int(scaled_y)), 8, color, -1)
+                cv2.circle(display_frame, (int(scaled_x), int(scaled_y)), 10, (255, 255, 255), 2)
                 
                 # Draw symbol - center it properly
-                # OpenCV putText uses bottom-left corner as reference, so we need to center it
                 font = cv2.FONT_HERSHEY_SIMPLEX
                 font_scale = 0.7
                 thickness = 2
                 (text_width, text_height), baseline = cv2.getTextSize(symbol, font, font_scale, thickness)
-                # Center the text: x - text_width/2, y + text_height/2 (since y is bottom-left reference)
-                text_x = int(x - text_width / 2)
-                text_y = int(y + text_height / 2)
+                text_x = int(scaled_x - text_width / 2)
+                text_y = int(scaled_y + text_height / 2)
                 cv2.putText(display_frame, symbol, (text_x, text_y), 
                            font, font_scale, (255, 255, 255), thickness)
                 
-                # Draw object name instead of just ID
-                obj_name = self.object_names.get(obj_id, f"Obj{obj_id}")[:8]  # Truncate long names
-                cv2.putText(display_frame, obj_name, (int(x)+15, int(y)-10), 
+                # Draw object name
+                obj_name = self.object_names.get(obj_id, f"Obj{obj_id}")[:8]
+                cv2.putText(display_frame, obj_name, (int(scaled_x)+15, int(scaled_y)-10), 
                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 2)
         
         # Convert to PIL and display
@@ -1522,14 +1649,25 @@ class SAM2VideoUI:
             offset_x = (canvas_width - img_display_width) // 2
             offset_y = (canvas_height - img_display_height) // 2
             
+            # Convert to current frame coordinates
             img_x = (canvas_x - offset_x) / self.scale_factor
             img_y = (canvas_y - offset_y) / self.scale_factor
             
-            # Ensure coordinates are within image bounds
+            # Ensure coordinates are within current frame bounds
             img_height, img_width = self.current_frame.shape[:2]
             if 0 <= img_x < img_width and 0 <= img_y < img_height:
-                # Store frame-aware point
-                self.click_points.append((img_x, img_y, is_positive, self.current_object_id, self.current_frame_idx))
+                # ADDED: Convert to ORIGINAL video coordinates before storing
+                # This ensures annotations work regardless of current scaling
+                if self.current_video_scale != 1.0 and self.original_video_width:
+                    original_x = img_x / self.current_video_scale
+                    original_y = img_y / self.current_video_scale
+                else:
+                    original_x = img_x
+                    original_y = img_y
+                
+                # Store frame-aware point with ORIGINAL coordinates
+                self.click_points.append((original_x, original_y, is_positive, 
+                                        self.current_object_id, self.current_frame_idx))
                 
                 # Track annotated frames in multi-frame annotation mode
                 if self.multi_frame_annotation_mode:
@@ -1600,6 +1738,16 @@ class SAM2VideoUI:
     def toggle_mask_display(self):
         """Toggle mask overlay display"""
         if self.frames:
+            self.display_current_frame()
+
+    def on_mask_opacity_change(self, value=None):
+        """Handle mask opacity slider change"""
+        opacity = self.mask_opacity_var.get()
+        # Update label to show percentage
+        self.opacity_label.config(text=f"{int(opacity * 100)}%")
+        
+        # Redraw frame if masks are visible
+        if self.show_masks_var.get() and self.frames:
             self.display_current_frame()
             
     def prev_frame(self):
@@ -2106,7 +2254,19 @@ class SAM2VideoUI:
                 
                 # Save only the frames we need to process
                 for save_idx, frame_idx in enumerate(frames_to_save):
-                    frame = self.frames[frame_idx]
+                    # Handle lazy loading - load frame on demand if needed
+                    if self.lazy_load_var.get() and hasattr(self, 'video_props'):
+                        frame = self._load_frame_lazy(frame_idx)
+                        if frame is None:
+                            # Skip this frame if it can't be loaded
+                            print(f"Warning: Could not load frame {frame_idx}, skipping...")
+                            continue
+                    else:
+                        frame = self.frames[frame_idx]
+                        if frame is None:
+                            print(f"Warning: Frame {frame_idx} is None, skipping...")
+                            continue
+                    
                     frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
                     frame_path = os.path.join(temp_dir, f"{save_idx:05d}.jpg")
                     cv2.imwrite(frame_path, frame_bgr)
@@ -2120,9 +2280,18 @@ class SAM2VideoUI:
                 self.progress_var.set(35)
                 self.root.update()
                 
-                # Initialize or reuse inference state
-                if not hasattr(self, 'inference_state') or self.inference_state is None:
-                    self.inference_state = self.sam2_model.init_state(video_path=temp_dir)
+                # Always reset inference state to clear dimension cache
+                # This ensures SAM2 uses current frame dimensions, not cached ones
+                if hasattr(self, 'inference_state') and self.inference_state is not None:
+                    # Reset existing state
+                    try:
+                        self.sam2_model.reset_state(self.inference_state)
+                    except:
+                        pass  # If reset_state doesn't exist, just clear the reference
+                    self.inference_state = None
+
+                # Initialize fresh state with current frames
+                self.inference_state = self.sam2_model.init_state(video_path=temp_dir)
                 
                 # Group click points by frame and by object ID
                 points_by_frame_and_object = {}
@@ -2135,12 +2304,25 @@ class SAM2VideoUI:
                     else:
                         limited_frame_idx = frame_idx
                     
+                    # ADDED: Convert from ORIGINAL coordinates to CURRENT frame coordinates
+                    # for SAM2 processing
+                    if self.current_video_scale != 1.0 and self.original_video_width:
+                        scaled_x = x * self.current_video_scale
+                        scaled_y = y * self.current_video_scale
+                    else:
+                        scaled_x = x
+                        scaled_y = y
+                    
                     if limited_frame_idx not in points_by_frame_and_object:
                         points_by_frame_and_object[limited_frame_idx] = {}
                     if obj_id not in points_by_frame_and_object[limited_frame_idx]:
                         points_by_frame_and_object[limited_frame_idx][obj_id] = {'points': [], 'labels': []}
-                    points_by_frame_and_object[limited_frame_idx][obj_id]['points'].append([x, y])
+                    
+                    # Use SCALED coordinates for SAM2 (matching current frame size)
+                    points_by_frame_and_object[limited_frame_idx][obj_id]['points'].append([scaled_x, scaled_y])
                     points_by_frame_and_object[limited_frame_idx][obj_id]['labels'].append(1 if is_pos else 0)
+                    
+                    
                 
                 self.status_label.config(text="Adding prompts to SAM2...")
                 self.progress_var.set(40)
@@ -2507,17 +2689,13 @@ class SAM2VideoUI:
             self.progress_bar.pack_forget()
             self.status_label.config(text=f"Export complete: {exported_count} masks + metadata")
             
-            # Ask if user wants to open the export folder
-            result = messagebox.askyesno("Export Complete", 
+            # Show brief success message without dialog
+            messagebox.showinfo("Export Complete", 
                               f"Successfully exported:\n"
                               f"- {exported_count} mask images (PNG)\n"
                               f"- 1 metadata file (JSON)\n"
                               f"- 1 object mapping (CSV)\n\n"
-                              f"Location: {folder_path}\n\n"
-                              f"Would you like to open the export folder?")
-            
-            if result:
-                self._open_folder(folder_path)
+                              f"Location: {folder_path}")
                 
         except Exception as e:
             self.progress_bar.pack_forget()
@@ -2948,18 +3126,13 @@ class SAM2VideoUI:
             else:
                 range_info = ""
             
-            # Ask if user wants to open the export folder
-            result = messagebox.askyesno("Export Complete", 
+            # Show brief success message without asking
+            messagebox.showinfo("Export Complete", 
                               f"Video exported successfully!\n"
                               f"Location: {file_path}\n"
                               f"Frames: {total_frames}{range_info}\n"
                               f"FPS: {fps}\n"
-                              f"Format: {export_format.upper()}\n\n"
-                              f"Would you like to open the export folder?")
-            
-            if result:
-                export_folder = os.path.dirname(file_path)
-                self._open_folder(export_folder)
+                              f"Format: {export_format.upper()}")
                               
         except Exception as e:
             self.progress_bar.pack_forget()
@@ -4601,16 +4774,12 @@ def main():
             elif result:  # Yes - save task status and let tasks continue
                 app._handle_background_tasks_save_on_exit()
                 # Don't stop workers - let them continue
-                # Just destroy the UI and let the process continue
-                root.destroy()
-                return
-            # No - just quit (tasks will be lost)
             else:
-                # Stop workers and quit normally
+                # No - stop workers
                 app._stop_export_worker()
                 app._stop_segmentation_worker()
         else:
-            # No active tasks, just quit normally
+            # No active tasks, stop workers normally
             app._stop_export_worker()
             app._stop_segmentation_worker()
         
@@ -4618,7 +4787,8 @@ def main():
         if hasattr(app, 'video_cap_lazy') and app.video_cap_lazy:
             app.video_cap_lazy.release()
         
-            root.destroy()
+        # CRITICAL: Always destroy root at the end
+        root.destroy()
     
     root.protocol("WM_DELETE_WINDOW", on_closing)
     
