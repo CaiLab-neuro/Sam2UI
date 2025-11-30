@@ -163,20 +163,25 @@ class SAM2VideoUI:
         main_container = ttk.Frame(self.root)
         main_container.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
         
-        # Better initial proportions - reduce left panel width
-        paned = ttk.PanedWindow(main_container, orient=tk.HORIZONTAL)
-        paned.pack(fill=tk.BOTH, expand=True)
+        # Create paned window - use tk.PanedWindow instead of ttk.PanedWindow
+        self.paned = tk.PanedWindow(main_container, orient=tk.HORIZONTAL, 
+                                    sashwidth=5, bg='#2b2b2b')
+        self.paned.pack(fill=tk.BOTH, expand=True)
         
-        # Reduced width for left panel (was 400, now 240)
-        left_panel = ttk.Frame(paned, width=240)
-        paned.add(left_panel, weight=1)
+        # Create panels
+        left_panel = ttk.Frame(self.paned)
+        right_panel = ttk.Frame(self.paned)
         
-        # Right panel gets more initial space
-        right_panel = ttk.Frame(paned, width=1200)
-        paned.add(right_panel, weight=5)  # Increased weight from 3 to 5
+        # Add panels
+        self.paned.add(left_panel, width=280)  # Set initial width to 280px
+        self.paned.add(right_panel)
         
+        # Setup panels
         self.setup_left_panel(left_panel)
         self.setup_right_panel(right_panel)
+        
+        # Force sash position after window renders
+        self.root.after(100, lambda: self.paned.sash_place(0, 280, 1))
         
     def setup_left_panel(self, parent):
         canvas = tk.Canvas(parent, bg='#2b2b2b', highlightthickness=0)
@@ -200,46 +205,13 @@ class SAM2VideoUI:
         scrollbar.pack(side="right", fill="y")
         canvas.pack(side="left", fill="both", expand=True)
         
-        # Mouse wheel scrolling setup
+        # Mouse wheel scrolling - simplified working version
         def _on_mousewheel(event):
-            # Scroll the main canvas
             canvas.yview_scroll(int(-1*(event.delta/120)), "units")
-            # Return "break" to stop event propagation
-            return "break"
-        
-        # Track if mouse is over a scrollable widget (like object tree)
-        self._mouse_over_scrollable = False
-        
-        def _on_enter_scrollable(event):
-            """Called when mouse enters a widget with its own scrollbar"""
-            self._mouse_over_scrollable = True
-        
-        def _on_leave_scrollable(event):
-            """Called when mouse leaves a widget with its own scrollbar"""
-            self._mouse_over_scrollable = False
-        
-        def _on_mousewheel_conditional(event):
-            """Only scroll main canvas if not over a scrollable subsection"""
-            if not self._mouse_over_scrollable:
-                canvas.yview_scroll(int(-1*(event.delta/120)), "units")
-                return "break"
-        
-        # Bind mousewheel globally when mouse enters the left panel area
-        def _bind_mousewheel(event):
-            """Bind mousewheel when mouse enters left panel"""
-            canvas.bind_all("<MouseWheel>", _on_mousewheel_conditional)
-        
-        def _unbind_mousewheel(event):
-            """Unbind mousewheel when mouse leaves left panel"""
-            canvas.unbind_all("<MouseWheel>")
-        
-        # Bind to canvas entry/exit
-        canvas.bind("<Enter>", _bind_mousewheel)
-        canvas.bind("<Leave>", _unbind_mousewheel)
-        
-        # Also bind to scrollable_frame
-        scrollable_frame.bind("<Enter>", _bind_mousewheel)
-        scrollable_frame.bind("<Leave>", _unbind_mousewheel)
+
+        # Bind when mouse enters/leaves the parent frame
+        parent.bind("<Enter>", lambda e: parent.bind_all("<MouseWheel>", _on_mousewheel))
+        parent.bind("<Leave>", lambda e: parent.unbind_all("<MouseWheel>"))
         
         # Title
         title_label = ttk.Label(scrollable_frame, text="SAM2 Enhanced", 
