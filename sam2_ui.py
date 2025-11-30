@@ -465,6 +465,11 @@ class SAM2VideoUI:
         ttk.Button(playback_frame, text="Next", command=self.next_frame).pack(side=tk.LEFT, padx=(0, 5))
         ttk.Button(playback_frame, text="Reset", command=self.reset_video).pack(side=tk.LEFT, padx=(10, 0))
         
+        # Jump to annotated frames buttons
+        ttk.Button(playback_frame, text="◄ Ann", command=self.jump_to_prev_annotated_frame).pack(side=tk.LEFT, padx=(10, 5))
+        ttk.Button(playback_frame, text="Ann ►", command=self.jump_to_next_annotated_frame).pack(side=tk.LEFT, padx=(0, 5))
+        
+        
         # Frame selection for refinement (always present; enabled when active)
         self.select_frame_button = ttk.Button(playback_frame, text="Select Frame",
                       command=self.toggle_frame_selection)
@@ -1109,8 +1114,17 @@ class SAM2VideoUI:
         closest_point_idx = None
         
         for point_idx, (px, py, is_pos, obj_id, f_idx) in frame_points:
-            # Calculate distance from click to point
-            distance = ((x - px) ** 2 + (y - py) ** 2) ** 0.5
+            # CRITICAL FIX: Convert stored ORIGINAL coordinates to CURRENT (scaled) coordinates
+            # for distance comparison with the click location
+            if self.current_video_scale != 1.0 and self.original_video_width:
+                scaled_px = px * self.current_video_scale
+                scaled_py = py * self.current_video_scale
+            else:
+                scaled_px = px
+                scaled_py = py
+            
+            # Calculate distance from click to point (both in current/scaled coordinates now)
+            distance = ((x - scaled_px) ** 2 + (y - scaled_py) ** 2) ** 0.5
             
             if distance < min_distance:
                 min_distance = distance
@@ -1130,7 +1144,7 @@ class SAM2VideoUI:
             self.update_object_list()
             self.display_current_frame()
             
-            # Show confirmation
+            # Show confirmation (using ORIGINAL coordinates in the message)
             point_type = "positive" if is_pos else "negative"
             obj_name = self.object_names.get(obj_id, f"Object_{obj_id}")
             self.status_label.config(text=f"Removed {point_type} point for {obj_name} at ({px:.0f}, {py:.0f})")
@@ -1199,11 +1213,37 @@ class SAM2VideoUI:
             messagebox.showerror("Error", f"Failed to load video: {str(e)}")
             
     def load_video_frames(self):
-        """Extract frames from video with memory optimization options"""
+        """Extract frames from video with multiple backend fallbacks"""
         try:
-            self.video_cap = cv2.VideoCapture(self.video_path)
-            if not self.video_cap.isOpened():
-                raise ValueError("Could not open video file")
+            # Try different OpenCV backends in order of preference
+            backends = [
+                (cv2.CAP_FFMPEG, "FFMPEG"),
+                (cv2.CAP_GSTREAMER, "GStreamer"),
+                (cv2.CAP_ANY, "Auto")
+            ]
+            
+            self.video_cap = None
+            successful_backend = None
+            
+            for backend, name in backends:
+                try:
+                    self.video_cap = cv2.VideoCapture(self.video_path, backend)
+                    if self.video_cap.isOpened():
+                        successful_backend = name
+                        break
+                    else:
+                        self.video_cap.release()
+                except Exception as e:
+                    print(f"Failed to open with {name} backend: {e}")
+                    continue
+            
+            if not self.video_cap or not self.video_cap.isOpened():
+                raise ValueError(
+                    "Could not open video file with any backend.\n"
+                    "Please install required codecs or convert video to MP4 format."
+                )
+            
+            self.status_label.config(text=f"Video loaded using {successful_backend} backend")
             
             self.frames = []
             self.masks = {}
@@ -1739,6 +1779,56 @@ class SAM2VideoUI:
         if self.frames:
             self.current_frame_idx = 0
             self.display_current_frame()
+
+    def jump_to_prev_annotated_frame(self):
+        """Jump to the previous frame with annotations for the current object"""
+        # Get frames with annotations for current object only
+        current_obj_frames = set()
+        for _, _, _, obj_id, frame_idx in self.click_points:
+            if obj_id == self.current_object_id:
+                current_obj_frames.add(frame_idx)
+        
+        if not current_obj_frames:
+            obj_name = self.object_names.get(self.current_object_id, f"Object_{self.current_object_id}")
+            messagebox.showinfo("No Annotations", f"No annotated frames found for {obj_name}.")
+            return
+        
+        sorted_annotated = sorted(list(current_obj_frames))
+        prev_frames = [f for f in sorted_annotated if f < self.current_frame_idx]
+        
+        if prev_frames:
+            self.current_frame_idx = prev_frames[-1]
+            self.display_current_frame()
+        else:
+            self.current_frame_idx = sorted_annotated[-1]
+            self.display_current_frame()
+            obj_name = self.object_names.get(self.current_object_id, f"Object_{self.current_object_id}")
+            messagebox.showinfo("Jump to Annotation", f"Wrapped to last annotated frame for {obj_name}")
+    
+    def jump_to_next_annotated_frame(self):
+        """Jump to the next frame with annotations for the current object"""
+        # Get frames with annotations for current object only
+        current_obj_frames = set()
+        for _, _, _, obj_id, frame_idx in self.click_points:
+            if obj_id == self.current_object_id:
+                current_obj_frames.add(frame_idx)
+        
+        if not current_obj_frames:
+            obj_name = self.object_names.get(self.current_object_id, f"Object_{self.current_object_id}")
+            messagebox.showinfo("No Annotations", f"No annotated frames found for {obj_name}.")
+            return
+        
+        sorted_annotated = sorted(list(current_obj_frames))
+        next_frames = [f for f in sorted_annotated if f > self.current_frame_idx]
+        
+        if next_frames:
+            self.current_frame_idx = next_frames[0]
+            self.display_current_frame()
+        else:
+            self.current_frame_idx = sorted_annotated[0]
+            self.display_current_frame()
+            obj_name = self.object_names.get(self.current_object_id, f"Object_{self.current_object_id}")
+            messagebox.showinfo("Jump to Annotation", f"Wrapped to first annotated frame for {obj_name}")
             
     def on_slider_change(self, value):
         """Handle frame slider change"""
