@@ -35,16 +35,16 @@ except ImportError as e:
     sys.exit(1)
 
 class SAM2Processor:
-    def __init__(self, config_path="configs/sam2.1/sam2.1_hiera_base_plus.pt"):
-        self.config_path = config_path
+    def __init__(self, model_path="checkpoints/sam2_hiera_base_plus.pt"):
+        self.model_path = model_path
         self.sam2_model = None
         self.video_predictor = None
         
     def load_model(self):
         """Load SAM2 model"""
-        print(f"Loading SAM2 model from {self.config_path}...")
+        print(f"Loading SAM2 model from {self.model_path}...")
         try:
-            self.sam2_model = build_sam2_video_predictor(self.config_path, device="cuda" if torch.cuda.is_available() else "cpu")
+            self.sam2_model = build_sam2_video_predictor(self.model_path, device="cuda" if torch.cuda.is_available() else "cpu")
             print("OK: Model loaded successfully")
             return True
         except Exception as e:
@@ -302,7 +302,7 @@ def main():
     parser.add_argument("annotation_file", help="Path to annotation JSON file from SAM2 Video UI")
     parser.add_argument("video_file", help="Path to input video file")
     parser.add_argument("--output_dir", default="sam2_output", help="Output directory (default: sam2_output)")
-    parser.add_argument("--config", default="configs/sam2.1/sam2.1_hiera_b+.yaml", help="SAM2 model config path")
+    parser.add_argument("--model", default="checkpoints/sam2_hiera_base_plus.pt", help="SAM2 model path")
     parser.add_argument("--fps", type=float, default=30.0, help="Output video FPS (default: 30)")
     parser.add_argument("--opacity", type=float, default=0.4, help="Mask overlay opacity (default: 0.4)")
     
@@ -330,7 +330,7 @@ def main():
     print()
     
     # Initialize processor
-    processor = SAM2Processor(args.config)
+    processor = SAM2Processor(args.model)
     
     # Load model
     if not processor.load_model():
@@ -387,5 +387,4 @@ if __name__ == "__main__":
         sys.exit(1)
     except Exception as e:
         print(f"\nProcessing failed: {e}")
-        # sys.exit(1)
-        raise
+        sys.exit(1)
