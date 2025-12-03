@@ -1537,9 +1537,10 @@ class SAM2VideoUI:
                 font_scale = 0.7
                 thickness = 2
                 (text_width, text_height), baseline = cv2.getTextSize(symbol, font, font_scale, thickness)
+                # Center text: putText uses bottom-left corner, so adjust for proper centering
                 text_x = int(scaled_x - text_width / 2)
-                text_y = int(scaled_y + text_height / 2)
-                cv2.putText(display_frame, symbol, (text_x, text_y), 
+                text_y = int(scaled_y + (text_height - baseline) / 2)
+                cv2.putText(display_frame, symbol, (text_x, text_y),
                            font, font_scale, (255, 255, 255), thickness)
                 
                 # Draw object name
@@ -1560,7 +1561,7 @@ class SAM2VideoUI:
             # Calculate scale to fit canvas while maintaining aspect ratio
             scale_w = (canvas_width - 20) / img_width
             scale_h = (canvas_height - 20) / img_height
-            self.scale_factor = min(scale_w, scale_h, 1.0)
+            self.scale_factor = min(scale_w, scale_h)  # Allow upscaling when window enlarged
             
             new_width = int(img_width * self.scale_factor)
             new_height = int(img_height * self.scale_factor)
