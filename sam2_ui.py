@@ -421,7 +421,8 @@ class SAM2VideoUI:
         # Bind canvas events
         self.canvas.bind("<Button-1>", self.on_canvas_click)
         self.canvas.bind("<Button-3>", self.on_canvas_right_click)
-        
+        self.canvas.bind("<Configure>", self.on_canvas_resize)
+
         # Video controls
         controls_frame = ttk.Frame(parent)
         controls_frame.pack(fill=tk.X)
@@ -1584,7 +1585,22 @@ class SAM2VideoUI:
         if self.multi_frame_annotation_mode and self.current_frame_idx in self.annotated_frames:
             frame_text += " (annotated)"
         self.frame_label.config(text=frame_text)
-        
+
+    def on_canvas_resize(self, event):
+        """Handle canvas resize events with debouncing"""
+        # Cancel any pending resize callback
+        if hasattr(self, '_resize_after_id'):
+            self.root.after_cancel(self._resize_after_id)
+
+        # Schedule display update after 100ms delay (debounce)
+        # This prevents excessive updates during active resizing
+        self._resize_after_id = self.root.after(100, self._handle_resize)
+
+    def _handle_resize(self):
+        """Actually handle the resize after debounce delay"""
+        if self.frames:
+            self.display_current_frame()
+
     def on_canvas_click(self, event):
         """Handle left mouse click (positive point or point removal)"""
         if self.point_removal_mode:
