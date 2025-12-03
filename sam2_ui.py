@@ -316,33 +316,31 @@ class SAM2VideoUI:
         # Segmentation controls
         seg_frame = ttk.LabelFrame(scrollable_frame, text="Segmentation", padding=10)
         seg_frame.pack(fill=tk.X, pady=(0, 10))
-        
-        ttk.Button(seg_frame, text="Segment Video", 
-                  command=self.segment_video, width=15).pack(fill=tk.X, pady=2)
-        ttk.Button(seg_frame, text="Refine Segment", 
-                  command=self.toggle_refinement_mode, width=15).pack(fill=tk.X, pady=2)
-        
+
+        # Annotation import/export first
+        ttk.Button(seg_frame, text="Import Annotations",
+                  command=self.import_annotations, width=15).pack(fill=tk.X, pady=2)
+        ttk.Button(seg_frame, text="Export Annotations",
+                  command=self.export_annotations, width=15).pack(fill=tk.X, pady=2)
+
         # Point management buttons
         point_mgmt_frame = ttk.Frame(seg_frame)
         point_mgmt_frame.pack(fill=tk.X, pady=2)
-        
-        ttk.Button(point_mgmt_frame, text="Remove Point", 
+
+        ttk.Button(point_mgmt_frame, text="Remove Point",
                   command=self.toggle_point_removal_mode, width=12).pack(side=tk.LEFT, padx=(0, 5))
-        ttk.Button(point_mgmt_frame, text="Clear All", 
+        ttk.Button(point_mgmt_frame, text="Clear All",
                   command=self.clear_points, width=12).pack(side=tk.LEFT)
-        
-        ttk.Button(seg_frame, text="Show Frame Points", 
+
+        ttk.Button(seg_frame, text="Show Frame Points",
                   command=self.show_frame_points, width=15).pack(fill=tk.X, pady=2)
-        
-        ttk.Button(seg_frame, text="Export Annotations", 
-                  command=self.export_annotations, width=15).pack(fill=tk.X, pady=2)
-        ttk.Button(seg_frame, text="Import Annotations", 
-                  command=self.import_annotations, width=15).pack(fill=tk.X, pady=2)
-        
-        # Multi-frame annotation mode indicator (always active)
-        self.multi_frame_label = ttk.Label(seg_frame, text="MULTI-FRAME ANNOTATION ACTIVE", foreground='blue')
-        self.multi_frame_label.pack(pady=2)
-        
+
+        # Segmentation execution last
+        ttk.Button(seg_frame, text="Segment Video",
+                  command=self.segment_video, width=15).pack(fill=tk.X, pady=2)
+        ttk.Button(seg_frame, text="Refine Segment",
+                  command=self.toggle_refinement_mode, width=15).pack(fill=tk.X, pady=2)
+
         # Refinement mode indicator
         self.refinement_label = ttk.Label(seg_frame, text="", foreground='orange')
         self.refinement_label.pack(pady=2)
@@ -355,9 +353,11 @@ class SAM2VideoUI:
         export_frame = ttk.LabelFrame(scrollable_frame, text="Export", padding=10)
         export_frame.pack(fill=tk.X, pady=(0, 10))
 
-        ttk.Button(export_frame, text="Export Video", 
+        ttk.Button(export_frame, text="Export Video",
                   command=self.export_video, width=15).pack(fill=tk.X, pady=2)
-        
+        ttk.Button(export_frame, text="Export Masks",
+                  command=self.export_masks, width=15).pack(fill=tk.X, pady=2)
+
         # Display options
         display_frame = ttk.LabelFrame(scrollable_frame, text="Display Options", padding=10)
         display_frame.pack(fill=tk.X, pady=(0, 10))
@@ -503,6 +503,10 @@ class SAM2VideoUI:
         lazy_frame.pack(fill=tk.X, pady=(2, 0))
         ttk.Checkbutton(lazy_frame, text="Lazy load frames", variable=self.lazy_load_var).pack(side=tk.LEFT)
         ttk.Label(lazy_frame, text="(load on demand - for very large videos)").pack(side=tk.LEFT, padx=(5, 0))
+
+        # Info about when settings apply
+        ttk.Label(large_video_frame, text="Note: any change made here applies to next video load",
+                  foreground='gray', font=('Arial', 8, 'italic')).pack(pady=(5, 0))
 
         # Info panel
         info_frame = ttk.Frame(controls_frame)
