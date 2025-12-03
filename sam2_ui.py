@@ -13,6 +13,7 @@ import traceback
 from omegaconf import OmegaConf, DictConfig
 import csv
 import time
+import threading
 
 # Add SAM2 path to Python path - dynamically detect project root
 def get_project_root():
@@ -1537,9 +1538,10 @@ class SAM2VideoUI:
                 font_scale = 0.7
                 thickness = 2
                 (text_width, text_height), baseline = cv2.getTextSize(symbol, font, font_scale, thickness)
-                # Center text: putText uses bottom-left corner, so adjust for proper centering
+                # Center text: putText uses baseline (bottom) as Y coordinate
+                # For vertical centering: baseline should be at center + half of text height above baseline
                 text_x = int(scaled_x - text_width / 2)
-                text_y = int(scaled_y + (text_height - baseline) / 2)
+                text_y = int(scaled_y + text_height / 2 - baseline)
                 cv2.putText(display_frame, symbol, (text_x, text_y),
                            font, font_scale, (255, 255, 255), thickness)
                 
@@ -1589,6 +1591,17 @@ class SAM2VideoUI:
 
     def on_canvas_resize(self, event):
         """Handle canvas resize events with debouncing"""
+        # Only respond to actual size changes, not other configure events
+        canvas_width = self.canvas.winfo_width()
+        canvas_height = self.canvas.winfo_height()
+
+        # Check if size actually changed
+        if hasattr(self, '_last_canvas_size'):
+            if (canvas_width, canvas_height) == self._last_canvas_size:
+                return  # Size didn't change, ignore this event
+
+        self._last_canvas_size = (canvas_width, canvas_height)
+
         # Cancel any pending resize callback
         if hasattr(self, '_resize_after_id'):
             self.root.after_cancel(self._resize_after_id)
