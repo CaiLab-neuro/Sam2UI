@@ -7,10 +7,17 @@ Takes annotation JSON from SAM2 Video UI and video file,
 then exports segmented video and masks.
 
 Usage:
-    python process_annotations.py <annotation_file> <video_file> [output_dir]
+    python process_annotations.py <annotation_file> <video_file> [options]
 
-Example:
-    python process_annotations.py annotations.json video.mp4 results/
+Examples:
+    # Use default model (sam2 base+)
+    python process_annotations.py annotations.json video.mp4
+    
+    # Use SAM2.1 large model
+    python process_annotations.py annotations.json video.mp4 --model sam2.1-large
+    
+    # Use custom config and checkpoint
+    python process_annotations.py annotations.json video.mp4 --config configs/sam2/sam2_hiera_l.yaml --checkpoint checkpoints/sam2_hiera_large.pt
 """
 
 import os
@@ -34,21 +41,78 @@ except ImportError as e:
     print("Please run setup.py first to install dependencies.")
     sys.exit(1)
 
+# Model configuration mappings
+MODEL_CONFIGS = {
+    # SAM2 models
+    "sam2-tiny": ("configs/sam2/sam2_hiera_t.yaml", "checkpoints/sam2_hiera_tiny.pt"),
+    "sam2-small": ("configs/sam2/sam2_hiera_s.yaml", "checkpoints/sam2_hiera_small.pt"),
+    "sam2-base+": ("configs/sam2/sam2_hiera_b+.yaml", "checkpoints/sam2_hiera_base_plus.pt"),
+    "sam2-large": ("configs/sam2/sam2_hiera_l.yaml", "checkpoints/sam2_hiera_large.pt"),
+    
+    # SAM2.1 models (if available)
+    "sam2.1-tiny": ("configs/sam2.1/sam2.1_hiera_t.yaml", "checkpoints/sam2.1_hiera_tiny.pt"),
+    "sam2.1-small": ("configs/sam2.1/sam2.1_hiera_s.yaml", "checkpoints/sam2.1_hiera_small.pt"),
+    "sam2.1-base+": ("configs/sam2.1/sam2.1_hiera_b+.yaml", "checkpoints/sam2.1_hiera_base_plus.pt"),
+    "sam2.1-large": ("configs/sam2.1/sam2.1_hiera_l.yaml", "checkpoints/sam2.1_hiera_large.pt"),
+}
+
 class SAM2Processor:
-    def __init__(self, model_path="checkpoints/sam2_hiera_base_plus.pt"):
-        self.model_path = model_path
+    def __init__(self, config_file=None, checkpoint_file=None, model_name="sam2-base+"):
+        """
+        Initialize SAM2 Processor
+        
+        Args:
+            config_file: Path to model config YAML (overrides model_name)
+            checkpoint_file: Path to checkpoint file (overrides model_name)
+            model_name: Preset model name (e.g., 'sam2-base+', 'sam2.1-large')
+        """
+        # Determine config and checkpoint paths
+        if config_file and checkpoint_file:
+            # Use custom paths
+            self.config_file = config_file
+            self.checkpoint_file = checkpoint_file
+        elif model_name in MODEL_CONFIGS:
+            # Use preset model
+            self.config_file, self.checkpoint_file = MODEL_CONFIGS[model_name]
+        else:
+            raise ValueError(f"Unknown model name: {model_name}. Available: {list(MODEL_CONFIGS.keys())}")
+        
+        # Validate paths exist
+        if not os.path.exists(self.config_file):
+            raise FileNotFoundError(f"Config file not found: {self.config_file}")
+        
+        # Checkpoint is optional for some use cases, but warn if missing
+        if not os.path.exists(self.checkpoint_file):
+            print(f"WARNING: Checkpoint file not found: {self.checkpoint_file}")
+            print("Model will be initialized without pre-trained weights.")
+            self.checkpoint_file = None
+        
         self.sam2_model = None
         self.video_predictor = None
         
     def load_model(self):
-        """Load SAM2 model"""
-        print(f"Loading SAM2 model from {self.model_path}...")
+        """Load SAM2 model with correct API usage"""
+        print(f"Loading SAM2 model...")
+        print(f"  Config: {self.config_file}")
+        print(f"  Checkpoint: {self.checkpoint_file or 'None (random init)'}")
+        
         try:
-            self.sam2_model = build_sam2_video_predictor(self.model_path, device="cuda" if torch.cuda.is_available() else "cpu")
+            # FIXED: Pass config_file as first argument, ckpt_path as optional second
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            print(f"  Device: {device}")
+            
+            self.video_predictor = build_sam2_video_predictor(
+                config_file=self.config_file,
+                ckpt_path=self.checkpoint_file,  # Optional parameter
+                device=device
+            )
+            
             print("OK: Model loaded successfully")
             return True
         except Exception as e:
             print(f"ERROR: Failed to load model: {e}")
+            import traceback
+            traceback.print_exc()
             return False
     
     def load_annotations(self, annotation_file):
@@ -71,9 +135,142 @@ class SAM2Processor:
             print(f"ERROR: Failed to load annotations: {e}")
             return None
     
-    def load_video(self, video_path):
-        """Load video and extract frames"""
-        print(f"Loading video from {video_path}...")
+    def get_video_info(self, video_path):
+        """Get video frame count and properties without loading all frames"""
+        print(f"Reading video info from {video_path}...")
+        try:
+            cap = cv2.VideoCapture(video_path)
+            if not cap.isOpened():
+                raise ValueError(f"Cannot open video file: {video_path}")
+            
+            frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            
+            cap.release()
+            
+            print(f"OK: Video info - {frame_count} frames, {fps:.2f} fps, {width}x{height}")
+            return frame_count, fps, width, height
+        except Exception as e:
+            print(f"ERROR: Failed to read video info: {e}")
+            return None, None, None, None
+    
+    def group_annotations_by_frame(self, annotations):
+        """Group annotations by frame index"""
+        frame_annotations = {}
+        for annotation in annotations:
+            frame_idx = annotation["frame_index"]
+            if frame_idx not in frame_annotations:
+                frame_annotations[frame_idx] = []
+            frame_annotations[frame_idx].append(annotation)
+        return frame_annotations
+    
+    def process_segmentation(self, video_path, annotations_data):
+        """Process segmentation using SAM2 - FIXED to use video path directly"""
+        print("Starting segmentation process...")
+        
+        # Group annotations by frame and object
+        frame_annotations = self.group_annotations_by_frame(annotations_data["annotations"])
+        
+        # FIXED: Initialize SAM2 inference state with video path (not frame list)
+        print("Initializing SAM2 inference state...")
+        print(f"  Loading video: {video_path}")
+        
+        inference_state = self.video_predictor.init_state(video_path=video_path)
+        
+        num_frames = inference_state["num_frames"]
+        print(f"  Loaded {num_frames} frames into inference state")
+        
+        # Process each annotated frame
+        object_names = annotations_data.get("object_names", {})
+        object_colors = annotations_data.get("object_colors", {})
+        
+        # Group annotations by object ID
+        objects_with_annotations = {}
+        for frame_idx, annotations in frame_annotations.items():
+            for annotation in annotations:
+                obj_id = annotation["object_id"]
+                if obj_id not in objects_with_annotations:
+                    objects_with_annotations[obj_id] = {}
+                if frame_idx not in objects_with_annotations[obj_id]:
+                    objects_with_annotations[obj_id][frame_idx] = []
+                objects_with_annotations[obj_id][frame_idx].append(annotation)
+        
+        print(f"Processing {len(objects_with_annotations)} objects...")
+        
+        # Process each object
+        for obj_id, obj_frames in objects_with_annotations.items():
+            obj_name = object_names.get(str(obj_id), f"Object_{obj_id}")
+            print(f"\nProcessing {obj_name} (ID: {obj_id})...")
+            
+            # Add prompts for each annotated frame of this object
+            for frame_idx, annotations in sorted(obj_frames.items()):
+                if frame_idx >= num_frames:
+                    print(f"  WARNING: Skipping frame {frame_idx} (beyond video length)")
+                    continue
+                
+                # Prepare points and labels
+                points = []
+                labels = []
+                
+                for annotation in annotations:
+                    x, y = annotation["x"], annotation["y"]
+                    is_positive = annotation["is_positive"]
+                    points.append([x, y])
+                    labels.append(1 if is_positive else 0)
+                
+                if not points:
+                    continue
+                
+                # Convert to numpy arrays
+                points_np = np.array(points, dtype=np.float32)
+                labels_np = np.array(labels, dtype=np.int32)
+                
+                print(f"  Frame {frame_idx}: {len(points)} points")
+                
+                # Add points to this frame for this object
+                try:
+                    _, out_obj_ids, out_mask_logits = self.video_predictor.add_new_points(
+                        inference_state=inference_state,
+                        frame_idx=frame_idx,
+                        obj_id=obj_id,
+                        points=points_np,
+                        labels=labels_np,
+                    )
+                except Exception as e:
+                    print(f"    WARNING: Error adding points: {e}")
+                    continue
+        
+        # Propagate annotations to all frames
+        print("\nPropagating annotations across all frames...")
+        
+        masks_by_frame = {}
+        
+        for out_frame_idx, out_obj_ids, out_mask_logits in self.video_predictor.propagate_in_video(inference_state):
+            frame_masks = {}
+            
+            for i, obj_id in enumerate(out_obj_ids):
+                mask = (out_mask_logits[i] > 0.0).cpu().numpy().squeeze()
+                
+                frame_masks[obj_id] = {
+                    'mask': mask,
+                    'score': 1.0,  # Propagated masks don't have scores
+                    'name': object_names.get(str(obj_id), f"Object_{obj_id}"),
+                    'color': object_colors.get(str(obj_id), [255, 0, 0])
+                }
+            
+            masks_by_frame[out_frame_idx] = frame_masks
+            
+            if (out_frame_idx + 1) % 50 == 0:
+                print(f"  Processed frame {out_frame_idx + 1}/{num_frames}")
+        
+        print(f"OK: Generated masks for {len(masks_by_frame)} frames")
+        return masks_by_frame, object_names, object_colors, num_frames
+    
+    def load_video_frames_for_export(self, video_path):
+        """Load video frames for export (needed after segmentation)"""
+        print(f"Loading video frames for export...")
         try:
             cap = cv2.VideoCapture(video_path)
             if not cap.isOpened():
@@ -86,6 +283,7 @@ class SAM2Processor:
                 ret, frame = cap.read()
                 if not ret:
                     break
+                # Keep in BGR for export
                 frames.append(frame)
                 frame_count += 1
                 
@@ -93,93 +291,13 @@ class SAM2Processor:
                     print(f"   Loaded {frame_count} frames...")
             
             cap.release()
-            print(f"OK: Loaded {len(frames)} frames from video")
+            print(f"OK: Loaded {len(frames)} frames for export")
             return frames
         except Exception as e:
-            print(f"ERROR: Failed to load video: {e}")
+            print(f"ERROR: Failed to load video frames: {e}")
             return None
     
-    def group_annotations_by_frame(self, annotations):
-        """Group annotations by frame index"""
-        frame_annotations = {}
-        for annotation in annotations:
-            frame_idx = annotation["frame_index"]
-            if frame_idx not in frame_annotations:
-                frame_annotations[frame_idx] = []
-            frame_annotations[frame_idx].append(annotation)
-        return frame_annotations
-    
-    def process_segmentation(self, frames, annotations_data):
-        """Process segmentation using SAM2"""
-        print("Starting segmentation process...")
-        
-        # Group annotations by frame
-        frame_annotations = self.group_annotations_by_frame(annotations_data["annotations"])
-        
-        # Initialize SAM2 state
-        print("Initializing SAM2 state...")
-        self.video_predictor.init_state(frames[0])
-        
-        # Process each annotated frame
-        masks_by_frame = {}
-        object_names = annotations_data.get("object_names", {})
-        object_colors = annotations_data.get("object_colors", {})
-        
-        for frame_idx, annotations in frame_annotations.items():
-            if frame_idx >= len(frames):
-                print(f"WARNING: Skipping frame {frame_idx} (beyond video length)")
-                continue
-                
-            print(f"Processing frame {frame_idx} with {len(annotations)} annotations...")
-            
-            # Prepare points and labels for this frame
-            points = []
-            labels = []
-            object_ids = []
-            
-            for annotation in annotations:
-                x, y = annotation["x"], annotation["y"]
-                is_positive = annotation["is_positive"]
-                obj_id = annotation["object_id"]
-                
-                points.append([x, y])
-                labels.append(1 if is_positive else 0)
-                object_ids.append(obj_id)
-            
-            if not points:
-                continue
-            
-            # Convert to numpy arrays
-            points = np.array(points)
-            labels = np.array(labels)
-            
-            # Run SAM2 prediction
-            try:
-                masks, scores, logits = self.video_predictor.predict(
-                    frame_idx, points, labels
-                )
-                
-                # Store masks for this frame
-                frame_masks = {}
-                for i, (mask, score, obj_id) in enumerate(zip(masks, scores, object_ids)):
-                    if score > 0.5:  # Threshold for mask quality
-                        frame_masks[obj_id] = {
-                            'mask': mask,
-                            'score': score,
-                            'name': object_names.get(str(obj_id), f"Object_{obj_id}"),
-                            'color': object_colors.get(str(obj_id), [255, 0, 0])
-                        }
-                
-                masks_by_frame[frame_idx] = frame_masks
-                print(f"   Generated {len(frame_masks)} masks")
-                
-            except Exception as e:
-                print(f"   WARNING: Error processing frame {frame_idx}: {e}")
-                continue
-        
-        return masks_by_frame, object_names, object_colors
-    
-    def export_masks(self, masks_by_frame, frames, object_names, output_dir):
+    def export_masks(self, masks_by_frame, video_path, object_names, output_dir):
         """Export individual mask images"""
         print("Exporting mask images...")
         
@@ -188,10 +306,13 @@ class SAM2Processor:
         
         exported_count = 0
         
+        # Get video dimensions
+        cap = cv2.VideoCapture(video_path)
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        cap.release()
+        
         for frame_idx, frame_masks in masks_by_frame.items():
-            if frame_idx >= len(frames):
-                continue
-                
             for obj_id, mask_data in frame_masks.items():
                 mask = mask_data['mask']
                 name = mask_data['name']
@@ -200,36 +321,43 @@ class SAM2Processor:
                 mask_filename = f"frame_{frame_idx:06d}_{name}_{obj_id}.png"
                 mask_path = masks_dir / mask_filename
                 
-                # Convert mask to PIL Image and save
-                mask_image = Image.fromarray((mask * 255).astype(np.uint8))
-                mask_image.save(mask_path)
+                # Resize mask to original video dimensions if needed
+                if mask.shape != (height, width):
+                    from PIL import Image as PILImage
+                    mask_pil = PILImage.fromarray((mask * 255).astype(np.uint8))
+                    mask_pil = mask_pil.resize((width, height), PILImage.NEAREST)
+                    mask_pil.save(mask_path)
+                else:
+                    mask_image = Image.fromarray((mask * 255).astype(np.uint8))
+                    mask_image.save(mask_path)
+                
                 exported_count += 1
         
         print(f"OK: Exported {exported_count} mask images to {masks_dir}")
         return exported_count
     
-    def export_video(self, masks_by_frame, frames, object_names, object_colors, 
+    def export_video(self, masks_by_frame, video_path, object_names, object_colors, 
                     output_dir, fps=30, overlay_opacity=0.4):
         """Export segmented video with overlays"""
         print("Exporting segmented video...")
         
-        video_path = Path(output_dir) / "segmented_video.mp4"
-        
+        # Load video frames for export
+        frames = self.load_video_frames_for_export(video_path)
         if not frames:
-            print("ERROR: No frames to process")
             return False
+        
+        video_output_path = Path(output_dir) / "segmented_video.mp4"
         
         # Get video dimensions
         height, width = frames[0].shape[:2]
         
         # Initialize video writer
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        out = cv2.VideoWriter(str(video_path), fourcc, fps, (width, height))
+        out = cv2.VideoWriter(str(video_output_path), fourcc, fps, (width, height))
         
         processed_frames = 0
         
         for frame_idx, frame in enumerate(frames):
-            # Create overlay frame
             overlay_frame = frame.copy()
             
             if frame_idx in masks_by_frame:
@@ -240,9 +368,20 @@ class SAM2Processor:
                     color = mask_data['color']
                     name = mask_data['name']
                     
-                    # Create colored mask
+                    # Resize mask to match frame dimensions if needed
+                    if mask.shape != (height, width):
+                        from PIL import Image as PILImage
+                        mask_pil = PILImage.fromarray((mask * 255).astype(np.uint8))
+                        mask_pil = mask_pil.resize((width, height), PILImage.NEAREST)
+                        mask = np.array(mask_pil) > 0
+                    
+                    # Create colored mask (BGR format)
                     colored_mask = np.zeros((height, width, 3), dtype=np.uint8)
-                    colored_mask[mask] = color
+                    # Handle color format - could be RGB list or string
+                    if isinstance(color, (list, tuple)):
+                        colored_mask[mask] = color[::-1]  # RGB to BGR
+                    else:
+                        colored_mask[mask] = [0, 0, 255]  # Default red in BGR
                     
                     # Blend with original frame
                     overlay_frame = cv2.addWeighted(overlay_frame, 1-overlay_opacity, 
@@ -265,10 +404,10 @@ class SAM2Processor:
             processed_frames += 1
             
             if processed_frames % 100 == 0:
-                print(f"   Processed {processed_frames} frames...")
+                print(f"   Processed {processed_frames}/{len(frames)} frames...")
         
         out.release()
-        print(f"OK: Exported segmented video to {video_path}")
+        print(f"OK: Exported segmented video to {video_output_path}")
         return True
     
     def export_metadata(self, annotations_data, masks_by_frame, output_dir):
@@ -278,6 +417,8 @@ class SAM2Processor:
         metadata = {
             "processing_info": {
                 "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "config_file": self.config_file,
+                "checkpoint_file": self.checkpoint_file,
                 "total_frames_processed": len(masks_by_frame),
                 "total_masks_generated": sum(len(masks) for masks in masks_by_frame.values()),
                 "objects_detected": list(set(
@@ -298,15 +439,49 @@ class SAM2Processor:
 
 def main():
     """Main processing function"""
-    parser = argparse.ArgumentParser(description="Process SAM2 annotations and generate segmented output")
+    parser = argparse.ArgumentParser(
+        description="Process SAM2 annotations and generate segmented output",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=f"""
+Available preset models:
+  {', '.join(MODEL_CONFIGS.keys())}
+
+Examples:
+  # Use default model (sam2-base+)
+  python process_annotations.py annotations.json video.mp4
+  
+  # Use SAM2.1 large model
+  python process_annotations.py annotations.json video.mp4 --model sam2.1-large
+  
+  # Use custom config and checkpoint
+  python process_annotations.py annotations.json video.mp4 \\
+    --config configs/sam2/sam2_hiera_l.yaml \\
+    --checkpoint checkpoints/sam2_hiera_large.pt
+        """
+    )
+    
     parser.add_argument("annotation_file", help="Path to annotation JSON file from SAM2 Video UI")
     parser.add_argument("video_file", help="Path to input video file")
     parser.add_argument("--output_dir", default="sam2_output", help="Output directory (default: sam2_output)")
-    parser.add_argument("--model", default="checkpoints/sam2_hiera_base_plus.pt", help="SAM2 model path")
+    
+    # Model selection (mutually exclusive)
+    model_group = parser.add_mutually_exclusive_group()
+    model_group.add_argument("--model", default="sam2-base+", 
+                           choices=list(MODEL_CONFIGS.keys()),
+                           help="Preset model name (default: sam2-base+)")
+    model_group.add_argument("--config", help="Custom config YAML path (requires --checkpoint)")
+    
+    parser.add_argument("--checkpoint", help="Custom checkpoint path (requires --config)")
     parser.add_argument("--fps", type=float, default=30.0, help="Output video FPS (default: 30)")
     parser.add_argument("--opacity", type=float, default=0.4, help="Mask overlay opacity (default: 0.4)")
     
     args = parser.parse_args()
+    
+    # Validate custom config/checkpoint usage
+    if args.config and not args.checkpoint:
+        parser.error("--config requires --checkpoint")
+    if args.checkpoint and not args.config:
+        parser.error("--checkpoint requires --config")
     
     # Validate input files
     if not os.path.exists(args.annotation_file):
@@ -330,7 +505,14 @@ def main():
     print()
     
     # Initialize processor
-    processor = SAM2Processor(args.model)
+    try:
+        if args.config:
+            processor = SAM2Processor(config_file=args.config, checkpoint_file=args.checkpoint)
+        else:
+            processor = SAM2Processor(model_name=args.model)
+    except (ValueError, FileNotFoundError) as e:
+        print(f"ERROR: {e}")
+        return 1
     
     # Load model
     if not processor.load_model():
@@ -341,25 +523,29 @@ def main():
     if not annotations_data:
         return 1
     
-    # Load video
-    frames = processor.load_video(args.video_file)
-    if frames is None:
+    # Get video info
+    frame_count, fps, width, height = processor.get_video_info(args.video_file)
+    if frame_count is None:
         return 1
     
-    # Process segmentation
-    masks_by_frame, object_names, object_colors = processor.process_segmentation(
-        frames, annotations_data
+    # Use video FPS if not specified
+    if args.fps == 30.0 and fps:
+        args.fps = fps
+    
+    # Process segmentation (FIXED: pass video path, not frames)
+    masks_by_frame, object_names, object_colors, num_frames = processor.process_segmentation(
+        args.video_file, annotations_data
     )
     
     if not masks_by_frame:
         print("ERROR: No masks generated")
         return 1
     
-    print(f"OK: Generated masks for {len(masks_by_frame)} frames")
+    print(f"\nOK: Generated masks for {len(masks_by_frame)} frames")
     
     # Export results
-    processor.export_masks(masks_by_frame, frames, object_names, output_dir)
-    processor.export_video(masks_by_frame, frames, object_names, object_colors, 
+    processor.export_masks(masks_by_frame, args.video_file, object_names, output_dir)
+    processor.export_video(masks_by_frame, args.video_file, object_names, object_colors, 
                          output_dir, args.fps, args.opacity)
     processor.export_metadata(annotations_data, masks_by_frame, output_dir)
     
@@ -387,4 +573,6 @@ if __name__ == "__main__":
         sys.exit(1)
     except Exception as e:
         print(f"\nProcessing failed: {e}")
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
