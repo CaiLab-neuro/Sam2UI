@@ -328,8 +328,11 @@ class SAM2VideoUI:
         point_mgmt_frame = ttk.Frame(seg_frame)
         point_mgmt_frame.pack(fill=tk.X, pady=2)
 
-        ttk.Button(point_mgmt_frame, text="Remove Point",
-                  command=self.toggle_point_removal_mode, width=12).pack(side=tk.LEFT, padx=(0, 5))
+        self.remove_point_button = tk.Button(point_mgmt_frame, text="Remove Point",
+                  command=self.toggle_point_removal_mode, width=12,
+                  bg='#404040', fg='white', activebackground='#505050')
+        self.remove_point_button.pack(side=tk.LEFT, padx=(0, 5))
+
         ttk.Button(point_mgmt_frame, text="Clear All",
                   command=self.clear_points, width=12).pack(side=tk.LEFT)
 
@@ -339,16 +342,11 @@ class SAM2VideoUI:
         # Segmentation execution last
         ttk.Button(seg_frame, text="Segment Video",
                   command=self.segment_video, width=15).pack(fill=tk.X, pady=2)
-        ttk.Button(seg_frame, text="Refine Segment",
-                  command=self.toggle_refinement_mode, width=15).pack(fill=tk.X, pady=2)
 
-        # Refinement mode indicator
-        self.refinement_label = ttk.Label(seg_frame, text="", foreground='orange')
-        self.refinement_label.pack(pady=2)
-        
-        # Point removal mode indicator
-        self.point_removal_label = ttk.Label(seg_frame, text="", foreground='red')
-        self.point_removal_label.pack(pady=2)
+        self.refine_segment_button = tk.Button(seg_frame, text="Refine Segment",
+                  command=self.toggle_refinement_mode, width=15,
+                  bg='#404040', fg='white', activebackground='#505050')
+        self.refine_segment_button.pack(fill=tk.X, pady=2)
         
         # Export controls
         export_frame = ttk.LabelFrame(scrollable_frame, text="Export", padding=10)
@@ -434,9 +432,18 @@ class SAM2VideoUI:
         
         self.play_button = ttk.Button(playback_frame, text="Play", command=self.toggle_play)
         self.play_button.pack(side=tk.LEFT, padx=(0, 5))
-        
-        ttk.Button(playback_frame, text="Prev", command=self.prev_frame).pack(side=tk.LEFT, padx=(0, 5))
-        ttk.Button(playback_frame, text="Next", command=self.next_frame).pack(side=tk.LEFT, padx=(0, 5))
+
+        # Prev/Next buttons with hold-to-scroll support
+        self.prev_button = tk.Button(playback_frame, text="Prev", bg='#404040', fg='white')
+        self.prev_button.pack(side=tk.LEFT, padx=(0, 5))
+        self.prev_button.bind("<ButtonPress-1>", lambda e: self._start_continuous_nav("prev"))
+        self.prev_button.bind("<ButtonRelease-1>", lambda e: self._stop_continuous_nav())
+
+        self.next_button = tk.Button(playback_frame, text="Next", bg='#404040', fg='white')
+        self.next_button.pack(side=tk.LEFT, padx=(0, 5))
+        self.next_button.bind("<ButtonPress-1>", lambda e: self._start_continuous_nav("next"))
+        self.next_button.bind("<ButtonRelease-1>", lambda e: self._stop_continuous_nav())
+
         ttk.Button(playback_frame, text="Reset", command=self.reset_video).pack(side=tk.LEFT, padx=(10, 0))
         
         # Jump to annotated frames buttons
@@ -1047,32 +1054,36 @@ class SAM2VideoUI:
     def toggle_refinement_mode(self):
         """Toggle refinement mode for improving segmentation"""
         self.refinement_mode = not self.refinement_mode
-        
+
         if self.refinement_mode:
-            self.refinement_label.config(text="REFINEMENT MODE ACTIVE")
+            # Change button color to indicate active state
+            self.refine_segment_button.config(bg='#FF8C00', activebackground='#FFA500')  # Orange
             self.status_label.config(text="Refinement mode: Select frames to improve, add points, then re-segment")
             if hasattr(self, 'select_frame_button'):
                 self.select_frame_button.state(["!disabled"])  # enable
             # Multi-frame annotation mode stays active
         else:
-            self.refinement_label.config(text="")
+            # Reset button color to normal
+            self.refine_segment_button.config(bg='#404040', activebackground='#505050')
             self.selected_frames_for_refinement.clear()
             self.status_label.config(text="Refinement mode disabled")
             if hasattr(self, 'select_frame_button'):
                 self.select_frame_button.state(["disabled"])  # disable
-    
+
     def toggle_point_removal_mode(self):
         """Toggle point removal mode for removing individual annotation points"""
         self.point_removal_mode = not self.point_removal_mode
-        
+
         if self.point_removal_mode:
-            self.point_removal_label.config(text="POINT REMOVAL MODE ACTIVE")
+            # Change button color to indicate active state
+            self.remove_point_button.config(bg='#DC143C', activebackground='#FF6347')  # Red
             self.status_label.config(text="Point removal mode: Click on annotation points to remove them")
             # Disable other modes
             self.refinement_mode = False
-            self.refinement_label.config(text="")
+            self.refine_segment_button.config(bg='#404040', activebackground='#505050')
         else:
-            self.point_removal_label.config(text="")
+            # Reset button color to normal
+            self.remove_point_button.config(bg='#404040', activebackground='#505050')
             self.status_label.config(text="Point removal mode disabled")
     
     def remove_point_at_location(self, x, y, frame_idx):
@@ -1527,23 +1538,34 @@ class SAM2VideoUI:
                 
                 obj_color = self.object_colors.get(obj_id, [255, 255, 255])
                 color = tuple(obj_color) if is_positive else (255, 0, 0)
-                symbol = "+" if is_positive else "-"
-                
+
                 # Draw circle using SCALED coordinates
                 cv2.circle(display_frame, (int(scaled_x), int(scaled_y)), 8, color, -1)
                 cv2.circle(display_frame, (int(scaled_x), int(scaled_y)), 10, (255, 255, 255), 2)
-                
-                # Draw symbol - center it properly
-                font = cv2.FONT_HERSHEY_SIMPLEX
-                font_scale = 0.7
-                thickness = 2
-                (text_width, text_height), baseline = cv2.getTextSize(symbol, font, font_scale, thickness)
-                # Center text: putText uses baseline (bottom) as Y coordinate
-                # For vertical centering: baseline should be at center + half of text height above baseline
-                text_x = int(scaled_x - text_width / 2)
-                text_y = int(scaled_y + text_height / 2 - baseline)
-                cv2.putText(display_frame, symbol, (text_x, text_y),
-                           font, font_scale, (255, 255, 255), thickness)
+
+                # Draw symbol using lines instead of text for perfect alignment
+                line_length = 6
+                line_thickness = 2
+                white = (255, 255, 255)
+
+                if is_positive:
+                    # Draw + (vertical and horizontal lines)
+                    # Vertical line
+                    cv2.line(display_frame,
+                            (int(scaled_x), int(scaled_y - line_length)),
+                            (int(scaled_x), int(scaled_y + line_length)),
+                            white, line_thickness)
+                    # Horizontal line
+                    cv2.line(display_frame,
+                            (int(scaled_x - line_length), int(scaled_y)),
+                            (int(scaled_x + line_length), int(scaled_y)),
+                            white, line_thickness)
+                else:
+                    # Draw - (horizontal line only)
+                    cv2.line(display_frame,
+                            (int(scaled_x - line_length), int(scaled_y)),
+                            (int(scaled_x + line_length), int(scaled_y)),
+                            white, line_thickness)
                 
                 # Draw object name
                 obj_name = self.object_names.get(obj_id, f"Obj{obj_id}")[:8]
@@ -1794,7 +1816,65 @@ class SAM2VideoUI:
         if self.frames and self.current_frame_idx < len(self.frames) - 1:
             self.current_frame_idx += 1
             self.display_current_frame()
-            
+
+    def _start_continuous_nav(self, direction):
+        """Start continuous frame navigation on button hold"""
+        # Cancel any existing navigation
+        self._stop_continuous_nav()
+
+        # Record start time for threshold detection
+        self._nav_start_time = time.time()
+        self._nav_direction = direction
+
+        # Initial single frame move (immediate response)
+        if direction == "prev":
+            self.prev_frame()
+        else:
+            self.next_frame()
+
+        # Schedule check for continuous navigation after threshold
+        self._nav_check_id = self.root.after(300, self._check_continuous_nav)
+
+    def _check_continuous_nav(self):
+        """Check if button is still held and start continuous navigation"""
+        # If we get here, button has been held for 300ms - start continuous mode
+        self._continuous_nav()
+
+    def _continuous_nav(self):
+        """Continuously navigate frames while button is held"""
+        if not hasattr(self, '_nav_direction'):
+            return
+
+        # Move to next/prev frame
+        if self._nav_direction == "prev":
+            if self.frames and self.current_frame_idx > 0:
+                self.current_frame_idx -= 1
+                self.display_current_frame()
+        else:  # next
+            if self.frames and self.current_frame_idx < len(self.frames) - 1:
+                self.current_frame_idx += 1
+                self.display_current_frame()
+
+        # Schedule next move (faster rate during continuous nav)
+        self._nav_repeat_id = self.root.after(50, self._continuous_nav)
+
+    def _stop_continuous_nav(self):
+        """Stop continuous frame navigation"""
+        # Cancel pending navigation callbacks
+        if hasattr(self, '_nav_check_id'):
+            self.root.after_cancel(self._nav_check_id)
+            delattr(self, '_nav_check_id')
+
+        if hasattr(self, '_nav_repeat_id'):
+            self.root.after_cancel(self._nav_repeat_id)
+            delattr(self, '_nav_repeat_id')
+
+        if hasattr(self, '_nav_direction'):
+            delattr(self, '_nav_direction')
+
+        if hasattr(self, '_nav_start_time'):
+            delattr(self, '_nav_start_time')
+
     def reset_video(self):
         """Reset to first frame"""
         if self.frames:
