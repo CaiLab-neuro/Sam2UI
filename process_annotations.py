@@ -333,32 +333,11 @@ class SAM2Processor:
 
             masks_by_frame = {}
 
-            for out_frame_idx, out_obj_ids, out_mask_logits in self.video_predictor.propagate_in_video(
-                inference_state, reverse=False
-            ):
-                frame_masks = {}
-
-                for i, obj_id in enumerate(out_obj_ids):
-                    mask = (out_mask_logits[i] > 0.0).cpu().numpy().squeeze()
-
-                    frame_masks[obj_id] = {
-                        'mask': mask,
-                        'score': 1.0,
-                        'name': object_names.get(str(obj_id), f"Object_{obj_id}"),
-                        'color': object_colors.get(str(obj_id), [255, 0, 0])
-                    }
-
-                masks_by_frame[out_frame_idx] = frame_masks
-
-                if (out_frame_idx + 1) % 50 == 0:
-                    print(f"  Forward: Processed frame {out_frame_idx + 1}/{num_frames}")
-
-            # Propagate annotations - BACKWARD direction (if needed)
-            if earliest_frame > 0:
-                print(f"\nPropagating annotations BACKWARD from frame {earliest_frame}...")
-
+            # CRITICAL: Nested autocast context to handle bfloat16 tensors from CPU offloading
+            # Matches SAM2 benchmark.py pattern (line 72) for proper dtype handling
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 for out_frame_idx, out_obj_ids, out_mask_logits in self.video_predictor.propagate_in_video(
-                    inference_state, reverse=True
+                    inference_state, reverse=False
                 ):
                     frame_masks = {}
 
@@ -375,7 +354,34 @@ class SAM2Processor:
                     masks_by_frame[out_frame_idx] = frame_masks
 
                     if (out_frame_idx + 1) % 50 == 0:
-                        print(f"  Backward: Processed frame {out_frame_idx + 1}/{num_frames}")
+                        print(f"  Forward: Processed frame {out_frame_idx + 1}/{num_frames}")
+
+            # Propagate annotations - BACKWARD direction (if needed)
+            if earliest_frame > 0:
+                print(f"\nPropagating annotations BACKWARD from frame {earliest_frame}...")
+
+                # CRITICAL: Nested autocast context to handle bfloat16 tensors from CPU offloading
+                # Matches SAM2 benchmark.py pattern (line 72) for proper dtype handling
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    for out_frame_idx, out_obj_ids, out_mask_logits in self.video_predictor.propagate_in_video(
+                        inference_state, reverse=True
+                    ):
+                        frame_masks = {}
+
+                        for i, obj_id in enumerate(out_obj_ids):
+                            mask = (out_mask_logits[i] > 0.0).cpu().numpy().squeeze()
+
+                            frame_masks[obj_id] = {
+                                'mask': mask,
+                                'score': 1.0,
+                                'name': object_names.get(str(obj_id), f"Object_{obj_id}"),
+                                'color': object_colors.get(str(obj_id), [255, 0, 0])
+                            }
+
+                        masks_by_frame[out_frame_idx] = frame_masks
+
+                        if (out_frame_idx + 1) % 50 == 0:
+                            print(f"  Backward: Processed frame {out_frame_idx + 1}/{num_frames}")
             else:
                 print("  Skipping backward propagation (earliest annotation at frame 0)")
 
