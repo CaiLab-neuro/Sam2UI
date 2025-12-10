@@ -36,6 +36,8 @@ import numpy as np
 import torch
 from PIL import Image
 
+import psutil
+
 # Add SAM2 to path
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
@@ -200,47 +202,69 @@ class SAM2Processor:
             frame_annotations[frame_idx].append(annotation)
         return frame_annotations
     
-    def process_segmentation(self, video_path, annotations_data):
+    def process_segmentation(self, video_path, annotations_data, output_dir, frame_dir=None):
         """Process segmentation using SAM2"""
-        return self.process_segmentation_full(video_path, annotations_data)
-    
-    def process_segmentation_full(self, video_path, annotations_data):
-        """Process segmentation - load all masks into memory (UI-style approach)"""
-        print("Starting segmentation process (full memory mode)...")
+        return self.process_segmentation_full(video_path, annotations_data, output_dir, frame_dir=frame_dir)
+
+    def process_segmentation_full(self, video_path, annotations_data, output_dir, frame_dir=None):
+        """Process segmentation with streaming mask export to reduce memory usage"""
+        print("Starting segmentation process (streaming export mode)...")
 
         # Group annotations by frame and object
         frame_annotations = self.group_annotations_by_frame(annotations_data["annotations"])
 
-        # Create temporary directory for JPEG frames (sam2ui.py approach)
-        temp_dir = tempfile.mkdtemp(prefix='sam2_frames_')
-        print(f"  Extracting frames to: {temp_dir}")
+        # Create or reuse frame directory
+        if frame_dir:
+            # Use persistent frame directory
+            temp_dir = Path(frame_dir)
+            temp_dir.mkdir(parents=True, exist_ok=True)
+            is_persistent = True
+
+            # Check if frames already exist
+            existing_frames = sorted(temp_dir.glob("*.jpg"))
+            if existing_frames:
+                print(f"  Reusing existing frames from: {temp_dir}")
+                print(f"  Found {len(existing_frames)} frames")
+                skip_extraction = True
+            else:
+                print(f"  Extracting frames to persistent directory: {temp_dir}")
+                skip_extraction = False
+        else:
+            # Use temporary directory (will be deleted after processing)
+            temp_dir = Path(tempfile.mkdtemp(prefix='sam2_frames_'))
+            is_persistent = False
+            skip_extraction = False
+            print(f"  Extracting frames to temporary directory: {temp_dir}")
 
         try:
-            # Extract all frames to JPEGs
-            cap = cv2.VideoCapture(video_path)
-            if not cap.isOpened():
-                raise ValueError(f"Cannot open video file: {video_path}")
+            # Extract frames if needed
+            if not skip_extraction:
+                cap = cv2.VideoCapture(video_path)
+                if not cap.isOpened():
+                    raise ValueError(f"Cannot open video file: {video_path}")
 
-            save_idx = 0
-            while True:
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                frame_path = os.path.join(temp_dir, f"{save_idx:05d}.jpg")
-                cv2.imwrite(frame_path, frame)
-                save_idx += 1
+                save_idx = 0
+                while True:
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+                    frame_path = temp_dir / f"{save_idx:05d}.jpg"
+                    cv2.imwrite(str(frame_path), frame)
+                    save_idx += 1
 
-                if save_idx % 500 == 0:
-                    print(f"  Extracted {save_idx} frames...")
+                    if save_idx % 500 == 0:
+                        print(f"  Extracted {save_idx} frames...")
 
-            cap.release()
-            print(f"  Extracted {save_idx} frames to temp directory")
+                cap.release()
+                print(f"  Extracted {save_idx} frames")
+            else:
+                print(f"  Skipping frame extraction (using existing frames)")
 
             # Initialize SAM2 inference state with JPEG directory
             print("Initializing SAM2 inference state...")
 
             # Build init_state parameters
-            init_params = {'video_path': temp_dir}
+            init_params = {'video_path': str(temp_dir)}
 
             # Add offloading if configured
             if hasattr(self, 'offload_to_cpu') and self.offload_to_cpu:
@@ -328,10 +352,14 @@ class SAM2Processor:
             # Determine earliest annotation frame for bidirectional propagation
             earliest_frame = min(frame_annotations.keys()) if frame_annotations else 0
 
+            # Create output directories for streaming export
+            masks_dir = Path(output_dir) / "masks"
+            masks_dir.mkdir(parents=True, exist_ok=True)
+
             # Propagate annotations - FORWARD direction first
             print(f"\nPropagating annotations FORWARD from frame {earliest_frame}...")
 
-            masks_by_frame = {}
+            masks_metadata = {}  # Only metadata, not actual mask arrays
 
             # CRITICAL: Nested autocast context to handle bfloat16 tensors from CPU offloading
             # Matches SAM2 benchmark.py pattern (line 72) for proper dtype handling
@@ -344,17 +372,48 @@ class SAM2Processor:
                     for i, obj_id in enumerate(out_obj_ids):
                         mask = (out_mask_logits[i] > 0.0).cpu().numpy().squeeze()
 
+                        # Get object info
+                        obj_name = object_names.get(str(obj_id), f"Object_{obj_id}")
+                        obj_color = object_colors.get(str(obj_id), [255, 0, 0])
+
+                        # Export mask to disk immediately (streaming export)
+                        mask_filename = f"mask_f{out_frame_idx:06d}_{obj_name}_id{obj_id}.png"
+                        mask_path = masks_dir / mask_filename
+                        cv2.imwrite(str(mask_path), (mask * 255).astype(np.uint8))
+
+                        # Store metadata only (no mask array!)
                         frame_masks[obj_id] = {
-                            'mask': mask,
+                            'filename': mask_filename,
                             'score': 1.0,
-                            'name': object_names.get(str(obj_id), f"Object_{obj_id}"),
-                            'color': object_colors.get(str(obj_id), [255, 0, 0])
+                            'name': obj_name,
+                            'color': obj_color
                         }
 
-                    masks_by_frame[out_frame_idx] = frame_masks
+                        # Explicitly delete mask array
+                        del mask
+
+                    masks_metadata[out_frame_idx] = frame_masks
+
+                    # Delete output tensors after each frame
+                    del out_mask_logits
 
                     if (out_frame_idx + 1) % 50 == 0:
-                        print(f"  Forward: Processed frame {out_frame_idx + 1}/{num_frames}")
+                        # Monitor GPU and RAM usage to track memory growth
+                        gpu_allocated = torch.cuda.memory_allocated() / (1024**3)
+                        gpu_reserved = torch.cuda.memory_reserved() / (1024**3)
+                        gpu_peak = torch.cuda.max_memory_allocated() / (1024**3)
+
+                        process = psutil.Process()
+                        ram_used = process.memory_info().rss / (1024**3)
+
+                        print(f"  Forward: Frame {out_frame_idx + 1}/{num_frames} | "
+                              f"GPU: {gpu_allocated:.2f}GB (peak: {gpu_peak:.2f}GB) | "
+                              f"RAM: {ram_used:.2f}GB")
+
+                        # Reset peak stats for next interval
+                        torch.cuda.reset_peak_memory_stats()
+                        # Clear GPU memory fragmentation
+                        torch.cuda.empty_cache()
 
             # Propagate annotations - BACKWARD direction (if needed)
             if earliest_frame > 0:
@@ -371,81 +430,98 @@ class SAM2Processor:
                         for i, obj_id in enumerate(out_obj_ids):
                             mask = (out_mask_logits[i] > 0.0).cpu().numpy().squeeze()
 
+                            # Get object info
+                            obj_name = object_names.get(str(obj_id), f"Object_{obj_id}")
+                            obj_color = object_colors.get(str(obj_id), [255, 0, 0])
+
+                            # Export mask to disk immediately (streaming export)
+                            mask_filename = f"mask_f{out_frame_idx:06d}_{obj_name}_id{obj_id}.png"
+                            mask_path = masks_dir / mask_filename
+                            cv2.imwrite(str(mask_path), (mask * 255).astype(np.uint8))
+
+                            # Store metadata only (no mask array!)
                             frame_masks[obj_id] = {
-                                'mask': mask,
+                                'filename': mask_filename,
                                 'score': 1.0,
-                                'name': object_names.get(str(obj_id), f"Object_{obj_id}"),
-                                'color': object_colors.get(str(obj_id), [255, 0, 0])
+                                'name': obj_name,
+                                'color': obj_color
                             }
 
-                        masks_by_frame[out_frame_idx] = frame_masks
+                            # Explicitly delete mask array
+                            del mask
+
+                        masks_metadata[out_frame_idx] = frame_masks
+
+                        # Delete output tensors after each frame
+                        del out_mask_logits
 
                         if (out_frame_idx + 1) % 50 == 0:
-                            print(f"  Backward: Processed frame {out_frame_idx + 1}/{num_frames}")
+                            # Monitor GPU and RAM usage to track memory growth
+                            gpu_allocated = torch.cuda.memory_allocated() / (1024**3)
+                            gpu_reserved = torch.cuda.memory_reserved() / (1024**3)
+                            gpu_peak = torch.cuda.max_memory_allocated() / (1024**3)
+
+                            process = psutil.Process()
+                            ram_used = process.memory_info().rss / (1024**3)
+
+                            print(f"  Backward: Frame {out_frame_idx + 1}/{num_frames} | "
+                                  f"GPU: {gpu_allocated:.2f}GB (peak: {gpu_peak:.2f}GB) | "
+                                  f"RAM: {ram_used:.2f}GB")
+
+                            # Reset peak stats for next interval
+                            torch.cuda.reset_peak_memory_stats()
+                            # Clear GPU memory fragmentation
+                            torch.cuda.empty_cache()
             else:
                 print("  Skipping backward propagation (earliest annotation at frame 0)")
 
-            print(f"OK: Generated masks for {len(masks_by_frame)} frames")
-            return masks_by_frame, object_names, object_colors, num_frames
+            # Phase 2: Clear SAM2's internal frame outputs (safe after propagation)
+            print("\nCleaning up SAM2 inference state...")
+            for obj_idx in range(len(objects_with_annotations)):
+                obj_output_dict = inference_state["output_dict_per_obj"][obj_idx]
+                # Clear non-conditioning frames (keep conditioning for potential refinement)
+                non_cond = obj_output_dict.get("non_cond_frame_outputs", {})
+                non_cond.clear()
+
+            torch.cuda.empty_cache()
+            print("OK: Cleaned SAM2 memory")
+
+            print(f"\nOK: Generated masks for {len(masks_metadata)} frames")
+            return masks_metadata, object_names, object_colors, num_frames
 
         finally:
-            # Clean up temporary directory
-            try:
-                shutil.rmtree(temp_dir)
-                print(f"Cleaned up temporary frames: {temp_dir}")
-            except Exception as e:
-                print(f"WARNING: Could not clean up temp directory: {e}")
+            # Clean up temporary directory (only if not persistent)
+            if not is_persistent:
+                try:
+                    shutil.rmtree(temp_dir)
+                    print(f"Cleaned up temporary frames: {temp_dir}")
+                except Exception as e:
+                    print(f"WARNING: Could not clean up temp directory: {e}")
+            else:
+                print(f"Keeping frames in persistent directory: {temp_dir}")
     
     def export_masks(self, masks_by_frame, video_path, object_names, output_dir):
-        """Export individual mask images"""
-        print("Exporting mask images...")
-        
+        """Verify mask images (already exported during propagation)"""
+        print("Verifying mask images...")
+
         masks_dir = Path(output_dir) / "masks"
-        masks_dir.mkdir(exist_ok=True)
-        
-        exported_count = 0
-        
-        # Get video dimensions
-        cap = cv2.VideoCapture(video_path)
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        cap.release()
-        
-        for frame_idx, frame_masks in masks_by_frame.items():
+        verified_count = 0
+        missing_count = 0
+
+        for frame_idx in sorted(masks_by_frame.keys()):
+            frame_masks = masks_by_frame[frame_idx]
             for obj_id, mask_data in frame_masks.items():
-                mask = mask_data['mask']
-                obj_name = mask_data['name']
-
-                # Use consolidated filename format: mask_f{frame_idx:06d}_{obj_name}_id{obj_id}.png
-                mask_filename = f"mask_f{frame_idx:06d}_{obj_name}_id{obj_id}.png"
-                mask_path = masks_dir / mask_filename
-
-                if mask.shape != (height, width):
-                    from PIL import Image as PILImage
-
-                    # STEP 1: Upscale with NEAREST (preserves binary)
-                    mask_pil = PILImage.fromarray((mask * 255).astype(np.uint8))
-                    mask_pil = mask_pil.resize((width, height), PILImage.NEAREST)
-                    mask_binary = np.array(mask_pil)
-
-                    # STEP 2: Optional morphological smoothing
-                    if self.smooth_masks:
-                        # Conservative kernel size for fine detail preservation (wires)
-                        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
-                        mask_binary = cv2.morphologyEx(mask_binary, cv2.MORPH_CLOSE, kernel, iterations=1)
-
-                    # Save binary mask
-                    PILImage.fromarray(mask_binary).save(mask_path)
+                mask_path = masks_dir / mask_data['filename']
+                if not mask_path.exists():
+                    print(f"WARNING: Missing mask file: {mask_path}")
+                    missing_count += 1
                 else:
-                    mask_image = Image.fromarray((mask * 255).astype(np.uint8))
-                    mask_image.save(mask_path)
-                
-                exported_count += 1
-        
-        print(f"OK: Exported {exported_count} mask images to {masks_dir}")
-        if self.smooth_masks:
-            print("  Applied morphological smoothing (2x2 kernel)")
-        return exported_count
+                    verified_count += 1
+
+        if missing_count > 0:
+            print(f"WARNING: {missing_count} mask files are missing!")
+        print(f"OK: Verified {verified_count} mask files in {masks_dir}")
+        return verified_count
 
     def _get_contrasting_text_color(self, bg_color):
         """Calculate contrasting text color (white or black) based on background luminance
@@ -524,17 +600,25 @@ class SAM2Processor:
             return False
         
         processed_frames = 0
-        
+        masks_dir = Path(output_dir) / "masks"
+
         for frame_idx, frame in enumerate(frames):
             overlay_frame = frame.copy()
-            
+
             if frame_idx in masks_by_frame:
                 frame_masks = masks_by_frame[frame_idx]
 
                 # Collect all mask data first
                 mask_data_list = []
                 for obj_id, mask_data in frame_masks.items():
-                    mask = mask_data['mask']
+                    # Load mask from disk
+                    mask_path = masks_dir / mask_data['filename']
+                    mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+                    if mask is None:
+                        print(f"WARNING: Could not load mask: {mask_path}")
+                        continue
+                    mask = (mask > 0).astype(bool)  # Convert to boolean
+
                     color = mask_data['color']
                     name = mask_data['name']
 
@@ -669,6 +753,8 @@ Examples:
                        help="Apply morphological smoothing to reduce pixelation in exported masks (preserves binary masks)")
     parser.add_argument("--use-bfloat16", action="store_true",
                        help="Use BFloat16 mixed precision for faster inference and reduced memory usage (requires Ampere+ GPU with BFloat16 support, e.g., RTX 30xx+, A100). Uses torch.autocast following SAM2's official benchmark pattern.")
+    parser.add_argument("--frame-dir", type=str, default=None,
+                       help="Persistent directory for video frames (default: auto-generated in /tmp). If specified, frames will be reused from previous runs and not deleted after processing.")
 
     args = parser.parse_args()
 
@@ -780,7 +866,7 @@ Examples:
     try:
         # Process segmentation
         masks_by_frame, object_names, object_colors, num_frames = processor.process_segmentation(
-            args.video_file, annotations_data
+            args.video_file, annotations_data, output_dir, frame_dir=args.frame_dir
         )
 
         if masks_by_frame is None:
