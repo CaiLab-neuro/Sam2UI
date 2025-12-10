@@ -41,6 +41,9 @@ import psutil
 # Add SAM2 to path
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
+# Import lazy loader BEFORE importing SAM2
+from sam2_lazy_loader import enable_lazy_loading
+
 try:
     from sam2.build_sam import build_sam2_video_predictor
 except ImportError as e:
@@ -410,6 +413,20 @@ class SAM2Processor:
                               f"GPU: {gpu_allocated:.2f}GB (peak: {gpu_peak:.2f}GB) | "
                               f"RAM: {ram_used:.2f}GB")
 
+                        # CRITICAL: Periodic cleanup of old frames to prevent memory growth
+                        # Keep only last 20 frames (SAM2 needs max 6-16 for memory attention)
+                        frames_to_keep = 20
+                        for obj_idx in range(len(inference_state["obj_ids"])):
+                            obj_output_dict = inference_state["output_dict_per_obj"][obj_idx]
+                            non_cond = obj_output_dict.get("non_cond_frame_outputs", {})
+
+                            # Find frames older than the retention window
+                            old_frames = [f for f in non_cond.keys() if f < out_frame_idx - frames_to_keep]
+
+                            # Delete old frame outputs
+                            for old_frame in old_frames:
+                                del non_cond[old_frame]
+
                         # Reset peak stats for next interval
                         torch.cuda.reset_peak_memory_stats()
                         # Clear GPU memory fragmentation
@@ -467,6 +484,20 @@ class SAM2Processor:
                             print(f"  Backward: Frame {out_frame_idx + 1}/{num_frames} | "
                                   f"GPU: {gpu_allocated:.2f}GB (peak: {gpu_peak:.2f}GB) | "
                                   f"RAM: {ram_used:.2f}GB")
+
+                            # CRITICAL: Periodic cleanup of old frames to prevent memory growth
+                            # Keep only last 20 frames (SAM2 needs max 6-16 for memory attention)
+                            frames_to_keep = 20
+                            for obj_idx in range(len(inference_state["obj_ids"])):
+                                obj_output_dict = inference_state["output_dict_per_obj"][obj_idx]
+                                non_cond = obj_output_dict.get("non_cond_frame_outputs", {})
+
+                                # Find frames older than the retention window
+                                old_frames = [f for f in non_cond.keys() if f < out_frame_idx - frames_to_keep]
+
+                                # Delete old frame outputs
+                                for old_frame in old_frames:
+                                    del non_cond[old_frame]
 
                             # Reset peak stats for next interval
                             torch.cuda.reset_peak_memory_stats()
@@ -755,6 +786,8 @@ Examples:
                        help="Use BFloat16 mixed precision for faster inference and reduced memory usage (requires Ampere+ GPU with BFloat16 support, e.g., RTX 30xx+, A100). Uses torch.autocast following SAM2's official benchmark pattern.")
     parser.add_argument("--frame-dir", type=str, default=None,
                        help="Persistent directory for video frames (default: auto-generated in /tmp). If specified, frames will be reused from previous runs and not deleted after processing.")
+    parser.add_argument("--frame-cache-size", type=int, default=20,
+                       help="Number of frames to keep in memory cache (default: 20, ~2GB). Minimum: 10, Recommended: 20-50.")
 
     args = parser.parse_args()
 
@@ -830,6 +863,9 @@ Examples:
     if args.offload_to_cpu:
         print(f"Memory optimization: CPU offloading enabled")
     print()
+
+    # Enable lazy loading BEFORE creating SAM2 model
+    enable_lazy_loading(cache_size=args.frame_cache_size)
 
     # Initialize processor
     try:
