@@ -18,26 +18,30 @@ import re
 
 # Add SAM2 path to Python path - dynamically detect project root
 def get_project_root():
-    """Dynamically detect the project root directory"""
+    """Dynamically detect the project root directory (where sam2_ui.py lives)"""
     current_file = os.path.abspath(__file__)
     current_dir = os.path.dirname(current_file)
-    
-    # Look for project root indicators
-    indicators = ['sam2', 'checkpoints', 'configs', 'setup.py'] # 'pyproject.toml',
-    
-    # Start from current file and go up directories
+
+    # The directory containing sam2_ui.py is the Sam2UI root
+    if os.path.basename(current_file) == 'sam2_ui.py':
+        return current_dir
+
+    # Fallback: search upwards for indicators
+    indicators = ['sam2', 'setup.py']
     search_dir = current_dir
     while search_dir != os.path.dirname(search_dir):  # Not at filesystem root
-        if all(os.path.exists(os.path.join(search_dir, indicator)) for indicator in indicators[:3]):
+        if all(os.path.exists(os.path.join(search_dir, indicator)) for indicator in indicators):
             return search_dir
         search_dir = os.path.dirname(search_dir)
-    
-    # Fallback to current directory if not found
+
+    # Final fallback to current directory
     return current_dir
 
 SAM2_PATH = get_project_root()
-if SAM2_PATH not in sys.path:
-    sys.path.append(SAM2_PATH)
+# Add sam2 package to path
+sam2_package_path = os.path.join(SAM2_PATH, "sam2")
+if os.path.exists(sam2_package_path) and sam2_package_path not in sys.path:
+    sys.path.insert(0, sam2_package_path)
 
 # Import torch for device detection
 try:
@@ -45,17 +49,34 @@ try:
 except ImportError:
     torch = None
 
+# Check SAM3 availability
+def _check_sam3_available():
+    """Check if SAM3 is installed and usable"""
+    try:
+        sam3_path = os.path.join(SAM2_PATH, "sam3")
+        if not os.path.exists(sam3_path):
+            return False
+        # Try importing SAM3
+        sys.path.insert(0, sam3_path)
+        from sam3.model_builder import build_sam3_video_predictor
+        return True
+    except ImportError:
+        return False
+
+SAM3_AVAILABLE = _check_sam3_available()
+
 class SAM2VideoUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("SAM2 Video Segmentation Tool - Enhanced")
+        self.root.title("SAM Video Segmentation Tool")
         self.root.geometry("1600x1000")
         self.root.configure(bg='#2b2b2b')
         
         # Dynamic paths - automatically detect project root
-        self.sam2_base_path = SAM2_PATH
-        self.checkpoint_dir = os.path.join(SAM2_PATH, "checkpoints")
-        self.config_dir = os.path.join(SAM2_PATH, "configs")
+        self.sam2_base_path = SAM2_PATH  # Sam2UI root
+        self.sam2_repo_path = os.path.join(SAM2_PATH, "sam2")  # SAM2 repository location
+        self.checkpoint_dir = os.path.join(self.sam2_repo_path, "checkpoints")
+        self.config_dir = os.path.join(self.sam2_repo_path, "configs")
         
         # Variables
         self.video_path = None
@@ -97,6 +118,16 @@ class SAM2VideoUI:
         self.available_gpus = self._detect_available_gpus()
         self.selected_gpu = tk.StringVar(value="auto")  # Default to auto selection
         self.gpu_device = None  # Will be set when model loads
+
+        # Model selection
+        self.available_models = self._detect_available_models()
+        self.selected_model = tk.StringVar(value="auto")  # Auto-select best model
+        self.current_model_info = None  # Store loaded model info
+
+        # Model type (SAM2/SAM3)
+        self.sam3_available = SAM3_AVAILABLE
+        self.model_type_var = tk.StringVar(value="SAM2")  # Default to SAM2
+        self.using_sam3 = False
         
         # Range-based processing for long videos
         self.limit_to_range_var = tk.BooleanVar(value=False)
@@ -210,25 +241,69 @@ class SAM2VideoUI:
         parent.bind("<Leave>", lambda e: parent.unbind_all("<MouseWheel>"))
         
         # Title
-        title_label = ttk.Label(scrollable_frame, text="SAM2 Enhanced", 
+        title_label = ttk.Label(scrollable_frame, text="SAM UI", 
                                font=('Arial', 16, 'bold'))
         title_label.pack(pady=(0, 15))
         
         # File operations
         file_frame = ttk.LabelFrame(scrollable_frame, text="File Operations", padding=10)
         file_frame.pack(fill=tk.X, pady=(0, 10))
-        
-        ttk.Button(file_frame, text="Load Video", 
+
+        ttk.Button(file_frame, text="Load Video",
                   command=self.load_video, width=15).pack(fill=tk.X, pady=2)
-        ttk.Button(file_frame, text="Load SAM2 Model", 
+
+        # Model Type Selection (SAM2/SAM3) - only show if SAM3 is available
+        if self.sam3_available:
+            ttk.Label(file_frame, text="Model Type:").pack(anchor=tk.W, pady=(10, 0))
+            model_type_frame = ttk.Frame(file_frame)
+            model_type_frame.pack(fill=tk.X, pady=(0, 5))
+
+            ttk.Radiobutton(
+                model_type_frame,
+                text="SAM2",
+                variable=self.model_type_var,
+                value="SAM2",
+                command=self.on_model_type_change
+            ).pack(side=tk.LEFT, padx=(0, 10))
+
+            ttk.Radiobutton(
+                model_type_frame,
+                text="SAM3",
+                variable=self.model_type_var,
+                value="SAM3",
+                command=self.on_model_type_change
+            ).pack(side=tk.LEFT)
+
+            # Note about SAM3 capabilities
+            note_label = ttk.Label(
+                file_frame,
+                text="Note: Text prompts coming soon",
+                foreground="gray",
+                font=("TkDefaultFont", 8, "italic")
+            )
+            note_label.pack(anchor=tk.W, pady=(0, 5))
+
+        # Model Selection - Shows all available models in sam2/checkpoints/
+        ttk.Label(file_frame, text="Model Variant:").pack(anchor=tk.W, pady=(5, 0))
+        self.model_combo = ttk.Combobox(
+            file_frame,
+            textvariable=self.selected_model,
+            values=self._format_model_list(),
+            state="readonly",
+            width=30
+        )
+        self.model_combo.pack(fill=tk.X, pady=(0, 5))
+        self.model_combo.bind('<<ComboboxSelected>>', self.on_model_selection_change)
+
+        ttk.Button(file_frame, text="Load SAM2 Model",
                   command=self.load_sam2_model, width=15).pack(fill=tk.X, pady=2)
-        ttk.Button(file_frame, text="Import Object List", 
+        ttk.Button(file_frame, text="Import Object List",
                   command=self.import_object_list, width=15).pack(fill=tk.X, pady=2)
-        ttk.Button(file_frame, text="Export Object List", 
+        ttk.Button(file_frame, text="Export Object List",
                   command=self.export_object_list, width=15).pack(fill=tk.X, pady=2)
-        
+
         # Model status
-        self.model_status_label = ttk.Label(file_frame, text="Model Not Loaded", 
+        self.model_status_label = ttk.Label(file_frame, text="Model Not Loaded",
                                            foreground='red')
         self.model_status_label.pack(pady=5)
         
@@ -725,7 +800,7 @@ class SAM2VideoUI:
             # Add metadata
             annotation_data["export_info"] = {
                 "export_time": time.strftime("%Y-%m-%d %H:%M:%S"),
-                "app_version": "SAM2 Video UI Enhanced v2.0",
+                "app_version": "SAM Video UI v1.0",
                 "coordinate_system": "original",  # ADDED: Indicate coordinate system
                 "multi_frame_mode": self.multi_frame_annotation_mode,
                 "refinement_mode": self.refinement_mode
@@ -2290,7 +2365,164 @@ class SAM2VideoUI:
             
         except Exception as e:
             self.gpu_info_label.config(text=f"Error: {str(e)}")
-    
+
+    def _detect_available_models(self):
+        """Detect available SAM2 models from checkpoints"""
+        from pathlib import Path
+
+        checkpoint_dir = Path(self.checkpoint_dir)
+        if not checkpoint_dir.exists():
+            return ["auto"]
+
+        models = []
+
+        # Model mapping: checkpoint filename -> (display name, config path)
+        model_mapping = {
+            # SAM2.1 models (preferred)
+            "sam2.1_hiera_tiny.pt": ("SAM2.1 Tiny (fastest)", "sam2.1/sam2.1_hiera_t.yaml"),
+            "sam2.1_hiera_small.pt": ("SAM2.1 Small", "sam2.1/sam2.1_hiera_s.yaml"),
+            "sam2.1_hiera_base_plus.pt": ("SAM2.1 Base+", "sam2.1/sam2.1_hiera_b+.yaml"),
+            "sam2.1_hiera_large.pt": ("SAM2.1 Large (best)", "sam2.1/sam2.1_hiera_l.yaml"),
+
+            # SAM2 legacy models
+            "sam2_hiera_tiny.pt": ("SAM2 Tiny", "sam2/sam2_hiera_t.yaml"),
+            "sam2_hiera_small.pt": ("SAM2 Small", "sam2/sam2_hiera_s.yaml"),
+            "sam2_hiera_base_plus.pt": ("SAM2 Base+", "sam2/sam2_hiera_b+.yaml"),
+            "sam2_hiera_large.pt": ("SAM2 Large", "sam2/sam2_hiera_l.yaml"),
+        }
+
+        models.append("auto")  # Auto-selection option
+
+        for checkpoint_file, (display_name, config_path) in model_mapping.items():
+            checkpoint_path = checkpoint_dir / checkpoint_file
+            full_config_path = Path(self.config_dir) / config_path
+
+            if checkpoint_path.exists() and full_config_path.exists():
+                models.append(f"{display_name}|{checkpoint_file}|{config_path}")
+
+        return models if len(models) > 1 else ["auto"]
+
+    def _auto_select_best_model(self):
+        """Auto-select best available model based on GPU memory"""
+        models = self.available_models[1:]  # Skip "auto" option
+
+        if not models:
+            return None
+
+        # Preference: SAM2.1 models first, then larger models for better quality
+        # Adjust based on available GPU memory
+        preference_order = [
+            # SAM2.1 models (preferred)
+            "sam2.1_hiera_large.pt",       # Best quality
+            "sam2.1_hiera_base_plus.pt",   # High quality
+            "sam2.1_hiera_small.pt",       # Good balance
+            "sam2.1_hiera_tiny.pt",        # Fastest
+            # SAM2 legacy models (fallback)
+            "sam2_hiera_large.pt",
+            "sam2_hiera_base_plus.pt",
+            "sam2_hiera_small.pt",
+            "sam2_hiera_tiny.pt",
+        ]
+
+        # Check GPU memory and adjust preference
+        try:
+            if torch and torch.cuda.is_available():
+                gpu_mem_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+
+                # Adjust based on GPU memory
+                if gpu_mem_gb >= 8:
+                    # Prefer large models (best quality)
+                    pass  # Keep original order
+                elif gpu_mem_gb >= 4:
+                    # Prefer base+ and small models
+                    preference_order = [p for p in preference_order if 'large' not in p]
+                else:
+                    # Low memory: prefer small and tiny models
+                    preference_order = [p for p in preference_order if 'large' not in p and 'base' not in p]
+        except:
+            # Default to base+ if can't detect GPU
+            preference_order = [p for p in preference_order if 'large' not in p]
+
+        # Find first available model in preference order
+        for preferred in preference_order:
+            for model in models:
+                if preferred in model:
+                    return model
+
+        # Fallback to first available
+        return models[0]
+
+    def _format_model_list(self):
+        """Format model list for display in combobox"""
+        formatted = ["Auto-select best model"]
+        for model in self.available_models[1:]:  # Skip first "auto"
+            display_name = model.split('|')[0]
+            formatted.append(display_name)
+        return formatted
+
+    def on_model_type_change(self):
+        """Handle model type change between SAM2 and SAM3"""
+        new_type = self.model_type_var.get()
+
+        # Warn if model is already loaded
+        if self.model_loaded:
+            result = messagebox.askyesno(
+                "Change Model Type",
+                f"Switching to {new_type} will clear the current model and all annotations.\n\n"
+                "Do you want to continue?",
+                icon='warning'
+            )
+            if not result:
+                # Revert to previous selection
+                old_type = "SAM3" if new_type == "SAM2" else "SAM2"
+                self.model_type_var.set(old_type)
+                return
+
+            # Clear current model
+            self.sam2_model = None
+            self.model_loaded = False
+            self.using_sam3 = False
+            self.inference_state = None
+            self.current_model_info = None
+            self.model_status_label.config(text="No model loaded", foreground='red')
+
+        # Update model dropdown to show appropriate models
+        # For SAM3, we'll keep the same model detection since both use similar checkpoint structure
+        # The difference is in which builder we use during loading
+        status_msg = f"{new_type} selected. Load a model to begin."
+        self.status_label.config(text=status_msg)
+
+    def on_model_selection_change(self, event=None):
+        """Handle model selection change"""
+        # Get selected display name
+        selected_display = self.model_combo.get()
+
+        if selected_display == "Auto-select best model":
+            self.selected_model.set("auto")
+        else:
+            # Find corresponding model info
+            for model in self.available_models[1:]:
+                if model.startswith(selected_display + "|"):
+                    self.selected_model.set(model)
+                    break
+
+        # Warn user if model already loaded
+        if hasattr(self, 'sam2_model') and self.sam2_model is not None:
+            response = messagebox.askyesno(
+                "Model Change",
+                "Changing the model requires reloading.\n\n"
+                "This will clear current segmentation state.\n\n"
+                "Continue?",
+                icon='warning'
+            )
+            if response:
+                self.load_sam2_model()
+            else:
+                # Revert selection
+                if self.current_model_info:
+                    display_name = self.current_model_info.split('|')[0]
+                    self.model_combo.set(display_name)
+
     def _ensure_model_dtype_consistency(self):
         """Ensure model is using consistent dtypes to avoid BFloat16/Float mismatches"""
         try:
@@ -3816,31 +4048,18 @@ class SAM2VideoUI:
             self.status_label.config(text="Export failed")
             messagebox.showerror("Export Error", f"Failed to export video: {str(e)}")
     def load_sam2_model(self):
-        """Load SAM2 model with correct video predictor initialization"""
+        """Load SAM2 or SAM3 model with correct video predictor initialization"""
         try:
-            self.status_label.config(text="Loading SAM2 model...")
+            # Determine which model type to load
+            model_type = self.model_type_var.get() if self.sam3_available else "SAM2"
+            self.status_label.config(text=f"Loading {model_type} model...")
             self.model_status_label.config(text="Loading...", foreground='orange')
             self.root.update()
 
-            # Use the correct checkpoint and config for video segmentation
-            sam2_checkpoint = os.path.join(self.checkpoint_dir, "sam2_hiera_small.pt")
-            model_cfg = os.path.join(self.sam2_base_path, "configs", "sam2_hiera_s.yaml")
-
-            # Check files exist
-            if not os.path.exists(sam2_checkpoint):
-                raise FileNotFoundError(f"Checkpoint not found: {sam2_checkpoint}")
-            if not os.path.exists(model_cfg):
-                raise FileNotFoundError(f"Config not found: {model_cfg}")
-            if model_cfg.startswith('/'):
-                model_cfg = '/' + model_cfg 
-
-            # Import the correct builder for VIDEO segmentation
-            from sam2.build_sam import build_sam2_video_predictor
-        
-            # Select device based on user selection
+            # Select and validate device FIRST (works for both SAM2 and SAM3)
             device = self._get_selected_device()
-            
-            # Validate device selection
+
+            # Validate device selection and provide feedback
             if device.startswith("cuda:"):
                 gpu_id = int(device.split(":")[1])
                 if not torch or not torch.cuda.is_available():
@@ -3848,31 +4067,94 @@ class SAM2VideoUI:
                     self.status_label.config(text="CUDA not available, using CPU...")
                 elif gpu_id >= torch.cuda.device_count():
                     device = "cpu"
-                    self.status_label.config(text=f"GPU {gpu_id} not available, using CPU...")
+                    self.status_label.config(text=f"GPU {gpu_id} not available (only {torch.cuda.device_count()} GPU(s) found), using CPU...")
                 else:
-                    self.status_label.config(text=f"Using GPU {gpu_id} for inference...")
+                    gpu_name = torch.cuda.get_device_name(gpu_id)
+                    self.status_label.config(text=f"Using GPU {gpu_id} ({gpu_name}) for inference...")
             elif device == "cuda":
                 if torch and torch.cuda.is_available():
-                    self.status_label.config(text="Using CUDA GPU for inference...")
+                    gpu_name = torch.cuda.get_device_name(0)
+                    self.status_label.config(text=f"Using CUDA GPU ({gpu_name}) for inference...")
                 else:
                     device = "cpu"
                     self.status_label.config(text="CUDA not available, using CPU...")
             else:  # cpu
                 self.status_label.config(text="Using CPU for inference (slower)...")
 
-            # Build the VIDEO predictor
-            self.sam2_model = build_sam2_video_predictor(
-                config_file=model_cfg,
-                ckpt_path=sam2_checkpoint,
-                device=device
-            )
-            
-            # CRITICAL: Setup autocast context for BFloat16 (following SAM2 notebook pattern)
+            self.root.update()
+
+            # Load model based on type
+            if model_type == "SAM3":
+                # SAM3 loading with HuggingFace model and SAM2-compatible API
+                try:
+                    from sam3.model_builder import build_sam3_video_model
+                except ImportError:
+                    raise ImportError(
+                        "SAM3 not found. Please install SAM3:\n"
+                        "1. Run setup.py and choose to install SAM3\n"
+                        "2. Follow HuggingFace authentication steps\n"
+                        "3. Download checkpoints from https://huggingface.co/facebook/sam3"
+                    )
+
+                # Build SAM3 model with SAM2-compatible API
+                self.status_label.config(text="Building SAM3 model (may download from HuggingFace)...")
+                self.root.update()
+
+                sam3_model = build_sam3_video_model(device=device)
+
+                # Extract the predictor using SAM2-compatible interface
+                self.sam2_model = sam3_model.tracker
+                self.sam2_model.backbone = sam3_model.detector.backbone
+
+                self.using_sam3 = True
+                display_name = "SAM3 (HuggingFace)"
+
+            else:
+                # SAM2 loading logic
+                # Determine model to load
+                model_selection = self.selected_model.get()
+
+                if model_selection == "auto":
+                    model_info = self._auto_select_best_model()
+                    if not model_info:
+                        raise ValueError("No models available. Please run setup.py first to download models.")
+                else:
+                    model_info = model_selection
+
+                # Parse model info: "Display Name|checkpoint_file|config_path"
+                parts = model_info.split('|')
+                if len(parts) != 3:
+                    raise ValueError(f"Invalid model selection: {model_info}")
+
+                display_name, checkpoint_file, config_path = parts
+
+                # Build full paths using new structure
+                sam2_checkpoint = os.path.join(self.checkpoint_dir, checkpoint_file)
+                model_cfg = os.path.join(self.config_dir, config_path)
+
+                # Check files exist
+                if not os.path.exists(sam2_checkpoint):
+                    raise FileNotFoundError(f"Checkpoint not found: {sam2_checkpoint}\n\nPlease run setup.py to download models.")
+                if not os.path.exists(model_cfg):
+                    raise FileNotFoundError(f"Config not found: {model_cfg}\n\nPlease ensure SAM2 is properly installed.")
+
+                # Import the correct builder for VIDEO segmentation
+                from sam2.build_sam import build_sam2_video_predictor
+                self.using_sam3 = False
+
+                # Build the VIDEO predictor for SAM2
+                self.sam2_model = build_sam2_video_predictor(
+                    config_file=model_cfg,
+                    ckpt_path=sam2_checkpoint,
+                    device=device
+                )
+
+            # Setup autocast context for BFloat16 (following SAM2 notebook pattern)
             if device != "cpu" and torch.cuda.is_available():
                 # Enable autocast for BFloat16 as per SAM2 official notebook
                 self.autocast_context = torch.autocast("cuda", dtype=torch.bfloat16)
                 self.autocast_context.__enter__()
-                
+
                 # Enable TF32 for Ampere GPUs (compute capability >= 8.0)
                 try:
                     gpu_id = 0 if device == "cuda" else int(device.split(":")[1])
@@ -3882,33 +4164,55 @@ class SAM2VideoUI:
                         print(f"Enabled TF32 for Ampere GPU (compute capability {torch.cuda.get_device_properties(gpu_id).major}.x)")
                 except Exception as e:
                     print(f"Could not enable TF32: {e}")
-                
+
                 print(f"Model loaded on {device} with BFloat16 autocast enabled")
             else:
                 self.autocast_context = None
                 print(f"Model loaded on {device} (CPU mode, no autocast)")
 
             self.model_loaded = True
+            # Store model info (for SAM2 only; SAM3 doesn't use this)
+            if not self.using_sam3:
+                self.current_model_info = model_info
+            else:
+                self.current_model_info = "SAM3|sam3_hiera_l.pt|sam3_hiera_l.yaml"
 
-            model_name = os.path.basename(sam2_checkpoint).replace('.pt', '')
+            # Update status display
             dtype_str = "BF16+TF32" if self.autocast_context else "FP32"
-            self.model_status_label.config(text=f"{model_name} ({device.upper()}/{dtype_str})", foreground='green')
-            self.status_label.config(text=f"SAM2 video predictor loaded successfully on {device.upper()}")
-        
+            model_type_display = model_type if self.sam3_available else "SAM2"
+            self.model_status_label.config(
+                text=f"{display_name} ({device.upper()}/{dtype_str})",
+                foreground='green'
+            )
+            self.status_label.config(text=f"{model_type_display} loaded: {display_name} on {device.upper()}")
+
             # Test that the model has the required methods
             if not hasattr(self.sam2_model, 'init_state'):
                 raise AttributeError("Model does not have 'init_state' method. Check SAM2 installation.")
             if not hasattr(self.sam2_model, 'add_new_points'):
                 raise AttributeError("Model does not have 'add_new_points' method. Check SAM2 installation.")
-            
+
         except Exception as e:
+            self.model_loaded = False
             self.model_status_label.config(text="Load Failed", foreground='red')
             traceback.print_exc()
-            error_msg = f"Failed to load SAM2 model: {str(e)}\n\nPossible solutions:\n"
-            error_msg += "1. Ensure SAM2 is properly installed\n"
-            error_msg += "2. Check checkpoint and config file paths\n"
-            error_msg += "3. Verify you have the video segmentation version\n"
-            error_msg += "4. Try reinstalling SAM2 from the official repository"
+
+            # Determine which model type failed
+            model_type = self.model_type_var.get() if self.sam3_available else "SAM2"
+
+            error_msg = f"Failed to load {model_type} model:\n\n{str(e)}\n\nPossible solutions:\n"
+            if model_type == "SAM3":
+                error_msg += "1. Run setup.py and install SAM3\n"
+                error_msg += "2. Authenticate with HuggingFace: huggingface-cli login\n"
+                error_msg += "3. Request access at https://huggingface.co/facebook/sam3\n"
+                error_msg += "4. Check Python ≥3.12, PyTorch ≥2.7, CUDA ≥12.6\n"
+                error_msg += "5. Try switching to SAM2 instead"
+            else:
+                error_msg += "1. Run setup.py to download models and install SAM2\n"
+                error_msg += "2. Check that sam2/ directory exists with checkpoints\n"
+                error_msg += "3. Verify SAM2 package is installed (pip list | grep sam2)\n"
+                error_msg += "4. Try a different model from the dropdown"
+
             messagebox.showerror("Model Load Error", error_msg)
 
 
