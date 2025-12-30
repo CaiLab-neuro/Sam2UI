@@ -1453,6 +1453,9 @@ class SAM2VideoUI:
             
     def load_video(self):
         """Load video file and extract frames"""
+        # Clean up temporary masks from previous video
+        self._cleanup_temp_masks()
+
         # Clean up any existing lazy loading
         if hasattr(self, 'video_cap_lazy') and self.video_cap_lazy:
             self.video_cap_lazy.release()
@@ -1776,7 +1779,11 @@ class SAM2VideoUI:
 
             # Collect all mask data first (to avoid cumulative blending bug)
             mask_data_list = []
-            for obj_id, mask in frame_masks.items():
+            for obj_id in frame_masks.keys():
+                # Load mask from disk (memory optimization)
+                mask = self._load_mask(self.current_frame_idx, obj_id)
+                if mask is None:
+                    continue
                 # If flash is in progress, only show the flashing object
                 if self.flash_in_progress and obj_id != self.flash_obj_id:
                     continue
@@ -2836,7 +2843,11 @@ class SAM2VideoUI:
             
             # Create temporary directory for frames
             temp_dir = tempfile.mkdtemp(prefix='sam2_frames_')
-            
+
+            # Create temporary directory for mask storage (always enabled for memory efficiency)
+            export_dir = tempfile.mkdtemp(prefix="sam2_masks_")
+            print(f"Temporary mask storage: {export_dir}")
+
             try:
                 # Determine which frames to save based on processing range
                 if self.limit_to_range_var.get() and not is_refinement:
@@ -2890,7 +2901,13 @@ class SAM2VideoUI:
                     self.inference_state = None
 
                 # Initialize fresh state with current frames
-                self.inference_state = self.sam2_model.init_state(video_path=temp_dir)
+                # Enable memory optimizations (always on)
+                self.inference_state = self.sam2_model.init_state(
+                    video_path=temp_dir,
+                    offload_video_to_cpu=True,  # Reduce GPU memory usage
+                    offload_state_to_cpu=True   # Offload model state to CPU when not in use
+                )
+                print("Memory optimizations enabled: CPU offloading")
                 
                 # Group click points by frame and by object ID
                 points_by_frame_and_object = {}
@@ -2926,14 +2943,9 @@ class SAM2VideoUI:
                 self.status_label.config(text="Adding prompts to SAM2...")
                 self.progress_var.set(40)
                 self.root.update()
-                
-                # Initialize masks dictionary if not exists
-                if not hasattr(self, 'masks'):
-                    self.masks = {}
-                    
-                for frame_idx in range(len(self.frames)):
-                    if frame_idx not in self.masks:
-                        self.masks[frame_idx] = {}
+
+                # Initialize metadata list instead of pre-allocating masks (memory optimization)
+                mask_metadata = []
                 
                 # Determine which frames to annotate based on where points exist
                 annotation_frames = sorted(points_by_frame_and_object.keys())
@@ -3043,14 +3055,25 @@ class SAM2VideoUI:
                                 
                                 # Convert to binary mask
                                 mask = (mask_logits > 0.0)
-                                
+
                                 # Ensure mask is 2D
                                 if len(mask.shape) > 2:
                                     mask = mask.squeeze()
-                                
-                                # Store mask with original frame index
-                                self.masks[original_frame_idx][out_obj_id] = (mask * 255).astype(np.uint8)
-                        
+
+                                # Always export to disk (streaming) for memory efficiency
+                                mask_uint8 = (mask * 255).astype(np.uint8)
+                                self._export_mask_to_disk(original_frame_idx, out_obj_id, mask_uint8, export_dir, mask_metadata)
+
+                                # Explicitly delete tensors
+                                del mask_logits
+                                del mask
+
+                        # Clean up old frames from cache to prevent memory growth
+                        self._cleanup_frame_cache(out_frame_idx, self.inference_state)
+
+                        # Monitor memory usage
+                        self._monitor_memory(out_frame_idx, len(frame_indices))
+
                         processed_frames += 1
                         progress = 45 + (processed_frames / max(1, len(frames_to_process))) * 55
                         self.progress_var.set(min(progress, 100))
@@ -3110,8 +3133,19 @@ class SAM2VideoUI:
                                         if len(mask.shape) > 2:
                                             mask = mask.squeeze()
 
-                                        # Store mask with original frame index
-                                        self.masks[original_frame_idx][out_obj_id] = (mask * 255).astype(np.uint8)
+                                        # Always export to disk (streaming) for memory efficiency
+                                        mask_uint8 = (mask * 255).astype(np.uint8)
+                                        self._export_mask_to_disk(original_frame_idx, out_obj_id, mask_uint8, export_dir, mask_metadata)
+
+                                        # Explicitly delete tensors
+                                        del mask_logits
+                                        del mask
+
+                                # Clean up old frames from cache to prevent memory growth
+                                self._cleanup_frame_cache(out_frame_idx, self.inference_state)
+
+                                # Monitor memory usage
+                                self._monitor_memory(out_frame_idx, earliest_frame)
 
                                 backward_processed += 1
                                 # Update progress (backward propagation gets remaining progress from 50% to 100%)
@@ -3131,8 +3165,37 @@ class SAM2VideoUI:
                             messagebox.showwarning("Backward Propagation Warning",
                                                 f"Encountered issue during backward propagation: {str(e)}")
 
+                # Save metadata and temporary directory
+                metadata_path = os.path.join(export_dir, "segmentation_metadata.json")
+                with open(metadata_path, 'w') as f:
+                    import json
+                    json.dump({
+                        'video_path': self.video_path,
+                        'total_frames': len(self.frames),
+                        'objects': {obj_id: self.object_names.get(obj_id, f"Object {obj_id}")
+                                   for obj_id in self.object_ids},
+                        'masks': mask_metadata
+                    }, f, indent=2)
+
+                # Store export directory for later use (video export, cleanup)
+                self.mask_export_dir = export_dir
+                print(f"\nMasks saved to temporary directory: {export_dir}")
+                print(f"Metadata saved to: {metadata_path}")
+
+                # For backward compatibility, populate self.masks with empty dicts
+                # (actual masks will be loaded from disk on demand)
+                if not hasattr(self, 'masks'):
+                    self.masks = {}
+                for item in mask_metadata:
+                    frame_idx = item['frame_idx']
+                    obj_id = item['obj_id']
+                    if frame_idx not in self.masks:
+                        self.masks[frame_idx] = {}
+                    # Store a placeholder - actual mask will be loaded from disk when needed
+                    self.masks[frame_idx][obj_id] = None
+
                 self.progress_bar.pack_forget()
-                
+
                 # Count results
                 total_masks = sum(len(frame_masks) for frame_masks in self.masks.values())
                 unique_objects = set()
@@ -3254,7 +3317,11 @@ class SAM2VideoUI:
             # Export each frame's masks
             total_frames = len(self.masks)
             for idx, (frame_idx, frame_masks) in enumerate(self.masks.items()):
-                for obj_id, mask in frame_masks.items():
+                for obj_id in frame_masks.keys():
+                    # Load mask from disk (memory optimization)
+                    mask = self._load_mask(frame_idx, obj_id)
+                    if mask is None:
+                        continue
                     obj_name = self.object_names.get(obj_id, f"Object_{obj_id}")
                     # Use consolidated filename format: mask_f{frame_idx:06d}_{obj_name}_id{obj_id}.png
                     mask_filename = f"mask_f{frame_idx:06d}_{obj_name}_id{obj_id}.png"
@@ -3366,7 +3433,11 @@ class SAM2VideoUI:
             
             # Export masks with object names in filename
             for frame_idx, frame_masks in masks.items():
-                for obj_id, mask in frame_masks.items():
+                for obj_id in frame_masks.keys():
+                    # Load mask from disk (memory optimization)
+                    mask = self._load_mask(frame_idx, obj_id)
+                    if mask is None:
+                        continue
                     obj_name = object_names.get(obj_id, f"Object_{obj_id}")
                     # Use consolidated filename format: mask_f{frame_idx:06d}_{obj_name}_id{obj_id}.png
                     mask_path = os.path.join(folder_path, f"mask_f{frame_idx:06d}_{obj_name}_id{obj_id}.png")
@@ -3986,9 +4057,12 @@ class SAM2VideoUI:
                 # Get masks for selected objects
                 masks_dict = {}
                 if frame_idx in self.masks:
-                    for obj_id, mask in self.masks[frame_idx].items():
+                    for obj_id in self.masks[frame_idx].keys():
                         if obj_id in selected_objects:
-                            masks_dict[obj_id] = mask
+                            # Load mask from disk (memory optimization)
+                            mask = self._load_mask(frame_idx, obj_id)
+                            if mask is not None:
+                                masks_dict[obj_id] = mask
                 
                 # Create output frame based on type
                 if export_type == "overlay":
@@ -4209,6 +4283,141 @@ class SAM2VideoUI:
 
             messagebox.showerror("Model Load Error", error_msg)
 
+    def _monitor_memory(self, frame_idx, total_frames):
+        """Monitor and log GPU/RAM memory usage (every 50 frames)"""
+        # Only monitor every 50 frames to reduce overhead
+        if frame_idx % 50 != 0:
+            return
+
+        if torch.cuda.is_available():
+            allocated = torch.cuda.memory_allocated() / 1024**3  # GB
+            reserved = torch.cuda.memory_reserved() / 1024**3
+            peak = torch.cuda.max_memory_allocated() / 1024**3
+
+            # Log to console
+            print(f"  GPU Memory - Frame {frame_idx}/{total_frames}: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved, {peak:.2f}GB peak")
+
+            # Reset peak stats every 50 frames to track incremental growth
+            torch.cuda.reset_peak_memory_stats()
+
+        # Monitor RAM
+        try:
+            import psutil
+            ram_used = psutil.virtual_memory().used / 1024**3
+            ram_total = psutil.virtual_memory().total / 1024**3
+            ram_percent = psutil.virtual_memory().percent
+            print(f"  RAM: {ram_used:.2f}/{ram_total:.2f} GB ({ram_percent:.1f}%)")
+        except ImportError:
+            pass  # psutil not available, skip RAM monitoring
+
+    def _export_mask_to_disk(self, frame_idx, obj_id, mask, output_dir, metadata_list):
+        """
+        Export mask to disk immediately and store only metadata
+
+        Args:
+            frame_idx: Frame index
+            obj_id: Object ID
+            mask: Binary mask (H, W) numpy array
+            output_dir: Directory to save masks
+            metadata_list: List to append metadata to
+        """
+        # Create masks subdirectory
+        masks_dir = os.path.join(output_dir, "masks")
+        os.makedirs(masks_dir, exist_ok=True)
+
+        # Generate filename
+        mask_filename = f"frame_{frame_idx:05d}_obj_{obj_id}.png"
+        mask_path = os.path.join(masks_dir, mask_filename)
+
+        # Save mask to disk
+        cv2.imwrite(mask_path, mask)
+
+        # Get object metadata
+        obj_name = self.object_names.get(obj_id, f"Object {obj_id}")
+        obj_color = self.object_colors.get(obj_id, (255, 0, 0))
+
+        # Store only metadata (filename, name, color) - NOT the full mask array
+        metadata = {
+            'frame_idx': frame_idx,
+            'obj_id': obj_id,
+            'mask_file': mask_filename,
+            'mask_path': mask_path,
+            'object_name': obj_name,
+            'color': obj_color,
+            'mask_shape': mask.shape
+        }
+        metadata_list.append(metadata)
+
+        # Explicitly delete mask array to free memory immediately
+        del mask
+
+    def _cleanup_frame_cache(self, current_frame_idx, inference_state):
+        """
+        Clean up old frames from inference state to prevent memory growth
+
+        SAM2 only needs last 6-16 frames for temporal memory attention.
+        Keeping more than necessary wastes GPU memory.
+
+        Args:
+            current_frame_idx: Current frame being processed
+            inference_state: SAM2 inference state object
+        """
+        frames_to_keep = 20  # Fixed value, always keep last 20 frames
+
+        # Get non-conditioning frames from inference state
+        # This is where SAM2 stores frame features and outputs
+        if hasattr(inference_state, 'non_cond_frame_outputs'):
+            non_cond = inference_state.non_cond_frame_outputs
+
+            # Find frames older than the cache window
+            old_frames = [f for f in non_cond.keys() if f < current_frame_idx - frames_to_keep]
+
+            # Delete old frame outputs
+            for old_frame in old_frames:
+                del non_cond[old_frame]
+
+            if old_frames and current_frame_idx % 50 == 0:
+                print(f"  Cleaned up {len(old_frames)} old frames from cache (keeping last {frames_to_keep})")
+
+        # Periodic GPU memory cleanup
+        if current_frame_idx % 50 == 0 and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def _load_mask(self, frame_idx, obj_id):
+        """
+        Load mask from disk (masks are always stored on disk for memory efficiency)
+
+        Args:
+            frame_idx: Frame index
+            obj_id: Object ID
+
+        Returns:
+            mask: Binary mask array (H, W) or None if not found
+        """
+        if not hasattr(self, 'mask_export_dir') or self.mask_export_dir is None:
+            print(f"WARNING: No mask export directory found for frame {frame_idx}, obj {obj_id}")
+            return None
+
+        mask_filename = f"frame_{frame_idx:05d}_obj_{obj_id}.png"
+        mask_path = os.path.join(self.mask_export_dir, "masks", mask_filename)
+
+        if os.path.exists(mask_path):
+            return cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+        else:
+            print(f"WARNING: Mask file not found: {mask_path}")
+            return None
+
+    def _cleanup_temp_masks(self):
+        """Clean up temporary mask directory"""
+        if hasattr(self, 'mask_export_dir') and self.mask_export_dir and os.path.exists(self.mask_export_dir):
+            try:
+                import shutil
+                shutil.rmtree(self.mask_export_dir)
+                print(f"Cleaned up temporary mask directory: {self.mask_export_dir}")
+            except Exception as e:
+                print(f"WARNING: Failed to clean up temporary masks: {e}")
+            self.mask_export_dir = None
+
 
 def main():
     """Main application entry point"""
@@ -4251,6 +4460,9 @@ def main():
         # Clean up video capture if lazy loading
         if hasattr(app, 'video_cap_lazy') and app.video_cap_lazy:
             app.video_cap_lazy.release()
+
+        # Clean up temporary masks
+        app._cleanup_temp_masks()
 
         # CRITICAL: Always destroy root at the end
         root.destroy()
