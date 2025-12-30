@@ -5,7 +5,6 @@ import numpy as np
 from PIL import Image, ImageTk
 import os
 import json
-import sys
 import tempfile
 import shutil
 from pathlib import Path
@@ -38,10 +37,6 @@ def get_project_root():
     return current_dir
 
 SAM2_PATH = get_project_root()
-# Add sam2 package to path
-sam2_package_path = os.path.join(SAM2_PATH, "sam2")
-if os.path.exists(sam2_package_path) and sam2_package_path not in sys.path:
-    sys.path.insert(0, sam2_package_path)
 
 # Import torch for device detection
 try:
@@ -53,11 +48,10 @@ except ImportError:
 def _check_sam3_available():
     """Check if SAM3 is installed and usable"""
     try:
-        sam3_path = os.path.join(SAM2_PATH, "sam3")
+        sam3_path = os.path.join(SAM2_PATH, "sam_models", "sam3")
         if not os.path.exists(sam3_path):
             return False
         # Try importing SAM3
-        sys.path.insert(0, sam3_path)
         from sam3.model_builder import build_sam3_video_predictor
         return True
     except ImportError:
@@ -74,7 +68,7 @@ class SAM2VideoUI:
         
         # Dynamic paths - automatically detect project root
         self.sam2_base_path = SAM2_PATH  # Sam2UI root
-        self.sam2_repo_path = os.path.join(SAM2_PATH, "sam2")  # SAM2 repository location
+        self.sam2_repo_path = os.path.join(SAM2_PATH, "sam_models", "sam2")  # SAM2 repository location
         self.checkpoint_dir = os.path.join(self.sam2_repo_path, "checkpoints")
         self.config_dir = os.path.join(self.sam2_repo_path, "configs")
         

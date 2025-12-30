@@ -38,12 +38,6 @@ from PIL import Image
 
 import psutil
 
-# Add SAM2 to path - use Sam2UI/sam2/ location
-sam2_ui_root = os.path.dirname(os.path.abspath(__file__))
-sam2_package_path = os.path.join(sam2_ui_root, "sam2")
-if os.path.exists(sam2_package_path):
-    sys.path.insert(0, sam2_package_path)
-
 # Import lazy loader BEFORE importing SAM2
 from sam2_lazy_loader import enable_lazy_loading
 
@@ -54,19 +48,21 @@ except ImportError as e:
     print("Please run setup.py first to install dependencies.")
     sys.exit(1)
 
-# Model configuration mappings - use sam2/ prefix for new structure
+# Model configuration mappings
+# NOTE: Config paths are relative to the sam2 package (Hydra search path: pkg://sam2)
+# Checkpoint paths are absolute/relative to the script directory
 MODEL_CONFIGS = {
     # SAM2.1 models (recommended)
-    "sam2.1-tiny": ("sam2/configs/sam2.1/sam2.1_hiera_t.yaml", "sam2/checkpoints/sam2.1_hiera_tiny.pt"),
-    "sam2.1-small": ("sam2/configs/sam2.1/sam2.1_hiera_s.yaml", "sam2/checkpoints/sam2.1_hiera_small.pt"),
-    "sam2.1-base+": ("sam2/configs/sam2.1/sam2.1_hiera_b+.yaml", "sam2/checkpoints/sam2.1_hiera_base_plus.pt"),
-    "sam2.1-large": ("sam2/configs/sam2.1/sam2.1_hiera_l.yaml", "sam2/checkpoints/sam2.1_hiera_large.pt"),
+    "sam2.1-tiny": ("configs/sam2.1/sam2.1_hiera_t.yaml", "sam_models/sam2/checkpoints/sam2.1_hiera_tiny.pt"),
+    "sam2.1-small": ("configs/sam2.1/sam2.1_hiera_s.yaml", "sam_models/sam2/checkpoints/sam2.1_hiera_small.pt"),
+    "sam2.1-base+": ("configs/sam2.1/sam2.1_hiera_b+.yaml", "sam_models/sam2/checkpoints/sam2.1_hiera_base_plus.pt"),
+    "sam2.1-large": ("configs/sam2.1/sam2.1_hiera_l.yaml", "sam_models/sam2/checkpoints/sam2.1_hiera_large.pt"),
 
     # SAM2 models (legacy)
-    "sam2-tiny": ("sam2/configs/sam2/sam2_hiera_t.yaml", "sam2/checkpoints/sam2_hiera_tiny.pt"),
-    "sam2-small": ("sam2/configs/sam2/sam2_hiera_s.yaml", "sam2/checkpoints/sam2_hiera_small.pt"),
-    "sam2-base+": ("sam2/configs/sam2/sam2_hiera_b+.yaml", "sam2/checkpoints/sam2_hiera_base_plus.pt"),
-    "sam2-large": ("sam2/configs/sam2/sam2_hiera_l.yaml", "sam2/checkpoints/sam2_hiera_large.pt"),
+    "sam2-tiny": ("configs/sam2/sam2_hiera_t.yaml", "sam_models/sam2/checkpoints/sam2_hiera_tiny.pt"),
+    "sam2-small": ("configs/sam2/sam2_hiera_s.yaml", "sam_models/sam2/checkpoints/sam2_hiera_small.pt"),
+    "sam2-base+": ("configs/sam2/sam2_hiera_b+.yaml", "sam_models/sam2/checkpoints/sam2_hiera_base_plus.pt"),
+    "sam2-large": ("configs/sam2/sam2_hiera_l.yaml", "sam_models/sam2/checkpoints/sam2_hiera_large.pt"),
 }
 
 class SAM2Processor:

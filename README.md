@@ -2,21 +2,51 @@
 
 Annotation tool for SAM2 video object segmentation with automatic setup and model management.
 
+## Prerequisites
+
+**IMPORTANT**: Before running setup, create and activate a dedicated conda environment or virtualenv. This prevents dependency conflicts and ensures proper package installation.
+
+### Recommended: Conda Environment
+
+```bash
+# Create conda environment with Python 3.10+ (3.12+ for SAM3)
+conda create -n sam python=3.12 -y
+conda activate sam
+```
+
+### Alternative: Virtual Environment (venv)
+
+```bash
+# Create virtual environment
+python3 -m venv sam_env
+# Activate it
+source sam_env/bin/activate  # Linux/Mac
+# OR
+sam_env\Scripts\activate  # Windows
+```
+
+**Note**: Always activate your environment before running `setup.py` or the UI!
+
 ## 1. Setup Script (`setup.py`)
 
 **Purpose**: Automatically install SAM2, dependencies, and model checkpoints
 
-**Usage** (ideally in a virtual environment built for using this package by conda or venv etc.):
+**Usage** (run inside activated conda/venv environment):
 ```bash
+# IMPORTANT: Activate your environment first!
+conda activate sam  # or: source sam_env/bin/activate
+
+# Then run setup
 python setup.py
 ```
 
 **What it does**:
-- Checks Python version (requires 3.8+)
+- Checks Python version (requires 3.10+ for SAM2, 3.12+ for SAM3)
 - Installs Python packages (torch, opencv, numpy, etc.)
-- **Clones and installs SAM2** into `Sam2UI/sam2/`
+- **Clones and installs SAM2** into `sam_models/sam2/`
 - **Interactive model selection** - choose which checkpoints to download
-- Optionally installs SAM3 for text-based prompting
+- Optionally installs SAM3 for text-based prompting (into `sam_models/sam3/`)
+- Installs additional dependencies (`einops` for SAM3)
 - Creates launcher scripts (run.bat/run.sh)
 - Verifies installation
 
@@ -24,8 +54,10 @@ python setup.py
 During setup, you'll be prompted to choose models:
 - **Option B (Recommended)**: SAM2.1 Small + Base+ (~500 MB)
 - **Option A**: All SAM2.1 models (~1.5 GB)
-- **Options 1-8**: Individual models
-- **Option C**: Custom selection
+- **Options 1-8**: Individual models (e.g., `2` for Small only)
+- **Range syntax**: Download multiple models (e.g., `2-4` for Small, Base+, Large)
+- **Comma-separated**: Select specific models (e.g., `2,4` for Small and Large)
+- **Option C**: Custom selection (interactive)
 
 ## 2. Model Selection
 
@@ -77,13 +109,31 @@ python process_annotations.py annotations.json video.mp4 \
 
 ## Complete Workflow
 
-### 1. Setup (First Time Only)
+### 1. Create Environment (First Time Only)
 ```bash
+# Conda (recommended)
+conda create -n sam python=3.12 -y
+conda activate sam
+
+# OR venv
+python3 -m venv sam_env
+source sam_env/bin/activate  # Linux/Mac
+```
+
+### 2. Setup (First Time Only)
+```bash
+# Ensure environment is activated!
+conda activate sam  # or: source sam_env/bin/activate
+
+# Run setup
 python setup.py
 ```
 
-### 2. Use SAM2 Video UI
+### 3. Use SAM2 Video UI
 ```bash
+# Ensure environment is activated!
+conda activate sam
+
 # Windows
 run.bat
 

@@ -78,10 +78,10 @@ def create_directories():
         print(f"OK: {directory}")
 
 def clone_sam2_repository():
-    """Clone SAM2 repository into Sam2UI/sam2/"""
+    """Clone SAM2 repository into Sam2UI/sam_models/sam2/"""
     print("\nCloning SAM2 repository...")
 
-    sam2_dir = Path("sam2")
+    sam2_dir = Path("sam_models/sam2")
 
     # Check if already exists with valid structure
     if sam2_dir.exists():
@@ -89,7 +89,7 @@ def clone_sam2_repository():
         sam2_package_dir = sam2_dir / "sam2"
         if sam2_package_dir.exists() and (sam2_package_dir / "__init__.py").exists():
             print("OK: SAM2 already installed (skipping clone)")
-            print("   To reinstall SAM2, delete the 'sam2' directory and re-run setup.py")
+            print("   To reinstall SAM2, delete the 'sam_models/sam2' directory and re-run setup.py")
             return True
         else:
             # Directory exists but doesn't look like valid SAM2
@@ -116,10 +116,13 @@ def clone_sam2_repository():
 
     # Clone repository
     try:
+        # Create sam_models directory if it doesn't exist
+        Path("sam_models").mkdir(parents=True, exist_ok=True)
+
         subprocess.run([
             "git", "clone",
-            "https://github.com/facebookresearch/segment-anything-2.git",
-            "sam2"
+            "https://github.com/facebookresearch/sam2.git",
+            "sam_models/sam2"
         ], check=True, capture_output=True, text=True)
         print("OK: SAM2 repository cloned")
         return True
@@ -136,7 +139,7 @@ def install_sam2_package():
     """Install SAM2 as editable package"""
     print("\nInstalling SAM2 package...")
 
-    sam2_dir = Path("sam2")
+    sam2_dir = Path("sam_models/sam2")
     if not sam2_dir.exists():
         print("ERROR: SAM2 directory not found")
         return False
@@ -144,7 +147,7 @@ def install_sam2_package():
     try:
         # Install SAM2 in editable mode
         subprocess.run([
-            sys.executable, "-m", "pip", "install", "-e", "./sam2"
+            sys.executable, "-m", "pip", "install", "-e", "./sam_models/sam2"
         ], check=True, capture_output=True)
         print("OK: SAM2 package installed")
         return True
@@ -188,8 +191,12 @@ def select_models_to_download():
     print("  A. Download all SAM2.1 models (~1.5 GB)")
     print("  B. Download recommended (SAM2.1 Small + Base+) (~500 MB)")
     print("  C. Custom selection")
+    print("\nYou can also specify:")
+    print("  - Single model: 2")
+    print("  - Multiple models: 2,3,4")
+    print("  - Range: 2-4")
 
-    choice = input("\nEnter your choice (1-8, A, B, C) [default: B]: ").strip().upper()
+    choice = input("\nEnter your choice (1-8, A, B, C, or range) [default: B]: ").strip().upper()
     if not choice:
         choice = 'B'
 
@@ -198,8 +205,10 @@ def select_models_to_download():
 
     if choice == 'A':
         selected = models_sam21
+        print(f"Selected: All SAM2.1 models")
     elif choice == 'B':
         selected = [models_sam21[1], models_sam21[2]]  # Small and Base+
+        print(f"Selected: SAM2.1 Small and Base+")
     elif choice == 'C':
         print("\nEnter model numbers to download (comma-separated, e.g., 2,3):")
         selections = input("Models: ").strip().split(',')
@@ -211,7 +220,48 @@ def select_models_to_download():
             except ValueError:
                 continue
     elif choice.isdigit() and 1 <= int(choice) <= 8:
-        selected = [all_models[int(choice) - 1]]
+        idx = int(choice) - 1
+        selected = [all_models[idx]]
+        model_name = all_models[idx][0]
+        print(f"Selected: {model_name}")
+    elif '-' in choice:
+        # Handle range syntax (e.g., "2-4")
+        try:
+            parts = choice.split('-')
+            if len(parts) == 2:
+                start = int(parts[0].strip())
+                end = int(parts[1].strip())
+                if 1 <= start <= end <= 8:
+                    for i in range(start, end + 1):
+                        selected.append(all_models[i - 1])
+                    model_names = [m[0] for m in selected]
+                    print(f"Selected: {', '.join(model_names)}")
+                else:
+                    print("Invalid range. Downloading recommended models (Small + Base+)")
+                    selected = [models_sam21[1], models_sam21[2]]
+            else:
+                print("Invalid range format. Downloading recommended models (Small + Base+)")
+                selected = [models_sam21[1], models_sam21[2]]
+        except ValueError:
+            print("Invalid range. Downloading recommended models (Small + Base+)")
+            selected = [models_sam21[1], models_sam21[2]]
+    elif ',' in choice:
+        # Handle comma-separated list (e.g., "2,3,4")
+        try:
+            selections = choice.split(',')
+            for sel in selections:
+                idx = int(sel.strip()) - 1
+                if 0 <= idx < len(all_models):
+                    selected.append(all_models[idx])
+            if selected:
+                model_names = [m[0] for m in selected]
+                print(f"Selected: {', '.join(model_names)}")
+            else:
+                print("No valid models selected. Downloading recommended models (Small + Base+)")
+                selected = [models_sam21[1], models_sam21[2]]
+        except ValueError:
+            print("Invalid input. Downloading recommended models (Small + Base+)")
+            selected = [models_sam21[1], models_sam21[2]]
     else:
         print("Invalid choice. Downloading recommended models (Small + Base+)")
         selected = [models_sam21[1], models_sam21[2]]
@@ -222,7 +272,7 @@ def download_checkpoints(selected_models):
     """Download selected model checkpoints with progress tracking"""
     print("\nDownloading model checkpoints...")
 
-    checkpoint_dir = Path("sam2/checkpoints")
+    checkpoint_dir = Path("sam_models/sam2/checkpoints")
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     total_size = sum(size for _, size, _ in selected_models)
@@ -293,16 +343,50 @@ def prompt_sam3_installation():
 
     return install_sam3()
 
+def _display_sam3_checkpoint_instructions():
+    """Display SAM3 checkpoint download instructions"""
+    print("\n" + "=" * 50)
+    print("SAM3 Checkpoint Download Instructions")
+    print("=" * 50)
+    print("\n1. REQUEST ACCESS TO CHECKPOINTS:")
+    print("   Visit: https://huggingface.co/facebook/sam3")
+    print("   Click 'Request Access' and wait for approval")
+    print("\n2. AUTHENTICATE WITH HUGGINGFACE:")
+    print("   a. Generate token at: https://huggingface.co/settings/tokens")
+    print("   b. Run: huggingface-cli login")
+    print("   c. Paste your token when prompted")
+    print("\n3. DOWNLOAD CHECKPOINT:")
+    print("   After authentication, download the checkpoint:")
+    print("   ")
+    print("   Method 1 - Using Python:")
+    print("   python -c \"from huggingface_hub import snapshot_download; \\")
+    print("       snapshot_download(repo_id='facebook/sam3', local_dir='sam_models/sam3/checkpoints')\"")
+    print("   ")
+    print("   Method 2 - Manual download:")
+    print("   - Download sam3.pt (3.45 GB) from https://huggingface.co/facebook/sam3")
+    print("   - Place in: sam_models/sam3/checkpoints/sam3.pt")
+    print("\n4. VERIFY INSTALLATION:")
+    print("   Run: python -c 'from sam3.model_builder import build_sam3_video_predictor; print(\"SAM3 OK\")'")
+    print("\nNote: SAM3 will not work until checkpoint is downloaded")
+
 def install_sam3():
     """Clone and install SAM3 repository"""
     print("\nCloning SAM3 repository...")
 
-    sam3_dir = Path("sam3")
+    sam3_dir = Path("sam_models/sam3")
+    sam3_checkpoint = sam3_dir / "checkpoints" / "sam3.pt"
 
     # Check if already exists
     if sam3_dir.exists():
-        print("SAM3 already installed")
-        return True
+        if sam3_checkpoint.exists():
+            print("SAM3 already installed (package and checkpoint found)")
+            return True
+        else:
+            print("SAM3 package exists, but checkpoint missing")
+            print("Skipping package installation...")
+            # Skip to checkpoint instructions
+            _display_sam3_checkpoint_instructions()
+            return True
 
     try:
         # Check Python version
@@ -341,39 +425,43 @@ def install_sam3():
             print("WARNING: PyTorch not installed. Please install PyTorch 2.7+ first")
             return False
 
+        # Create sam_models directory if it doesn't exist
+        Path("sam_models").mkdir(parents=True, exist_ok=True)
+
         # Clone SAM3
         subprocess.run([
             "git", "clone",
             "https://github.com/facebookresearch/sam3.git",
-            "sam3"
+            "sam_models/sam3"
         ], check=True, capture_output=True)
         print("OK: SAM3 repository cloned")
 
         # Install SAM3
         subprocess.run([
-            sys.executable, "-m", "pip", "install", "-e", "./sam3"
+            sys.executable, "-m", "pip", "install", "-e", "./sam_models/sam3"
         ], check=True, capture_output=True)
         print("OK: SAM3 package installed")
 
-        # Checkpoint and authentication instructions
-        print("\n" + "=" * 50)
-        print("SAM3 Setup - Next Steps")
-        print("=" * 50)
-        print("\n1. REQUEST ACCESS TO CHECKPOINTS:")
-        print("   Visit: https://huggingface.co/facebook/sam3")
-        print("   Click 'Request Access' and wait for approval")
-        print("\n2. AUTHENTICATE WITH HUGGINGFACE:")
-        print("   a. Generate token at: https://huggingface.co/settings/tokens")
-        print("   b. Run: huggingface-cli login")
-        print("   c. Paste your token when prompted")
-        print("\n3. DOWNLOAD CHECKPOINTS:")
-        print("   After authentication, download checkpoints from HuggingFace")
-        print("   Place them in: sam3/checkpoints/")
-        print("   Expected files:")
-        print("     - sam3_hiera_l.pt (or other SAM3 model variants)")
-        print("\n4. VERIFY INSTALLATION:")
-        print("   Run: python -c 'from sam3.model_builder import build_sam3_video_predictor; print(\"SAM3 OK\")'")
-        print("\nNote: SAM3 will not work until you complete these steps")
+        # Install additional dependencies needed for SAM3
+        print("Installing additional SAM3 dependencies...")
+        additional_deps = ["einops"]  # Required for model loading
+        for dep in additional_deps:
+            try:
+                subprocess.run([
+                    sys.executable, "-m", "pip", "install", dep
+                ], check=True, capture_output=True)
+                print(f"OK: {dep} installed")
+            except subprocess.CalledProcessError:
+                print(f"WARNING: Failed to install {dep}")
+                print(f"You may need to manually install it: pip install {dep}")
+
+        # Create checkpoint directory
+        checkpoint_dir = Path("sam_models/sam3/checkpoints")
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        print(f"OK: Created checkpoint directory: {checkpoint_dir}")
+
+        # Display checkpoint download instructions
+        _display_sam3_checkpoint_instructions()
 
         return True
 
@@ -409,9 +497,9 @@ def verify_setup():
         # Check files and directories
         required_paths = [
             "sam2_ui.py",
-            "sam2/",
-            "sam2/sam2/",
-            "sam2/checkpoints/"
+            "sam_models/sam2/",
+            "sam_models/sam2/sam2/",
+            "sam_models/sam2/checkpoints/"
         ]
 
         for path in required_paths:
@@ -422,7 +510,7 @@ def verify_setup():
                 return False
 
         # Check at least one checkpoint exists
-        checkpoint_dir = Path("sam2/checkpoints")
+        checkpoint_dir = Path("sam_models/sam2/checkpoints")
         checkpoints = list(checkpoint_dir.glob("*.pt"))
         if checkpoints:
             print(f"OK: Found {len(checkpoints)} checkpoint(s)")
@@ -431,8 +519,15 @@ def verify_setup():
             return False
 
         # Optional: Check SAM3
-        if Path("sam3").exists():
+        if Path("sam_models/sam3").exists():
             print("OK: SAM3 installed (optional)")
+            # Check SAM3 dependencies
+            try:
+                import einops
+                print("OK: SAM3 dependencies (einops) available")
+            except ImportError:
+                print("WARNING: einops not found - SAM3 may not work")
+                print("  Install with: pip install einops")
 
         return True
 
