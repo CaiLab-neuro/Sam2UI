@@ -295,10 +295,6 @@ class SAM2VideoUI:
 
         ttk.Button(file_frame, text="Load SAM2 Model",
                   command=self.load_sam2_model, width=15).pack(fill=tk.X, pady=2)
-        ttk.Button(file_frame, text="Import Object List",
-                  command=self.import_object_list, width=15).pack(fill=tk.X, pady=2)
-        ttk.Button(file_frame, text="Export Object List",
-                  command=self.export_object_list, width=15).pack(fill=tk.X, pady=2)
 
         # Model status
         self.model_status_label = ttk.Label(file_frame, text="Model Not Loaded",
@@ -325,7 +321,11 @@ class SAM2VideoUI:
         # Enhanced Object Management
         obj_frame = ttk.LabelFrame(scrollable_frame, text="Object Management", padding=10)
         obj_frame.pack(fill=tk.X, pady=(0, 10))
-        
+
+        # Import object list button (before object list)
+        ttk.Button(obj_frame, text="Import Object List",
+                  command=self.import_object_list, width=15).pack(fill=tk.X, pady=(0, 5))
+
         # Current object selection with more space
         current_obj_frame = ttk.Frame(obj_frame)
         current_obj_frame.pack(fill=tk.X, pady=(0, 5))
@@ -396,7 +396,11 @@ class SAM2VideoUI:
         # When mouse is over this widget, it should handle its own scrolling
         self.object_tree.bind('<Enter>', lambda e: setattr(self, '_mouse_over_scrollable', True))
         self.object_tree.bind('<Leave>', lambda e: setattr(self, '_mouse_over_scrollable', False))
-        
+
+        # Export object list button (after object list)
+        ttk.Button(obj_frame, text="Export Object List",
+                  command=self.export_object_list, width=15).pack(fill=tk.X, pady=(5, 0))
+
         # Segmentation controls
         seg_frame = ttk.LabelFrame(scrollable_frame, text="Segmentation", padding=10)
         seg_frame.pack(fill=tk.X, pady=(0, 10))
@@ -865,7 +869,7 @@ class SAM2VideoUI:
             current_total_frames = len(self.frames)
             
             if saved_total_frames != current_total_frames:
-                result = messagebox.askyesnocancel(
+                result = messagebox.askokcancel(
                     "Frame Count Mismatch",
                     f"Warning: Annotation file has {saved_total_frames} frames, "
                     f"but current video has {current_total_frames} frames.\n\n"
@@ -874,28 +878,28 @@ class SAM2VideoUI:
                     f"- Video was loaded with frame skipping enabled\n"
                     f"- Different video file is loaded\n\n"
                     f"Coordinate system: {coordinate_system}\n\n"
-                    f"Do you want to continue?\n\n"
-                    f"Yes: Attempt to import (may skip invalid frame indices)\n"
-                    f"No: Cancel import"
+                    f"Click OK to attempt import (may skip invalid frame indices)\n"
+                    f"or Cancel to abort.",
+                    icon='warning'
                 )
-                
-                if not result:  # No or Cancel
+
+                if not result:  # Cancel
                     return
             
             # Ask user if they want to clear existing annotations
             if self.click_points:
-                result = messagebox.askyesnocancel(
+                result = self._show_three_button_dialog(
                     "Existing Annotations",
                     f"You have {len(self.click_points)} existing annotations.\n\n"
-                    f"What would you like to do?\n\n"
-                    f"Yes: Clear existing and import new annotations\n"
-                    f"No: Add to existing annotations\n"
-                    f"Cancel: Abort import"
+                    f"How would you like to import new annotations?",
+                    "Replace All",
+                    "Add to Existing",
+                    "Cancel"
                 )
-                
+
                 if result is None:  # Cancel
                     return
-                elif result:  # Yes - clear existing
+                elif result == 0:  # Replace All - clear existing
                     self.click_points.clear()
                     self.object_names.clear()
                     self.object_colors.clear()
@@ -1547,23 +1551,23 @@ class SAM2VideoUI:
             
             # Show memory warning for large videos
             if estimated_memory_mb > 1000:  # > 1GB
-                result = messagebox.askyesnocancel(
-                    "Large Video Detected", 
+                result = self._show_three_button_dialog(
+                    "Large Video Detected",
                     f"Video size: {total_frames} frames ({original_width}x{original_height})\n"
                     f"Estimated memory: {estimated_memory_mb:.1f} MB\n"
                     f"Optimized memory: {optimized_memory_mb:.1f} MB\n\n"
                     f"Enable optimizations to reduce memory usage?\n"
                     f"- Frame skipping: {skip_frames}x\n"
                     f"- Video scaling: {scale_factor:.1f}x\n"
-                    f"- Lazy loading: Load frames on demand\n\n"
-                    f"Click Yes to proceed with optimizations,\n"
-                    f"No to load without optimizations,\n"
-                    f"Cancel to abort."
+                    f"- Lazy loading: Load frames on demand",
+                    "Use Optimizations",
+                    "Full Quality",
+                    "Cancel"
                 )
                 if result is None:  # Cancel
                     self.video_cap.release()
                     return
-                elif result:  # Yes - enable optimizations
+                elif result == 0:  # Use Optimizations
                     self.downsample_frames_var.set(True)
                     self.scale_video_var.set(True)
                     self.lazy_load_var.set(True)
@@ -2312,6 +2316,62 @@ class SAM2VideoUI:
         else:
             return "cpu"
     
+    def _show_three_button_dialog(self, title, message, button1_text, button2_text, button3_text="Cancel"):
+        """
+        Show a custom dialog with 3 buttons
+
+        Returns:
+            0: Button 1 clicked
+            1: Button 2 clicked
+            None: Button 3 (Cancel) clicked or dialog closed
+        """
+        dialog = tk.Toplevel(self.root)
+        dialog.title(title)
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        # Center the dialog
+        dialog.geometry("500x250")
+        dialog.resizable(False, False)
+
+        # Result variable
+        result = [None]
+
+        # Message frame
+        message_frame = ttk.Frame(dialog, padding=20)
+        message_frame.pack(fill=tk.BOTH, expand=True)
+
+        message_label = ttk.Label(message_frame, text=message, wraplength=450, justify=tk.LEFT)
+        message_label.pack(expand=True)
+
+        # Button frame
+        button_frame = ttk.Frame(dialog, padding=(20, 0, 20, 20))
+        button_frame.pack(fill=tk.X)
+
+        def on_button1():
+            result[0] = 0
+            dialog.destroy()
+
+        def on_button2():
+            result[0] = 1
+            dialog.destroy()
+
+        def on_button3():
+            result[0] = None
+            dialog.destroy()
+
+        ttk.Button(button_frame, text=button1_text, command=on_button1, width=15).pack(side=tk.LEFT, padx=5)
+        ttk.Button(button_frame, text=button2_text, command=on_button2, width=15).pack(side=tk.LEFT, padx=5)
+        ttk.Button(button_frame, text=button3_text, command=on_button3, width=15).pack(side=tk.RIGHT, padx=5)
+
+        # Handle window close button
+        dialog.protocol("WM_DELETE_WINDOW", on_button3)
+
+        # Wait for dialog to close
+        self.root.wait_window(dialog)
+
+        return result[0]
+
     def on_gpu_selection_change(self, event=None):
         """Handle GPU selection change"""
         device = self._get_selected_device()
@@ -2460,10 +2520,10 @@ class SAM2VideoUI:
 
         # Warn if model is already loaded
         if self.model_loaded:
-            result = messagebox.askyesno(
+            result = messagebox.askokcancel(
                 "Change Model Type",
                 f"Switching to {new_type} will clear the current model and all annotations.\n\n"
-                "Do you want to continue?",
+                "Click OK to continue or Cancel to keep current model.",
                 icon='warning'
             )
             if not result:
@@ -2502,11 +2562,11 @@ class SAM2VideoUI:
 
         # Warn user if model already loaded
         if hasattr(self, 'sam2_model') and self.sam2_model is not None:
-            response = messagebox.askyesno(
+            response = messagebox.askokcancel(
                 "Model Change",
                 "Changing the model requires reloading.\n\n"
                 "This will clear current segmentation state.\n\n"
-                "Continue?",
+                "Click OK to continue or Cancel to keep current model.",
                 icon='warning'
             )
             if response:
@@ -2805,33 +2865,39 @@ class SAM2VideoUI:
                             f"or create new annotations for the current video.")
             return
         
-        # Ask for output directory for auto-export
-        export_dir_choice = filedialog.askdirectory(
+        # Ask for output directory for results
+        output_base_dir = filedialog.askdirectory(
             title="Select Output Directory for Segmentation Results (Cancel to abort)",
             initialdir=os.path.expanduser("~")
         )
 
-        if not export_dir_choice:
+        if not output_base_dir:
             # User cancelled - abort segmentation
             return
 
-        # Store export directory for auto-export after segmentation
-        self.auto_export_after_segmentation = True
-        self.auto_export_directory = export_dir_choice
-            
+        # Create output directory structure directly (no temp directories)
+        try:
+            os.makedirs(output_base_dir, exist_ok=True)
+            masks_output_dir = os.path.join(output_base_dir, "masks")
+            os.makedirs(masks_output_dir, exist_ok=True)
+            print(f"Output directory: {output_base_dir}")
+            print(f"Masks will be saved to: {masks_output_dir}")
+        except Exception as e:
+            messagebox.showerror("Directory Error", f"Failed to create output directories: {e}")
+            return
+
         try:
             self.status_label.config(text="Preparing frames for SAM2...")
 
             self.progress_bar.pack(fill=tk.X, pady=(5, 0))
             self.progress_var.set(0)
             self.root.update()
-            
-            # Create temporary directory for frames
+
+            # Create temporary directory for frames (still needed for SAM2 processing)
             temp_dir = tempfile.mkdtemp(prefix='sam2_frames_')
 
-            # Create temporary directory for mask storage (always enabled for memory efficiency)
-            export_dir = tempfile.mkdtemp(prefix="sam2_masks_")
-            print(f"Temporary mask storage: {export_dir}")
+            # Use the user-selected directory for mask output (no temp directory)
+            export_dir = masks_output_dir
 
             # Check if we need to use original video for re-segmentation
             segmentation_video_path = None
@@ -3097,7 +3163,7 @@ class SAM2VideoUI:
                         self._cleanup_frame_cache(out_frame_idx, self.inference_state)
 
                         # Monitor memory usage
-                        self._monitor_memory(out_frame_idx, len(frame_indices))
+                        self._monitor_memory(out_frame_idx, len(frames_to_process))
 
                         processed_frames += 1
                         progress = 45 + (processed_frames / max(1, len(frames_to_process))) * 55
@@ -3197,7 +3263,7 @@ class SAM2VideoUI:
                         'video_path': self.video_path,
                         'total_frames': len(self.frames),
                         'objects': {obj_id: self.object_names.get(obj_id, f"Object {obj_id}")
-                                   for obj_id in self.object_ids},
+                                   for obj_id in self.object_names.keys()},
                         'masks': mask_metadata
                     }, f, indent=2)
 
@@ -3233,16 +3299,65 @@ class SAM2VideoUI:
                     self.show_masks_var.set(True)
                     self.update_object_list()
                     self.display_current_frame()
-                    
-                    # Auto-export if requested
-                    if getattr(self, 'auto_export_after_segmentation', False):
-                        self._perform_auto_export_after_segmentation()
-                    
-                    messagebox.showinfo("Success", 
+
+                    # Export segmented video and metadata
+                    try:
+                        # Prepare annotations data (matching process_annotations.py format)
+                        annotations_data = {
+                            "video_path": self.video_path,
+                            "total_frames": len(self.frames),
+                            "object_names": self.object_names,
+                            "object_colors": self.object_colors,
+                            "annotations": [
+                                {
+                                    "frame_index": frame_idx,
+                                    "object_id": obj_id,
+                                    "x": x,
+                                    "y": y,
+                                    "is_positive": is_pos
+                                }
+                                for x, y, is_pos, obj_id, frame_idx in self.click_points
+                            ]
+                        }
+
+                        # Export segmented video with overlays
+                        self.status_label.config(text="Exporting segmented video...")
+                        self.root.update()
+                        video_exported = self._export_segmented_video(output_base_dir, masks_output_dir)
+
+                        # Save processing metadata (matching process_annotations.py format)
+                        metadata_path = os.path.join(output_base_dir, "processing_metadata.json")
+                        with open(metadata_path, 'w') as f:
+                            json.dump({
+                                "processing_info": {
+                                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                                    "total_frames_processed": len(frames_to_process),
+                                    "total_masks_generated": total_masks,
+                                    "objects_detected": list(self.object_names.keys())
+                                },
+                                "file_paths": {
+                                    "original_video_path": str(Path(self.video_path).resolve()) if self.video_path else None,
+                                    "segmented_video_filename": "segmented_video.mp4",
+                                    "metadata_filename": "processing_metadata.json"
+                                },
+                                "original_annotations": annotations_data
+                            }, f, indent=2)
+
+                        print(f"✅ Results saved to: {output_base_dir}")
+                        print(f"   - Masks: {masks_output_dir}/ ({total_masks} files)")
+                        print(f"   - Video: {output_base_dir}/segmented_video.mp4")
+                        print(f"   - Metadata: {metadata_path}")
+
+                    except Exception as e:
+                        print(f"⚠️ Warning: Failed to export results: {e}")
+                        traceback.print_exc()
+
+                    messagebox.showinfo("Success",
                                       f"Segmentation completed!\n"
                                       f"Objects: {len(unique_objects)}\n"
                                       f"Total masks: {total_masks}\n"
-                                      f"Frames processed: {len(frames_to_process)}")
+                                      f"Frames processed: {len(frames_to_process)}\n\n"
+                                      f"Results saved to:\n{output_base_dir}")
                 else:
                     self.status_label.config(text="No masks generated")
                     messagebox.showwarning("Warning", "No masks were generated. Try different points.")
@@ -3275,75 +3390,93 @@ class SAM2VideoUI:
 
         return True, "All annotations valid"
 
-    def _perform_auto_export_after_segmentation(self):
-        """Auto-export masks and video to pre-selected directory after segmentation"""
-        if not hasattr(self, 'auto_export_directory') or not self.auto_export_directory:
-            print("WARNING: Auto-export requested but no directory specified")
-            return
+    def _export_segmented_video(self, output_dir, masks_dir, fps=30, overlay_opacity=0.4):
+        """
+        Export segmented video with mask overlays and text labels
+        Following the pattern from process_annotations.py
+        """
+        print("Exporting segmented video...")
 
-        export_dir = self.auto_export_directory
+        video_output_path = os.path.join(output_dir, "segmented_video.mp4")
+        height, width = self.frames[0].shape[:2]
 
-        # Create timestamped subdirectory to avoid overwriting
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        video_name = os.path.splitext(os.path.basename(self.video_path))[0] if self.video_path else "video"
-        export_subdir = os.path.join(export_dir, f"{video_name}_{timestamp}")
-        os.makedirs(export_subdir, exist_ok=True)
+        # Use H.264 codec (matching process_annotations.py)
+        for codec in ['avc1', 'H264', 'X264', 'mp4v']:
+            fourcc = cv2.VideoWriter_fourcc(*codec)
+            out = cv2.VideoWriter(video_output_path, fourcc, fps, (width, height))
+            if out.isOpened():
+                if codec != 'mp4v':
+                    print(f"  Using {codec} codec for video encoding")
+                break
 
-        print(f"Auto-exporting results to: {export_subdir}")
+        if not out.isOpened():
+            print("  WARNING: Could not initialize video writer with any codec")
+            return False
 
-        try:
-            # Export masks
-            masks_dir = os.path.join(export_subdir, "masks")
-            os.makedirs(masks_dir, exist_ok=True)
+        processed_frames = 0
+        for frame_idx, frame in enumerate(self.frames):
+            overlay_frame = frame.copy()
 
-            metadata_list = []
-            total_exported = 0
+            # Check if this frame has masks
+            if frame_idx in self.masks and self.masks[frame_idx]:
+                # Collect mask data
+                mask_data_list = []
+                for obj_id in self.masks[frame_idx].keys():
+                    # Load mask from disk
+                    mask = self._load_mask(frame_idx, obj_id)
+                    if mask is None:
+                        continue
 
-            for frame_idx, frame_masks in self.masks.items():
-                for obj_id in frame_masks.keys():
-                    # Export mask using existing method
-                    self._export_mask_to_disk(frame_idx, obj_id, frame_masks[obj_id], masks_dir, metadata_list)
-                    total_exported += 1
+                    mask_bool = (mask > 0).astype(bool)
+                    color = self.object_colors.get(obj_id, [255, 0, 0])  # Default red
+                    name = self.object_names.get(obj_id, f"Object_{obj_id}")
 
-            # Save metadata JSON
-            metadata_path = os.path.join(export_subdir, "segmentation_metadata.json")
-            with open(metadata_path, 'w') as f:
-                json.dump({
-                    "video_path": self.video_path,
-                    "total_frames": len(self.frames),
-                    "total_masks_exported": total_exported,
-                    "objects": {obj_id: self.object_names.get(obj_id, f"Object_{obj_id}")
-                               for obj_id in self.object_names.keys()},
-                    "masks": metadata_list
-                }, f, indent=2)
+                    mask_data_list.append((mask_bool, color, name, obj_id))
 
-            # Export annotations JSON
-            annotations_path = os.path.join(export_subdir, "annotations.json")
-            annotations_data = {
-                "video_path": self.video_path,
-                "object_names": self.object_names,
-                "object_colors": self.object_colors,
-                "annotations": [
-                    {
-                        "frame_index": frame_idx,
-                        "object_id": obj_id,
-                        "x": x,
-                        "y": y,
-                        "is_positive": is_pos
-                    }
-                    for x, y, is_pos, obj_id, frame_idx in self.click_points
-                ]
-            }
-            with open(annotations_path, 'w') as f:
-                json.dump(annotations_data, f, indent=2)
+                if mask_data_list:
+                    # Create overlay with averaged colors for overlapping regions
+                    combined_overlay = np.zeros((height, width, 3), dtype=np.float32)
+                    overlap_count = np.zeros((height, width), dtype=np.int32)
 
-            print(f"✅ Auto-export complete: {total_exported} masks exported to {export_subdir}")
-            self.status_label.config(text=f"Auto-export complete: {total_exported} masks")
+                    for mask_bool, color, name, obj_id in mask_data_list:
+                        # Convert RGB to BGR for OpenCV
+                        color_bgr = color[::-1] if isinstance(color, (list, tuple)) else [0, 0, 255]
+                        combined_overlay[mask_bool] += color_bgr
+                        overlap_count[mask_bool] += 1
 
-        except Exception as e:
-            print(f"❌ Auto-export failed: {e}")
-            traceback.print_exc()
-            messagebox.showerror("Auto-Export Error", f"Failed to auto-export results: {str(e)}")
+                    # Average colors where masks overlap
+                    mask_pixels = overlap_count > 0
+                    combined_overlay[mask_pixels] /= overlap_count[mask_pixels, np.newaxis]
+                    combined_overlay = combined_overlay.astype(np.uint8)
+
+                    # Single blend operation
+                    overlay_frame = cv2.addWeighted(frame, 1-overlay_opacity,
+                                                  combined_overlay, overlay_opacity, 0)
+
+                    # Add text labels
+                    for mask_bool, color, name, obj_id in mask_data_list:
+                        if mask_bool.any():
+                            y_coords, x_coords = np.where(mask_bool)
+                            if len(y_coords) > 0:
+                                center_x = int(np.mean(x_coords))
+                                center_y = int(np.mean(y_coords))
+
+                                # Get contrasting text color
+                                luminance = 0.299 * color[0] + 0.587 * color[1] + 0.114 * color[2]
+                                text_color = (0, 0, 0) if luminance > 127 else (255, 255, 255)
+
+                                cv2.putText(overlay_frame, name, (center_x, center_y),
+                                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, text_color, 2)
+
+            out.write(overlay_frame)
+            processed_frames += 1
+
+            if processed_frames % 100 == 0:
+                print(f"   Processed {processed_frames}/{len(self.frames)} frames...")
+
+        out.release()
+        print(f"OK: Exported segmented video to {video_output_path}")
+        return True
 
     def export_masks(self):
         """Export masks with enhanced metadata including object names"""
@@ -3371,17 +3504,18 @@ class SAM2VideoUI:
         # Check if masks already exist in the directory
         existing_masks = [f for f in os.listdir(export_dir) if f.startswith('mask_f') and f.endswith('.png')]
         if existing_masks:
-            response = messagebox.askyesnocancel(
+            response = self._show_three_button_dialog(
                 "Masks Exist",
                 f"Directory already contains {len(existing_masks)} mask files.\n\n"
-                "Yes: Delete existing masks and export new ones\n"
-                "No: Keep existing masks and add new ones\n"
-                "Cancel: Abort export"
+                f"How would you like to proceed?",
+                "Overwrite All",
+                "Merge",
+                "Cancel"
             )
 
             if response is None:  # Cancel
                 return
-            elif response:  # Yes - delete existing
+            elif response == 0:  # Overwrite All - delete existing
                 import shutil
                 for mask_file in existing_masks:
                     try:
@@ -4104,10 +4238,11 @@ class SAM2VideoUI:
 
         # Check if video file already exists
         if os.path.exists(output_path):
-            response = messagebox.askyesno(
-                "Video Exists",
-                f"Video file already exists:\n{os.path.basename(output_path)}\n\nOverwrite?",
-                default=messagebox.NO
+            response = messagebox.askokcancel(
+                "File Exists",
+                f"Video file already exists:\n{os.path.basename(output_path)}\n\n"
+                "Click OK to overwrite or Cancel to abort.",
+                icon='warning'
             )
             if not response:
                 return
