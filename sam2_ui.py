@@ -70,7 +70,7 @@ class SAM2VideoUI:
         self.sam2_base_path = SAM2_PATH  # Sam2UI root
         self.sam2_repo_path = os.path.join(SAM2_PATH, "sam_models", "sam2")  # SAM2 repository location
         self.checkpoint_dir = os.path.join(self.sam2_repo_path, "checkpoints")
-        self.config_dir = os.path.join(self.sam2_repo_path, "configs")
+        self.config_dir = os.path.join(self.sam2_repo_path, "sam2", "configs")  # Configs are in sam2/sam2/configs/
         
         # Variables
         self.video_path = None
@@ -2296,7 +2296,7 @@ class SAM2VideoUI:
     def _get_selected_device(self):
         """Get the selected device string and convert to PyTorch device"""
         selected = self.selected_gpu.get()
-        
+
         if selected == "auto":
             if torch and torch.cuda.is_available():
                 return "cuda"
@@ -2304,13 +2304,12 @@ class SAM2VideoUI:
                 return "cpu"
         elif selected == "cpu":
             return "cpu"
-        elif selected.startswith("cuda:"):
-            return selected
+        elif "cuda:" in selected:
+            # Extract cuda device from display string like "cuda:0 (GPU Name - 24.0GB)"
+            # This handles both plain "cuda:0" and formatted "cuda:0 (...)" strings
+            device_part = selected.split("cuda:")[1].split(" ")[0]
+            return f"cuda:{device_part}"
         else:
-            # Extract cuda device from display string
-            if "cuda:" in selected:
-                device_part = selected.split("cuda:")[1].split(" ")[0]
-                return f"cuda:{device_part}"
             return "cpu"
     
     def on_gpu_selection_change(self, event=None):
@@ -2806,21 +2805,19 @@ class SAM2VideoUI:
                             f"or create new annotations for the current video.")
             return
         
-        # Ask about processing mode before segmentation
-        processing_choice = messagebox.askyesnocancel(
-            "Segmentation Processing Options",
-            "How would you like to process the segmentation?\n\n"
-            "Yes: Background processing (segment + export, can close app)\n"
-            "No: Foreground processing (wait for completion)\n"
-            "Cancel: Abort segmentation"
+        # Ask for output directory for auto-export
+        export_dir_choice = filedialog.askdirectory(
+            title="Select Output Directory for Segmentation Results (Cancel to abort)",
+            initialdir=os.path.expanduser("~")
         )
-        
-        if export_choice is None:  # Cancel
+
+        if not export_dir_choice:
+            # User cancelled - abort segmentation
             return
-        elif export_choice:  # Yes
-            self.auto_export_after_segmentation = True
-        else:  # No
-            self.auto_export_after_segmentation = False
+
+        # Store export directory for auto-export after segmentation
+        self.auto_export_after_segmentation = True
+        self.auto_export_directory = export_dir_choice
             
         try:
             self.status_label.config(text="Preparing frames for SAM2...")
@@ -3267,16 +3264,86 @@ class SAM2VideoUI:
         """Validate that annotations have valid frame indices for current video"""
         if not self.click_points:
             return False, "No annotation points found"
-        
+
         invalid_points = []
         for i, (x, y, is_pos, obj_id, frame_idx) in enumerate(self.click_points):
             if frame_idx >= len(self.frames):
                 invalid_points.append((i, frame_idx))
-        
+
         if invalid_points:
             return False, f"Found {len(invalid_points)} annotations with invalid frame indices"
-        
+
         return True, "All annotations valid"
+
+    def _perform_auto_export_after_segmentation(self):
+        """Auto-export masks and video to pre-selected directory after segmentation"""
+        if not hasattr(self, 'auto_export_directory') or not self.auto_export_directory:
+            print("WARNING: Auto-export requested but no directory specified")
+            return
+
+        export_dir = self.auto_export_directory
+
+        # Create timestamped subdirectory to avoid overwriting
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        video_name = os.path.splitext(os.path.basename(self.video_path))[0] if self.video_path else "video"
+        export_subdir = os.path.join(export_dir, f"{video_name}_{timestamp}")
+        os.makedirs(export_subdir, exist_ok=True)
+
+        print(f"Auto-exporting results to: {export_subdir}")
+
+        try:
+            # Export masks
+            masks_dir = os.path.join(export_subdir, "masks")
+            os.makedirs(masks_dir, exist_ok=True)
+
+            metadata_list = []
+            total_exported = 0
+
+            for frame_idx, frame_masks in self.masks.items():
+                for obj_id in frame_masks.keys():
+                    # Export mask using existing method
+                    self._export_mask_to_disk(frame_idx, obj_id, frame_masks[obj_id], masks_dir, metadata_list)
+                    total_exported += 1
+
+            # Save metadata JSON
+            metadata_path = os.path.join(export_subdir, "segmentation_metadata.json")
+            with open(metadata_path, 'w') as f:
+                json.dump({
+                    "video_path": self.video_path,
+                    "total_frames": len(self.frames),
+                    "total_masks_exported": total_exported,
+                    "objects": {obj_id: self.object_names.get(obj_id, f"Object_{obj_id}")
+                               for obj_id in self.object_names.keys()},
+                    "masks": metadata_list
+                }, f, indent=2)
+
+            # Export annotations JSON
+            annotations_path = os.path.join(export_subdir, "annotations.json")
+            annotations_data = {
+                "video_path": self.video_path,
+                "object_names": self.object_names,
+                "object_colors": self.object_colors,
+                "annotations": [
+                    {
+                        "frame_index": frame_idx,
+                        "object_id": obj_id,
+                        "x": x,
+                        "y": y,
+                        "is_positive": is_pos
+                    }
+                    for x, y, is_pos, obj_id, frame_idx in self.click_points
+                ]
+            }
+            with open(annotations_path, 'w') as f:
+                json.dump(annotations_data, f, indent=2)
+
+            print(f"✅ Auto-export complete: {total_exported} masks exported to {export_subdir}")
+            self.status_label.config(text=f"Auto-export complete: {total_exported} masks")
+
+        except Exception as e:
+            print(f"❌ Auto-export failed: {e}")
+            traceback.print_exc()
+            messagebox.showerror("Auto-Export Error", f"Failed to auto-export results: {str(e)}")
 
     def export_masks(self):
         """Export masks with enhanced metadata including object names"""
@@ -4216,6 +4283,10 @@ class SAM2VideoUI:
                 # Build full paths using new structure
                 sam2_checkpoint = os.path.join(self.checkpoint_dir, checkpoint_file)
                 model_cfg = os.path.join(self.config_dir, config_path)
+
+                # Hydra on Linux strips leading '/', so prepend extra '/' for absolute paths
+                if model_cfg.startswith('/'):
+                    model_cfg = '/' + model_cfg
 
                 # Check files exist
                 if not os.path.exists(sam2_checkpoint):
