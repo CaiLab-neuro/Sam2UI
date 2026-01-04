@@ -91,8 +91,6 @@ class SAM2VideoUI:
         # Enhanced object management
         self.object_names = {}  # Maps obj_id to custom name
         self.object_colors = {}  # Dynamic color assignment
-        self.refinement_mode = False
-        self.selected_frames_for_refinement = set()
         self.point_removal_mode = False
         
         # Multi-frame annotation mode (always enabled)
@@ -140,6 +138,12 @@ class SAM2VideoUI:
         self.original_video_width = None
         self.original_video_height = None
         self.current_video_scale = 1.0  # Current scale applied to loaded frames
+
+        # State for loading segmentation results
+        self.loaded_from_results = False  # Flag if loaded from results
+        self.original_video_path_for_resegment = None  # Path for re-segmentation
+        self.segmented_video_displayed = False  # Track if displaying segmented vs original
+        self.results_output_dir = None  # Store output directory
 
         # Initialize default colors and names
         self._initialize_objects()
@@ -426,11 +430,6 @@ class SAM2VideoUI:
         ttk.Button(seg_frame, text="Segment Video",
                   command=self.segment_video, width=15).pack(fill=tk.X, pady=2)
 
-        self.refine_segment_button = tk.Button(seg_frame, text="Refine Segment",
-                  command=self.toggle_refinement_mode, width=15,
-                  bg='#404040', fg='white', activebackground='#505050')
-        self.refine_segment_button.pack(fill=tk.X, pady=2)
-
         # Flash mask button
         ttk.Button(seg_frame, text="Flash Mask (F)",
                   command=self.flash_selected_object_mask, width=15).pack(fill=tk.X, pady=2)
@@ -539,14 +538,7 @@ class SAM2VideoUI:
         # Jump to annotated frames buttons
         ttk.Button(playback_frame, text="◄ Ann", command=self.jump_to_prev_annotated_frame).pack(side=tk.LEFT, padx=(10, 5))
         ttk.Button(playback_frame, text="Ann ►", command=self.jump_to_next_annotated_frame).pack(side=tk.LEFT, padx=(0, 5))
-        
-        
-        # Frame selection for refinement (always present; enabled when active)
-        self.select_frame_button = ttk.Button(playback_frame, text="Select Frame",
-                      command=self.toggle_frame_selection)
-        self.select_frame_button.state(["disabled"])
-        self.select_frame_button.pack(side=tk.LEFT, padx=(10, 0))
-        
+
         # Frame slider
         slider_frame = ttk.Frame(controls_frame)
         slider_frame.pack(fill=tk.X, pady=(0, 5))
@@ -796,8 +788,7 @@ class SAM2VideoUI:
                 "export_time": time.strftime("%Y-%m-%d %H:%M:%S"),
                 "app_version": "SAM Video UI v1.0",
                 "coordinate_system": "original",  # ADDED: Indicate coordinate system
-                "multi_frame_mode": self.multi_frame_annotation_mode,
-                "refinement_mode": self.refinement_mode
+                "multi_frame_mode": self.multi_frame_annotation_mode
             }
             
             # Write to file
@@ -981,10 +972,10 @@ class SAM2VideoUI:
             messagebox.showerror("Import Error", f"Failed to import annotations: {str(e)}")
 
     def import_masks(self):
-        """Import pre-computed masks from processing output directory"""
+        """Load segmentation results: segmented video, annotations, and mask directory"""
         try:
             # Select output directory
-            output_dir = filedialog.askdirectory(title="Select Mask Output Directory")
+            output_dir = filedialog.askdirectory(title="Select Processing Output Directory")
             if not output_dir:
                 return
 
@@ -997,112 +988,150 @@ class SAM2VideoUI:
             with open(metadata_path, 'r') as f:
                 metadata = json.load(f)
 
-            # Extract object info from metadata
-            object_names = {}
-            object_colors = {}
+            # Get file paths from metadata (with backward compatibility)
+            file_paths = metadata.get("file_paths", {})
+            segmented_video_filename = file_paths.get("segmented_video_filename", "segmented_video.mp4")
 
-            if "original_annotations" in metadata:
-                annotations = metadata["original_annotations"]
-                object_names_raw = annotations.get("object_names", {})
-                # Convert string keys to int
-                object_names = {int(k): v for k, v in object_names_raw.items()}
+            # Store original video path for re-segmentation
+            self.original_video_path_for_resegment = file_paths.get("original_video_path")
 
-                object_colors_raw = annotations.get("object_colors", {})
-                object_colors = {int(k): v for k, v in object_colors_raw.items()}
+            # Locate segmented video
+            segmented_video_path = os.path.join(output_dir, segmented_video_filename)
+            if not os.path.exists(segmented_video_path):
+                # Prompt user to locate the video
+                messagebox.showwarning("Video Not Found",
+                                     f"Segmented video not found at:\n{segmented_video_path}\n\n"
+                                     f"Please locate the segmented video file.")
+                segmented_video_path = filedialog.askopenfilename(
+                    title="Select Segmented Video",
+                    filetypes=[("Video files", "*.mp4 *.avi *.mov *.mkv"), ("All files", "*.*")]
+                )
+                if not segmented_video_path:
+                    return
 
-            # Load masks from masks/ subdirectory
+            # Clear existing state
+            self.frames = []
+            self.masks = {}
+            self.click_points = []
+            self.annotated_frames = set()
+
+            # Load segmented video
+            print(f"Loading segmented video: {segmented_video_path}")
+            self.video_path = segmented_video_path
+            self.segmented_video_displayed = True
+            self.results_output_dir = output_dir
+            self.load_video_frames()
+
+            # Set mask export directory for flash functionality
             masks_dir = os.path.join(output_dir, "masks")
             if not os.path.exists(masks_dir):
                 messagebox.showerror("Error", "masks/ directory not found")
                 return
+            self.mask_export_dir = masks_dir
 
-            # Parse mask files
-            masks_by_frame = {}
-            for filename in os.listdir(masks_dir):
-                if not filename.endswith('.png'):
-                    continue
+            # Load annotations from metadata
+            self._load_annotations_from_metadata(metadata)
 
-                # Parse: mask_f{frame_idx:06d}_{obj_name}_id{obj_id}.png
-                match = re.match(r'mask_f(\d{6})_(.+)_id(\d+)\.png', filename)
-                if match:
-                    frame_idx = int(match.group(1))
-                    obj_name_from_file = match.group(2)
-                    obj_id = int(match.group(3))
+            # Validate masks exist on first frame (just check, don't load)
+            first_frame_with_annotations = min(
+                (pt[4] for pt in self.click_points),
+                default=None
+            )
+            if first_frame_with_annotations is not None:
+                # Try to find at least one mask file for the first frame
+                found_mask = False
+                for filename in os.listdir(masks_dir):
+                    if filename.startswith(f"mask_f{first_frame_with_annotations:06d}_"):
+                        found_mask = True
+                        break
 
-                    # Load mask image
-                    mask_path = os.path.join(masks_dir, filename)
-                    mask_raw = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
-
-                    if mask_raw is None:
-                        print(f"Warning: Could not load mask: {filename}")
-                        continue
-
-                    # Normalize mask to uint8 (0-255) to match UI's internal format
-                    # PNG masks are already stored as 0 or 255
-                    mask = mask_raw.astype(np.uint8)
-
-                    # Debug: Print mask info
-                    print(f"Loaded mask {filename}: shape={mask.shape}, dtype={mask.dtype}, "
-                          f"unique_values={np.unique(mask)[:5]}, nonzero_pixels={np.count_nonzero(mask)}")
-
-                    if frame_idx not in masks_by_frame:
-                        masks_by_frame[frame_idx] = {}
-
-                    masks_by_frame[frame_idx][obj_id] = mask
-
-            if not masks_by_frame:
-                messagebox.showwarning("Warning", "No valid mask files found in directory")
-                return
-
-            # Ask user if they want to clear existing masks
-            if self.masks:
-                result = messagebox.askyesnocancel(
-                    "Existing Masks",
-                    f"You have existing masks for {len(self.masks)} frames.\n\n"
-                    f"What would you like to do?\n\n"
-                    f"Yes: Clear existing and import new masks\n"
-                    f"No: Merge with existing masks\n"
-                    f"Cancel: Abort import"
-                )
-
-                if result is None:  # Cancel
-                    return
-                elif result:  # Yes - clear existing
-                    self.masks.clear()
-                    self.object_names.clear()
-                    self.object_colors.clear()
-
-            # Update UI state
-            if not self.masks:
-                self.masks = masks_by_frame
-            else:
-                # Merge masks
-                for frame_idx, frame_masks in masks_by_frame.items():
-                    if frame_idx not in self.masks:
-                        self.masks[frame_idx] = {}
-                    self.masks[frame_idx].update(frame_masks)
-
-            # Update object names and colors from metadata
-            for obj_id, obj_name in object_names.items():
-                if obj_id not in self.object_names:
-                    self.object_names[obj_id] = obj_name
-
-            for obj_id, obj_color in object_colors.items():
-                if obj_id not in self.object_colors:
-                    self.object_colors[obj_id] = obj_color
+                if not found_mask:
+                    print(f"WARNING: No mask files found for first annotated frame {first_frame_with_annotations}")
 
             # Update UI
+            self.loaded_from_results = True
             self.update_object_list()
             self.display_current_frame()
 
+            num_objects = len(self.object_names)
+            num_annotations = len(self.click_points)
             messagebox.showinfo("Success",
-                              f"Imported masks successfully!\n\n"
-                              f"Frames with masks: {len(masks_by_frame)}\n"
-                              f"Objects: {len(object_names)}\n"
-                              f"Total masks loaded: {sum(len(m) for m in masks_by_frame.values())}")
+                              f"Loaded segmentation results successfully!\n\n"
+                              f"Video: {os.path.basename(segmented_video_path)}\n"
+                              f"Frames: {len(self.frames)}\n"
+                              f"Objects: {num_objects}\n"
+                              f"Annotations: {num_annotations}")
 
         except Exception as e:
             messagebox.showerror("Import Error", f"Failed to import masks: {str(e)}")
+
+    def _load_annotations_from_metadata(self, metadata):
+        """Load annotations from processing metadata into UI state"""
+        if "original_annotations" not in metadata:
+            print("WARNING: No original_annotations found in metadata")
+            return
+
+        annotations = metadata["original_annotations"]
+
+        # Load object names: {int: str}
+        object_names_raw = annotations.get("object_names", {})
+        self.object_names = {int(k): v for k, v in object_names_raw.items()}
+
+        # Load object colors: {int: [R,G,B]}
+        object_colors_raw = annotations.get("object_colors", {})
+        self.object_colors = {int(k): v for k, v in object_colors_raw.items()}
+
+        # Load click points: [(x, y, is_positive, obj_id, frame_idx), ...]
+        annotations_list = annotations.get("annotations", [])
+        for ann in annotations_list:
+            self.click_points.append([
+                ann["x"],
+                ann["y"],
+                ann["is_positive"],
+                ann["object_id"],
+                ann["frame_index"]
+            ])
+
+        # Update annotated frames set
+        self.annotated_frames = set(ann["frame_index"] for ann in annotations_list)
+
+        # Update max object ID
+        if self.object_names:
+            self.max_object_id = max(self.object_names.keys())
+        else:
+            self.max_object_id = 1
+
+        print(f"Loaded annotations: {len(self.click_points)} points, "
+              f"{len(self.object_names)} objects, "
+              f"{len(self.annotated_frames)} annotated frames")
+
+    def _get_original_video_for_resegmentation(self):
+        """Get original video path for re-segmentation when working with loaded results"""
+        # Check if we have stored path from metadata
+        if self.original_video_path_for_resegment and os.path.exists(self.original_video_path_for_resegment):
+            # Confirm with user
+            result = messagebox.askyesno(
+                "Use Stored Original Video?",
+                f"Found original video path in metadata:\n\n"
+                f"{self.original_video_path_for_resegment}\n\n"
+                f"Use this video for re-segmentation?"
+            )
+            if result:
+                return self.original_video_path_for_resegment
+
+        # Prompt user to locate original video
+        messagebox.showinfo(
+            "Select Original Video",
+            "Re-segmentation requires the original video (not the segmented version).\n\n"
+            "Please select the original video file."
+        )
+
+        original_video_path = filedialog.askopenfilename(
+            title="Select Original Video for Re-segmentation",
+            filetypes=[("Video files", "*.mp4 *.avi *.mov *.mkv"), ("All files", "*.*")]
+        )
+
+        return original_video_path if original_video_path else None
 
     def flash_selected_object_mask(self):
         """Flash the mask for the currently selected object with white color"""
@@ -1111,13 +1140,18 @@ class SAM2VideoUI:
             messagebox.showinfo("Info", "Please select an object first")
             return
 
-        if self.current_frame_idx not in self.masks:
-            messagebox.showinfo("Info", "No mask for current frame")
-            return
+        # Try to load mask if not in memory (e.g., when loaded from results)
+        if self.current_frame_idx not in self.masks or current_obj_id not in self.masks.get(self.current_frame_idx, {}):
+            # Try loading from disk
+            mask = self._load_mask(self.current_frame_idx, current_obj_id)
+            if mask is None:
+                messagebox.showinfo("Info", "No mask found for selected object on current frame")
+                return
 
-        if current_obj_id not in self.masks[self.current_frame_idx]:
-            messagebox.showinfo("Info", "Selected object not in current frame")
-            return
+            # Temporarily add to self.masks for flash animation
+            if self.current_frame_idx not in self.masks:
+                self.masks[self.current_frame_idx] = {}
+            self.masks[self.current_frame_idx][current_obj_id] = mask
 
         # Initialize flash state
         self.flash_in_progress = True
@@ -1311,25 +1345,6 @@ class SAM2VideoUI:
         # Multi-frame annotation is always active, no need to toggle
         self.multi_frame_label.config(text="MULTI-FRAME ANNOTATION ACTIVE")
         self.status_label.config(text="Multi-frame mode: Navigate to different frames and add points, then segment")
-    
-    def toggle_refinement_mode(self):
-        """Toggle refinement mode for improving segmentation"""
-        self.refinement_mode = not self.refinement_mode
-
-        if self.refinement_mode:
-            # Change button color to indicate active state
-            self.refine_segment_button.config(bg='#FF8C00', activebackground='#FFA500')  # Orange
-            self.status_label.config(text="Refinement mode: Select frames to improve, add points, then re-segment")
-            if hasattr(self, 'select_frame_button'):
-                self.select_frame_button.state(["!disabled"])  # enable
-            # Multi-frame annotation mode stays active
-        else:
-            # Reset button color to normal
-            self.refine_segment_button.config(bg='#404040', activebackground='#505050')
-            self.selected_frames_for_refinement.clear()
-            self.status_label.config(text="Refinement mode disabled")
-            if hasattr(self, 'select_frame_button'):
-                self.select_frame_button.state(["disabled"])  # disable
 
     def toggle_point_removal_mode(self):
         """Toggle point removal mode for removing individual annotation points"""
@@ -1339,9 +1354,6 @@ class SAM2VideoUI:
             # Change button color to indicate active state
             self.remove_point_button.config(bg='#DC143C', activebackground='#FF6347')  # Red
             self.status_label.config(text="Point removal mode: Click on annotation points to remove them")
-            # Disable other modes
-            self.refinement_mode = False
-            self.refine_segment_button.config(bg='#404040', activebackground='#505050')
         else:
             # Reset button color to normal
             self.remove_point_button.config(bg='#404040', activebackground='#505050')
@@ -1400,21 +1412,9 @@ class SAM2VideoUI:
             self.status_label.config(text=f"Removed {point_type} point for {obj_name} at ({px:.0f}, {py:.0f})")
             
             return True
-        
+
         return False
-            
-    def toggle_frame_selection(self):
-        """Toggle current frame selection for refinement"""
-        if not self.refinement_mode:
-            return
-            
-        if self.current_frame_idx in self.selected_frames_for_refinement:
-            self.selected_frames_for_refinement.remove(self.current_frame_idx)
-        else:
-            self.selected_frames_for_refinement.add(self.current_frame_idx)
-            
-        self.display_current_frame()
-        
+
     def update_object_name(self, event=None):
         """Update the name of the current object"""
         new_name = self.object_name_var.get().strip()
@@ -1755,13 +1755,7 @@ class SAM2VideoUI:
                 return
             self.current_frame = self.frames[self.current_frame_idx].copy()
         display_frame = self.current_frame.copy()
-        
-        # Add frame selection indicator for refinement mode
-        if self.refinement_mode and self.current_frame_idx in self.selected_frames_for_refinement:
-            # Add orange border for selected frames
-            cv2.rectangle(display_frame, (0, 0), (display_frame.shape[1]-1, display_frame.shape[0]-1), 
-                         (255, 165, 0), 10)
-        
+
         # Add annotation indicator for multi-frame annotation mode
         if self.multi_frame_annotation_mode and self.current_frame_idx in self.annotated_frames:
             # Add blue border for annotated frames
@@ -2787,7 +2781,7 @@ class SAM2VideoUI:
             print(f"Debug error: {e}")
 
     def segment_video(self):
-        """Enhanced segmentation with refinement support"""
+        """Segment video using SAM2 model"""
         if not self.frames:
             messagebox.showwarning("Warning", "Please load a video first")
             return
@@ -2829,14 +2823,8 @@ class SAM2VideoUI:
             self.auto_export_after_segmentation = False
             
         try:
-            # Determine if this is refinement or initial segmentation
-            is_refinement = self.refinement_mode and self.selected_frames_for_refinement
-            
-            if is_refinement:
-                self.status_label.config(text="Refining segmentation for selected frames...")
-            else:
-                self.status_label.config(text="Preparing frames for SAM2...")
-                
+            self.status_label.config(text="Preparing frames for SAM2...")
+
             self.progress_bar.pack(fill=tk.X, pady=(5, 0))
             self.progress_var.set(0)
             self.root.update()
@@ -2848,9 +2836,16 @@ class SAM2VideoUI:
             export_dir = tempfile.mkdtemp(prefix="sam2_masks_")
             print(f"Temporary mask storage: {export_dir}")
 
+            # Check if we need to use original video for re-segmentation
+            segmentation_video_path = None
+            if self.segmented_video_displayed:
+                segmentation_video_path = self._get_original_video_for_resegmentation()
+                if not segmentation_video_path:
+                    return  # User cancelled
+
             try:
                 # Determine which frames to save based on processing range
-                if self.limit_to_range_var.get() and not is_refinement:
+                if self.limit_to_range_var.get():
                     start_idx = max(0, min(self.range_start_var.get(), len(self.frames)-1))
                     end_idx = max(0, min(self.range_end_var.get(), len(self.frames)-1))
                     if end_idx < start_idx:
@@ -2863,23 +2858,46 @@ class SAM2VideoUI:
                     print(f"Processing full video: {len(frames_to_save)} frames")
                 
                 # Save only the frames we need to process
-                for save_idx, frame_idx in enumerate(frames_to_save):
-                    # Handle lazy loading - load frame on demand if needed
-                    if self.lazy_load_var.get() and hasattr(self, 'video_props'):
-                        frame = self._load_frame_lazy(frame_idx)
-                        if frame is None:
-                            # Skip this frame if it can't be loaded
-                            print(f"Warning: Could not load frame {frame_idx}, skipping...")
+                if segmentation_video_path:
+                    # Re-segmentation: Extract frames from original video
+                    print(f"Re-segmentation mode: Extracting frames from original video")
+                    cap = cv2.VideoCapture(segmentation_video_path)
+
+                    for save_idx, frame_idx in enumerate(frames_to_save):
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                        ret, frame_bgr = cap.read()
+                        if not ret:
+                            print(f"Warning: Could not read frame {frame_idx} from original video, skipping...")
                             continue
-                    else:
-                        frame = self.frames[frame_idx]
-                        if frame is None:
-                            print(f"Warning: Frame {frame_idx} is None, skipping...")
-                            continue
-                    
-                    frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-                    frame_path = os.path.join(temp_dir, f"{save_idx:05d}.jpg")
-                    cv2.imwrite(frame_path, frame_bgr)
+
+                        frame_path = os.path.join(temp_dir, f"{save_idx:05d}.jpg")
+                        cv2.imwrite(frame_path, frame_bgr)
+
+                        progress = (save_idx / len(frames_to_save)) * 30
+                        self.progress_var.set(progress)
+                        if save_idx % 10 == 0:
+                            self.root.update_idletasks()
+
+                    cap.release()
+                else:
+                    # Normal segmentation: Use loaded frames
+                    for save_idx, frame_idx in enumerate(frames_to_save):
+                        # Handle lazy loading - load frame on demand if needed
+                        if self.lazy_load_var.get() and hasattr(self, 'video_props'):
+                            frame = self._load_frame_lazy(frame_idx)
+                            if frame is None:
+                                # Skip this frame if it can't be loaded
+                                print(f"Warning: Could not load frame {frame_idx}, skipping...")
+                                continue
+                        else:
+                            frame = self.frames[frame_idx]
+                            if frame is None:
+                                print(f"Warning: Frame {frame_idx} is None, skipping...")
+                                continue
+
+                        frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                        frame_path = os.path.join(temp_dir, f"{save_idx:05d}.jpg")
+                        cv2.imwrite(frame_path, frame_bgr)
                     
                     progress = (save_idx / len(frames_to_save)) * 30
                     self.progress_var.set(progress)
@@ -2908,21 +2926,43 @@ class SAM2VideoUI:
                     offload_state_to_cpu=True   # Offload model state to CPU when not in use
                 )
                 print("Memory optimizations enabled: CPU offloading")
-                
+
+                # Calculate coordinate scaling if re-segmenting
+                coord_scale_x = 1.0
+                coord_scale_y = 1.0
+                if segmentation_video_path:
+                    cap_temp = cv2.VideoCapture(segmentation_video_path)
+                    orig_width = int(cap_temp.get(cv2.CAP_PROP_FRAME_WIDTH))
+                    orig_height = int(cap_temp.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                    cap_temp.release()
+
+                    seg_height, seg_width = self.frames[0].shape[:2]
+                    coord_scale_x = orig_width / seg_width
+                    coord_scale_y = orig_height / seg_height
+
+                    print(f"Re-segmentation coordinate scaling: {coord_scale_x:.3f}x (width), {coord_scale_y:.3f}x (height)")
+                    print(f"  Segmented video: {seg_width}x{seg_height}")
+                    print(f"  Original video: {orig_width}x{orig_height}")
+
                 # Group click points by frame and by object ID
                 points_by_frame_and_object = {}
                 for x, y, is_pos, obj_id, frame_idx in self.click_points:
                     # Map original frame index to limited video index
-                    if self.limit_to_range_var.get() and not is_refinement:
+                    if self.limit_to_range_var.get():
                         if frame_idx not in frames_to_save:
                             continue  # Skip points outside the processing range
                         limited_frame_idx = frames_to_save.index(frame_idx)
                     else:
                         limited_frame_idx = frame_idx
                     
+                    # Handle coordinate scaling for re-segmentation
+                    if coord_scale_x != 1.0 or coord_scale_y != 1.0:
+                        # Re-segmentation: Scale from segmented video dimensions to original video dimensions
+                        scaled_x = x * coord_scale_x
+                        scaled_y = y * coord_scale_y
                     # ADDED: Convert from ORIGINAL coordinates to CURRENT frame coordinates
                     # for SAM2 processing
-                    if self.current_video_scale != 1.0 and self.original_video_width:
+                    elif self.current_video_scale != 1.0 and self.original_video_width:
                         scaled_x = x * self.current_video_scale
                         scaled_y = y * self.current_video_scale
                     else:
@@ -2994,22 +3034,17 @@ class SAM2VideoUI:
                             messagebox.showerror("Segmentation Error", error_msg)
                             return
                 
-                # Propagate through video (or just selected frames in refinement)
-                if is_refinement:
-                    self.status_label.config(text="Refining selected frames...")
-                    frames_to_process = sorted(self.selected_frames_for_refinement)
+                # Determine processing range
+                if self.limit_to_range_var.get():
+                    start_idx = max(0, min(self.range_start_var.get(), len(self.frames)-1))
+                    end_idx = max(0, min(self.range_end_var.get(), len(self.frames)-1))
+                    if end_idx < start_idx:
+                        start_idx, end_idx = end_idx, start_idx
+                    frames_to_process = list(range(start_idx, end_idx + 1))
+                    self.status_label.config(text=f"Propagating through selected range {start_idx+1}-{end_idx+1}...")
                 else:
-                    # Determine processing range
-                    if self.limit_to_range_var.get():
-                        start_idx = max(0, min(self.range_start_var.get(), len(self.frames)-1))
-                        end_idx = max(0, min(self.range_end_var.get(), len(self.frames)-1))
-                        if end_idx < start_idx:
-                            start_idx, end_idx = end_idx, start_idx
-                        frames_to_process = list(range(start_idx, end_idx + 1))
-                        self.status_label.config(text=f"Propagating through selected range {start_idx+1}-{end_idx+1}...")
-                    else:
-                        self.status_label.config(text="Propagating through entire video...")
-                        frames_to_process = list(range(len(self.frames)))
+                    self.status_label.config(text="Propagating through entire video...")
+                    frames_to_process = list(range(len(self.frames)))
                 
                 # Store the processing range for later use
                 self.processing_range = frames_to_process
@@ -3022,20 +3057,13 @@ class SAM2VideoUI:
                 try:
                     for out_frame_idx, out_obj_ids, out_mask_logits in self.sam2_model.propagate_in_video(self.inference_state):
                         # Map limited video frame index back to original frame index
-                        if self.limit_to_range_var.get() and not is_refinement:
+                        if self.limit_to_range_var.get():
                             if out_frame_idx >= len(frames_to_save):
                                 continue
                             original_frame_idx = frames_to_save[out_frame_idx]
                         else:
                             original_frame_idx = out_frame_idx
-                        
-                        # Skip frames not in processing list during refinement
-                        if is_refinement and original_frame_idx not in frames_to_process:
-                            continue
-                        # Skip frames not in selected range (when limiting)
-                        if not is_refinement and self.limit_to_range_var.get() and original_frame_idx not in frames_to_process:
-                            continue
-                        
+
                         # Only process frames that are in our target range
                         if original_frame_idx not in frames_to_process:
                             continue
@@ -3089,81 +3117,80 @@ class SAM2VideoUI:
                                         f"Encountered issue during forward propagation: {str(e)}")
 
                 # BACKWARD PROPAGATION - if earliest annotation is not at frame 0
-                if not is_refinement:  # Only for full segmentation, not refinement
-                    earliest_frame = min(annotation_frames) if annotation_frames else 0
+                earliest_frame = min(annotation_frames) if annotation_frames else 0
 
-                    if earliest_frame > 0:
-                        self.status_label.config(text=f"Propagating backward from frame {earliest_frame+1}...")
-                        self.root.update()
+                if earliest_frame > 0:
+                    self.status_label.config(text=f"Propagating backward from frame {earliest_frame+1}...")
+                    self.root.update()
 
-                        try:
-                            backward_processed = 0
-                            frames_to_backward = earliest_frame  # Number of frames before first annotation
+                    try:
+                        backward_processed = 0
+                        frames_to_backward = earliest_frame  # Number of frames before first annotation
 
-                            for out_frame_idx, out_obj_ids, out_mask_logits in self.sam2_model.propagate_in_video(
-                                self.inference_state, reverse=True
-                            ):
-                                # Map limited video frame index back to original frame index
-                                if self.limit_to_range_var.get():
-                                    if out_frame_idx >= len(frames_to_save):
-                                        continue
-                                    original_frame_idx = frames_to_save[out_frame_idx]
-                                else:
-                                    original_frame_idx = out_frame_idx
-
-                                # Only process frames before the earliest annotation
-                                if original_frame_idx >= earliest_frame:
+                        for out_frame_idx, out_obj_ids, out_mask_logits in self.sam2_model.propagate_in_video(
+                            self.inference_state, reverse=True
+                        ):
+                            # Map limited video frame index back to original frame index
+                            if self.limit_to_range_var.get():
+                                if out_frame_idx >= len(frames_to_save):
                                     continue
+                                original_frame_idx = frames_to_save[out_frame_idx]
+                            else:
+                                original_frame_idx = out_frame_idx
 
-                                # Process each object mask
-                                for i, out_obj_id in enumerate(out_obj_ids):
-                                    if any(out_obj_id in obj_dict for obj_dict in points_by_frame_and_object.values()):
-                                        mask_logits = out_mask_logits[i]
+                            # Only process frames before the earliest annotation
+                            if original_frame_idx >= earliest_frame:
+                                continue
 
-                                        # Convert from BFloat16 to Float32 only when moving to CPU for numpy
-                                        if hasattr(mask_logits, 'cpu'):
-                                            mask_logits = mask_logits.float().cpu()
-                                        if hasattr(mask_logits, 'numpy'):
-                                            mask_logits = mask_logits.numpy()
+                            # Process each object mask
+                            for i, out_obj_id in enumerate(out_obj_ids):
+                                if any(out_obj_id in obj_dict for obj_dict in points_by_frame_and_object.values()):
+                                    mask_logits = out_mask_logits[i]
 
-                                        # Convert to binary mask
-                                        mask = (mask_logits > 0.0)
+                                    # Convert from BFloat16 to Float32 only when moving to CPU for numpy
+                                    if hasattr(mask_logits, 'cpu'):
+                                        mask_logits = mask_logits.float().cpu()
+                                    if hasattr(mask_logits, 'numpy'):
+                                        mask_logits = mask_logits.numpy()
 
-                                        # Ensure mask is 2D
-                                        if len(mask.shape) > 2:
-                                            mask = mask.squeeze()
+                                    # Convert to binary mask
+                                    mask = (mask_logits > 0.0)
 
-                                        # Always export to disk (streaming) for memory efficiency
-                                        mask_uint8 = (mask * 255).astype(np.uint8)
-                                        self._export_mask_to_disk(original_frame_idx, out_obj_id, mask_uint8, export_dir, mask_metadata)
+                                    # Ensure mask is 2D
+                                    if len(mask.shape) > 2:
+                                        mask = mask.squeeze()
 
-                                        # Explicitly delete tensors
-                                        del mask_logits
-                                        del mask
+                                    # Always export to disk (streaming) for memory efficiency
+                                    mask_uint8 = (mask * 255).astype(np.uint8)
+                                    self._export_mask_to_disk(original_frame_idx, out_obj_id, mask_uint8, export_dir, mask_metadata)
 
-                                # Clean up old frames from cache to prevent memory growth
-                                self._cleanup_frame_cache(out_frame_idx, self.inference_state)
+                                    # Explicitly delete tensors
+                                    del mask_logits
+                                    del mask
 
-                                # Monitor memory usage
-                                self._monitor_memory(out_frame_idx, earliest_frame)
+                            # Clean up old frames from cache to prevent memory growth
+                            self._cleanup_frame_cache(out_frame_idx, self.inference_state)
 
-                                backward_processed += 1
-                                # Update progress (backward propagation gets remaining progress from 50% to 100%)
-                                if frames_to_backward > 0:
-                                    backward_progress = 50 + (backward_processed / frames_to_backward) * 50
-                                    self.progress_var.set(min(backward_progress, 100))
+                            # Monitor memory usage
+                            self._monitor_memory(out_frame_idx, earliest_frame)
 
-                                if backward_processed % 10 == 0:
-                                    self.status_label.config(text=f"Backward: Processing frame {backward_processed}/{frames_to_backward}")
-                                    self.root.update_idletasks()
+                            backward_processed += 1
+                            # Update progress (backward propagation gets remaining progress from 50% to 100%)
+                            if frames_to_backward > 0:
+                                backward_progress = 50 + (backward_processed / frames_to_backward) * 50
+                                self.progress_var.set(min(backward_progress, 100))
+
+                            if backward_processed % 10 == 0:
+                                self.status_label.config(text=f"Backward: Processing frame {backward_processed}/{frames_to_backward}")
+                                self.root.update_idletasks()
 
                             print(f"Backward propagation complete: processed {backward_processed} frames")
 
-                        except Exception as e:
-                            print(f"Error during backward propagation: {e}")
-                            traceback.print_exc()
-                            messagebox.showwarning("Backward Propagation Warning",
-                                                f"Encountered issue during backward propagation: {str(e)}")
+                    except Exception as e:
+                        print(f"Error during backward propagation: {e}")
+                        traceback.print_exc()
+                        messagebox.showwarning("Backward Propagation Warning",
+                                            f"Encountered issue during backward propagation: {str(e)}")
 
                 # Save metadata and temporary directory
                 metadata_path = os.path.join(export_dir, "segmentation_metadata.json")
@@ -3203,15 +3230,9 @@ class SAM2VideoUI:
                     unique_objects.update(frame_masks.keys())
                 
                 if total_masks > 0:
-                    if is_refinement:
-                        self.status_label.config(text=f"Refinement complete! Updated masks for {len(unique_objects)} objects")
-                        self.refinement_mode = False
-                        self.refinement_label.config(text="")
-                        self.selected_frames_for_refinement.clear()
-                    else:
-                        self.status_label.config(text=f"Segmentation complete! Generated {total_masks} masks for {len(unique_objects)} objects")
-                        # Multi-frame annotation mode stays active for continued annotation
-                    
+                    self.status_label.config(text=f"Segmentation complete! Generated {total_masks} masks for {len(unique_objects)} objects")
+                    # Multi-frame annotation mode stays active for continued annotation
+
                     self.show_masks_var.set(True)
                     self.update_object_list()
                     self.display_current_frame()
@@ -3345,10 +3366,6 @@ class SAM2VideoUI:
                     "base_path": self.sam2_base_path,
                     "checkpoint_dir": self.checkpoint_dir,
                     "config_dir": self.config_dir
-                },
-                "refinement_info": {
-                    "refinement_used": hasattr(self, 'selected_frames_for_refinement') and len(self.selected_frames_for_refinement) > 0,
-                    "refined_frames": list(getattr(self, 'selected_frames_for_refinement', set()))
                 }
             }
             
@@ -4385,7 +4402,7 @@ class SAM2VideoUI:
 
     def _load_mask(self, frame_idx, obj_id):
         """
-        Load mask from disk (masks are always stored on disk for memory efficiency)
+        Load mask from disk with pattern matching fallback
 
         Args:
             frame_idx: Frame index
@@ -4398,14 +4415,34 @@ class SAM2VideoUI:
             print(f"WARNING: No mask export directory found for frame {frame_idx}, obj {obj_id}")
             return None
 
-        mask_filename = f"frame_{frame_idx:05d}_obj_{obj_id}.png"
-        mask_path = os.path.join(self.mask_export_dir, "masks", mask_filename)
+        # Try 1: Exact name match with new pattern
+        obj_name = self.object_names.get(obj_id, f"Object_{obj_id}")
+        mask_filename = f"mask_f{frame_idx:06d}_{obj_name}_id{obj_id}.png"
+        mask_path = os.path.join(self.mask_export_dir, mask_filename)
 
         if os.path.exists(mask_path):
             return cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
-        else:
-            print(f"WARNING: Mask file not found: {mask_path}")
-            return None
+
+        # Try 2: Legacy pattern (for backward compatibility)
+        mask_filename_legacy = f"frame_{frame_idx:05d}_obj_{obj_id}.png"
+        mask_path_legacy = os.path.join(self.mask_export_dir, "masks", mask_filename_legacy)
+
+        if os.path.exists(mask_path_legacy):
+            print(f"WARNING: Using legacy mask pattern for frame {frame_idx}, obj {obj_id}")
+            return cv2.imread(mask_path_legacy, cv2.IMREAD_GRAYSCALE)
+
+        # Try 3: Pattern matching by frame and ID (name mismatch fallback)
+        for filename in os.listdir(self.mask_export_dir):
+            match = re.match(rf'mask_f{frame_idx:06d}_(.+)_id{obj_id}\.png', filename)
+            if match:
+                found_name = match.group(1)
+                print(f"WARNING: Mask name mismatch for obj {obj_id}. "
+                      f"Expected '{obj_name}', found '{found_name}'. Using found mask.")
+                mask_path_fallback = os.path.join(self.mask_export_dir, filename)
+                return cv2.imread(mask_path_fallback, cv2.IMREAD_GRAYSCALE)
+
+        print(f"WARNING: Mask file not found for frame {frame_idx}, obj {obj_id}")
+        return None
 
     def _cleanup_temp_masks(self):
         """Clean up temporary mask directory"""
