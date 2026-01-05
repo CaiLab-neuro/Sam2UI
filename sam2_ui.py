@@ -727,7 +727,7 @@ class SAM2VideoUI:
 
                 custom_count = self._count_custom_objects()
                 messagebox.showinfo("Import Complete",
-                                  f"Successfully imported {custom_count} custom objects ({imported_count} total)")
+                                  f"Successfully imported {custom_count} custom objects ({imported_count} available)")
                                   
         except Exception as e:
             messagebox.showerror("Import Error", f"Failed to import object list: {str(e)}")
@@ -2432,22 +2432,23 @@ class SAM2VideoUI:
         self._update_speed_button_highlight()
 
     def _update_zoom_button_highlight(self):
-        """Update zoom button styling to show current selection"""
+        """Update zoom button styling to show current selection using ttk state"""
         current_zoom = self.slider_zoom_level.get()
         for level, button in self.zoom_buttons.items():
             if level == current_zoom:
-                button.config(relief='sunken', default='active')
+                button.state(['pressed'])      # Makes it look sunken/selected
             else:
-                button.config(relief='raised', default='normal')
+                button.state(['!pressed'])     # Returns to normal appearance
+
 
     def _update_speed_button_highlight(self):
-        """Update speed button styling to show current selection"""
+        """Update speed button styling to show current selection using ttk state"""
         current_speed = self.playback_speed.get()
         for speed, button in self.speed_buttons.items():
             if speed == current_speed:
-                button.config(relief='sunken', default='active')
+                button.state(['pressed'])      # Selected → looks pressed/sunken
             else:
-                button.config(relief='raised', default='normal')
+                button.state(['!pressed'])     # Not selected → normal look
 
     def on_slider_change(self, value):
         """Handle frame slider change"""
@@ -3988,10 +3989,10 @@ class SAM2VideoUI:
                     mask_filename = f"mask_f{frame_idx:06d}_{obj_name}_id{obj_id}.png"
                     mask_path = os.path.join(export_dir, mask_filename)
                     
-                    progress = (exported_count / total_masks) * 90
+                    progress = (idx / total_frames) * 90
                     self.progress_var.set(progress)
                     
-                    if exported_count % 50 == 0:
+                    if idx % 100 == 0:
                         self.root.update_idletasks()
             
             # Enhanced metadata export
