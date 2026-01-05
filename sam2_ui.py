@@ -401,7 +401,7 @@ class SAM2VideoUI:
             # Note about SAM3 capabilities
             note_label = ttk.Label(
                 model_frame,
-                text="Note: Text prompts coming soon",
+                text="Text prompts coming later",
                 foreground="gray",
                 font=("TkDefaultFont", 8, "italic")
             )
@@ -448,17 +448,8 @@ class SAM2VideoUI:
         ttk.Button(seg_frame, text="Segment Video",
                   command=self.segment_video, width=15).pack(fill=tk.X, pady=2)
 
-        # SAM3 batch mode option (default enabled, recommended)
-        self.sam3_batch_mode_var = tk.BooleanVar(value=True)
-        self.sam3_batch_checkbox = ttk.Checkbutton(
-            seg_frame,
-            text="Use Batch Mode (adds all objects, then propagates - faster, recommended)",
-            variable=self.sam3_batch_mode_var
-        )
-        self.sam3_batch_checkbox.pack(anchor=tk.W, pady=2)
-        # Initially disable if not using SAM3
-        if not self.using_sam3:
-            self.sam3_batch_checkbox.config(state='disabled')
+        
+        
 
         ttk.Button(seg_frame, text="Import Segmentation",
                   command=self.import_masks, width=15).pack(fill=tk.X, pady=2)
@@ -1920,10 +1911,7 @@ class SAM2VideoUI:
         if self.show_masks_var.get() and self.current_frame_idx in self.masks:
             frame_masks = self.masks[self.current_frame_idx]
 
-            # Debug: Print mask info for current frame
-            print(f"\nDEBUG: Rendering frame {self.current_frame_idx}")
-            print(f"  Frame shape: {display_frame.shape}")
-            print(f"  Num masks: {len(frame_masks)}")
+            
 
             # Collect all mask data first (to avoid cumulative blending bug)
             mask_data_list = []
@@ -1937,10 +1925,7 @@ class SAM2VideoUI:
                     continue
 
                 if len(mask.shape) == 2:  # Single channel mask
-                    # Debug: Print mask details
-                    print(f"  Mask {obj_id}: shape={mask.shape}, dtype={mask.dtype}, "
-                          f"nonzero={np.count_nonzero(mask)}, max={mask.max()}")
-
+                    
                     # Get object color
                     obj_color = self.object_colors.get(obj_id, [255, 255, 255])
 
@@ -2949,13 +2934,7 @@ class SAM2VideoUI:
             status_msg += " (Single variant - uses HuggingFace model)"
         self.status_label.config(text=status_msg)
 
-        # Enable/disable batch mode checkbox based on model type
-        if hasattr(self, 'sam3_batch_checkbox'):
-            if new_type == "SAM3":
-                self.sam3_batch_checkbox.config(state='normal')
-            else:
-                self.sam3_batch_checkbox.config(state='disabled')
-                self.sam3_batch_mode_var.set(False)
+        
 
     def on_model_selection_change(self, event=None):
         """Handle model selection change"""
@@ -3228,27 +3207,7 @@ class SAM2VideoUI:
             # Fallback to original values
             return points, labels
     
-    def _debug_dtype_mismatch(self, points, labels, frame_idx, obj_id):
-        """Debug method to identify dtype mismatches"""
-        try:
-            print(f"Debug: Processing frame {frame_idx}, object {obj_id}")
-            print(f"  Points type: {type(points)}, shape: {getattr(points, 'shape', 'N/A')}")
-            print(f"  Labels type: {type(labels)}, shape: {getattr(labels, 'shape', 'N/A')}")
-            
-            if hasattr(points, 'dtype'):
-                print(f"  Points dtype: {points.dtype}")
-            if hasattr(labels, 'dtype'):
-                print(f"  Labels dtype: {labels.dtype}")
-                
-            # Check model dtype
-            if hasattr(self, 'sam2_model') and hasattr(self.sam2_model, 'model'):
-                for name, param in self.sam2_model.model.named_parameters():
-                    if param.dtype != torch.float32:
-                        print(f"  WARNING: Model parameter {name} has dtype {param.dtype}, not float32")
-                        break
-                        
-        except Exception as e:
-            print(f"Debug error: {e}")
+    
 
     def segment_video(self):
         """Segment video using SAM2 model"""
@@ -3471,7 +3430,10 @@ class SAM2VideoUI:
                 # Use for metadata
                 ann_frame_idx = annotation_frames[0] if annotation_frames else self.current_frame_idx
                 self.ann_frame_idx = ann_frame_idx
-                
+
+                # Check if using SAM3 (different API signature for add_new_points_or_box)
+                is_sam3 = hasattr(self.sam2_model, '__class__') and 'Sam3' in self.sam2_model.__class__.__name__
+
                 # Process each annotation frame and its objects
                 for ann_frame in annotation_frames:
                     obj_dict = points_by_frame_and_object[ann_frame]
@@ -3494,15 +3456,24 @@ class SAM2VideoUI:
                             # Make sure tensors are contiguous
                             points_tensor = points_tensor.contiguous()
                             labels_tensor = labels_tensor.contiguous()
-                            
-                            # Add points (autocast context handles dtype conversion automatically)
-                            _ = self.sam2_model.add_new_points(
-                                inference_state=self.inference_state,
-                                frame_idx=ann_frame,
-                                obj_id=obj_id,
-                                points=points_tensor,
-                                labels=labels_tensor,
-                            )
+
+                            # Build kwargs for add_new_points_or_box
+                            kwargs = {
+                                'inference_state': self.inference_state,
+                                'frame_idx': ann_frame,
+                                'obj_id': obj_id,
+                                'points': points_tensor,
+                                'labels': labels_tensor,
+                                'clear_old_points': False,
+                            }
+
+                            # SAM3-specific: Tell it to treat coordinates as pixels, not relative (0-1)
+                            if is_sam3:
+                                kwargs['rel_coordinates'] = False
+
+                            # Use add_new_points_or_box directly (add_new_points is deprecated)
+                            # autocast context handles dtype conversion automatically
+                            _ = self.sam2_model.add_new_points_or_box(**kwargs)
                                     
                             print(f"Successfully added {len(points)} points for {obj_name} on frame {ann_frame}")
                             
@@ -5170,6 +5141,9 @@ class SAM2VideoUI:
     def _save_last_export_dir(self, export_dir):
         """Save last export directory to config file"""
         try:
+            # Update in-memory variable (fixes within-session persistence)
+            self.last_export_dir = export_dir
+
             config_path = self._get_config_file_path()
             config = {}
             # Load existing config if it exists
