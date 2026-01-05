@@ -139,6 +139,9 @@ class SAM2VideoUI:
         self.zoom_buttons = {}  # Map zoom level -> button widget
         self.speed_buttons = {}  # Map speed -> button widget
 
+        # Export folder memory (persists across sessions)
+        self.last_export_dir = self._load_last_export_dir()
+
         # Slider zoom functionality for precise navigation
         self.slider_zoom_level = tk.IntVar(value=1)  # 1 = full range, 10/100/1000 = zoomed
         self.slider_window_center = 0  # Center frame for zoomed slider window
@@ -444,6 +447,18 @@ class SAM2VideoUI:
 
         ttk.Button(seg_frame, text="Segment Video",
                   command=self.segment_video, width=15).pack(fill=tk.X, pady=2)
+
+        # SAM3 batch mode option (default enabled, recommended)
+        self.sam3_batch_mode_var = tk.BooleanVar(value=True)
+        self.sam3_batch_checkbox = ttk.Checkbutton(
+            seg_frame,
+            text="Use Batch Mode (adds all objects, then propagates - faster, recommended)",
+            variable=self.sam3_batch_mode_var
+        )
+        self.sam3_batch_checkbox.pack(anchor=tk.W, pady=2)
+        # Initially disable if not using SAM3
+        if not self.using_sam3:
+            self.sam3_batch_checkbox.config(state='disabled')
 
         ttk.Button(seg_frame, text="Import Segmentation",
                   command=self.import_masks, width=15).pack(fill=tk.X, pady=2)
@@ -2889,7 +2904,7 @@ class SAM2VideoUI:
 
     def _format_model_list(self):
         """Format model list for display in combobox"""
-        formatted = ["Auto-select best model"]
+        formatted = ["auto"]  # Match internal value for consistency
         for model in self.available_models[1:]:  # Skip first "auto"
             display_name = model.split('|')[0]
             formatted.append(display_name)
@@ -2934,12 +2949,20 @@ class SAM2VideoUI:
             status_msg += " (Single variant - uses HuggingFace model)"
         self.status_label.config(text=status_msg)
 
+        # Enable/disable batch mode checkbox based on model type
+        if hasattr(self, 'sam3_batch_checkbox'):
+            if new_type == "SAM3":
+                self.sam3_batch_checkbox.config(state='normal')
+            else:
+                self.sam3_batch_checkbox.config(state='disabled')
+                self.sam3_batch_mode_var.set(False)
+
     def on_model_selection_change(self, event=None):
         """Handle model selection change"""
         # Get selected display name
         selected_display = self.model_combo.get()
 
-        if selected_display == "Auto-select best model":
+        if selected_display == "auto":
             self.selected_model.set("auto")
         else:
             # Find corresponding model info
@@ -3254,14 +3277,19 @@ class SAM2VideoUI:
             return
         
         # Ask for output directory for results
+        # Use parent of last export dir if available, otherwise home directory
+        initial_dir = os.path.dirname(self.last_export_dir) if self.last_export_dir else os.path.expanduser("~")
         output_base_dir = filedialog.askdirectory(
             title="Select Output Directory for Segmentation Results (Cancel to abort)",
-            initialdir=os.path.expanduser("~")
+            initialdir=initial_dir
         )
 
         if not output_base_dir:
             # User cancelled - abort segmentation
             return
+
+        # Save this directory for next time
+        self._save_last_export_dir(output_base_dir)
 
         # Create output directory structure directly (no temp directories)
         try:
@@ -3523,7 +3551,13 @@ class SAM2VideoUI:
                     else:
                         propagate_iterator = self.sam2_model.propagate_in_video(self.inference_state)
 
-                    for out_frame_idx, out_obj_ids, out_mask_logits in propagate_iterator:
+                    for result in propagate_iterator:
+                        # Unpack based on model type (SAM3 returns 5 values, SAM2 returns 3)
+                        if is_sam3:
+                            out_frame_idx, out_obj_ids, out_low_res_masks, out_mask_logits, out_obj_scores = result
+                        else:
+                            out_frame_idx, out_obj_ids, out_mask_logits = result
+
                         # Map limited video frame index back to original frame index
                         if self.limit_to_range_var.get():
                             if out_frame_idx >= len(frames_to_save):
@@ -3610,7 +3644,13 @@ class SAM2VideoUI:
                                 self.inference_state, reverse=True
                             )
 
-                        for out_frame_idx, out_obj_ids, out_mask_logits in backward_iterator:
+                        for result in backward_iterator:
+                            # Unpack based on model type (SAM3 returns 5 values, SAM2 returns 3)
+                            if is_sam3:
+                                out_frame_idx, out_obj_ids, out_low_res_masks, out_mask_logits, out_obj_scores = result
+                            else:
+                                out_frame_idx, out_obj_ids, out_mask_logits = result
+
                             # Map limited video frame index back to original frame index
                             if self.limit_to_range_var.get():
                                 if out_frame_idx >= len(frames_to_save):
@@ -3854,7 +3894,17 @@ class SAM2VideoUI:
             return False
 
         processed_frames = 0
-        for frame_idx, frame in enumerate(self.frames):
+        for frame_idx in range(len(self.frames)):
+            # Load frame on demand (handles lazy loading)
+            if hasattr(self, 'video_cap_lazy') and self.video_cap_lazy:
+                frame = self._load_frame_lazy(frame_idx)
+            else:
+                frame = self.frames[frame_idx]
+
+            if frame is None:
+                print(f"WARNING: Could not load frame {frame_idx}, skipping")
+                continue
+
             overlay_frame = frame.copy()
 
             # Check if this frame has masks
@@ -3937,9 +3987,17 @@ class SAM2VideoUI:
             return
         
         # Get export directory
-        export_dir = filedialog.askdirectory(title="Select Export Directory for Masks")
+        # Use parent of last export dir if available, otherwise home directory
+        initial_dir = os.path.dirname(self.last_export_dir) if self.last_export_dir else os.path.expanduser("~")
+        export_dir = filedialog.askdirectory(
+            title="Select Export Directory for Masks",
+            initialdir=initial_dir
+        )
         if not export_dir:
             return
+
+        # Save this directory for next time
+        self._save_last_export_dir(export_dir)
 
         # Check if masks already exist in the directory
         existing_masks = [f for f in os.listdir(export_dir) if f.startswith('mask_f') and f.endswith('.png')]
@@ -4009,38 +4067,38 @@ class SAM2VideoUI:
                     "config_dir": self.config_dir
                 }
             }
-            
+
             # Object information with names and colors
             for obj_id in range(1, self.max_total_objects + 1):
                 if any(obj_id in frame_masks for frame_masks in self.masks.values()):
                     mask_count = sum(1 for frame_masks in self.masks.values() if obj_id in frame_masks)
                     point_count = sum(1 for _, _, _, oid in self.click_points if oid == obj_id)
-                    
+
                     metadata["objects"][obj_id] = {
                         "name": self.object_names.get(obj_id, f"Object_{obj_id}"),
                         "mask_count": mask_count,
                         "point_count": point_count,
                         "color": self.object_colors.get(obj_id, [255, 255, 255])
                     }
-            
+
             # Click points grouped by object
             for x, y, is_pos, obj_id, frame_idx in self.click_points:
                 if obj_id not in metadata["click_points_by_object"]:
                     metadata["click_points_by_object"][obj_id] = []
                 metadata["click_points_by_object"][obj_id].append({
-                    "x": float(x), 
-                    "y": float(y), 
+                    "x": float(x),
+                    "y": float(y),
                     "positive": bool(is_pos),
                     "object_name": self.object_names.get(obj_id, f"Object_{obj_id}"),
                     "frame": int(frame_idx)
                 })
-            
-            metadata_path = os.path.join(folder_path, "segmentation_metadata.json")
+
+            metadata_path = os.path.join(export_dir, "segmentation_metadata.json")
             with open(metadata_path, 'w') as f:
                 json.dump(metadata, f, indent=2)
-            
+
             # Also export object mapping CSV
-            csv_path = os.path.join(folder_path, "object_mapping.csv")
+            csv_path = os.path.join(export_dir, "object_mapping.csv")
             with open(csv_path, 'w', newline='', encoding='utf-8') as csvfile:
                 fieldnames = ['id', 'name', 'mask_count', 'point_count', 'color_hex']
                 writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
@@ -4058,6 +4116,8 @@ class SAM2VideoUI:
             
             self.progress_var.set(100)
             self.progress_bar.pack_forget()
+            # Calculate exported count
+            exported_count = sum(len(frame_masks) for frame_masks in self.masks.values())
             self.status_label.config(text=f"Export complete: {exported_count} masks + metadata")
             
             # Show brief success message without dialog
@@ -4483,11 +4543,11 @@ class SAM2VideoUI:
                 out.write(output_frame_bgr)
                 
                 # Update progress
-                self.progress_var.set((idx + 1) / total_frames * 100)
+                self.progress_var.set((export_idx + 1) / total_frames * 100)
                 self.root.update()
             
             self.progress_bar.pack_forget()
-            messagebox.showinfo("Export Complete", f"Masks exported to {export_dir}")
+            messagebox.showinfo("Export Complete", f"Masks exported to {file_path}")
             self.status_label.config(text="Mask export complete")
             
             # Determine if this was a limited export
@@ -4947,9 +5007,9 @@ class SAM2VideoUI:
             messagebox.showerror("Model Load Error", error_msg)
 
     def _monitor_memory(self, frame_idx, total_frames):
-        """Monitor and log GPU/RAM memory usage (every 50 frames)"""
-        # Only monitor every 50 frames to reduce overhead
-        if frame_idx % 50 != 0:
+        """Monitor and log GPU/RAM memory usage (every 100 frames)"""
+        # Only monitor every 100 frames to reduce overhead
+        if frame_idx % 100 != 0:
             return
 
         if torch.cuda.is_available():
@@ -4960,7 +5020,7 @@ class SAM2VideoUI:
             # Log to console
             print(f"  GPU Memory - Frame {frame_idx}/{total_frames}: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved, {peak:.2f}GB peak")
 
-            # Reset peak stats every 50 frames to track incremental growth
+            # Reset peak stats every 100 frames to track incremental growth
             torch.cuda.reset_peak_memory_stats()
 
         # Monitor RAM
@@ -4987,16 +5047,16 @@ class SAM2VideoUI:
         # Ensure output directory exists (output_dir is already the masks directory)
         os.makedirs(output_dir, exist_ok=True)
 
-        # Generate filename
-        mask_filename = f"frame_{frame_idx:05d}_obj_{obj_id}.png"
+        # Get object metadata first (needed for filename)
+        obj_name = self.object_names.get(obj_id, f"Object_{obj_id}")
+        obj_color = self.object_colors.get(obj_id, (255, 0, 0))
+
+        # Generate filename using new consolidated pattern
+        mask_filename = f"mask_f{frame_idx:06d}_{obj_name}_id{obj_id}.png"
         mask_path = os.path.join(output_dir, mask_filename)
 
         # Save mask to disk
         cv2.imwrite(mask_path, mask)
-
-        # Get object metadata
-        obj_name = self.object_names.get(obj_id, f"Object {obj_id}")
-        obj_color = self.object_colors.get(obj_id, (255, 0, 0))
 
         # Store only metadata (filename, name, color) - NOT the full mask array
         metadata = {
@@ -5089,6 +5149,43 @@ class SAM2VideoUI:
         print(f"WARNING: Mask file not found for frame {frame_idx}, obj {obj_id}")
         return None
 
+    def _get_config_file_path(self):
+        """Get path to config file for storing persistent settings"""
+        config_dir = os.path.expanduser("~/.sam2_ui")
+        os.makedirs(config_dir, exist_ok=True)
+        return os.path.join(config_dir, "config.json")
+
+    def _load_last_export_dir(self):
+        """Load last export directory from config file"""
+        try:
+            config_path = self._get_config_file_path()
+            if os.path.exists(config_path):
+                with open(config_path, 'r') as f:
+                    config = json.load(f)
+                    return config.get('last_export_dir', None)
+        except Exception as e:
+            print(f"Warning: Could not load config: {e}")
+        return None
+
+    def _save_last_export_dir(self, export_dir):
+        """Save last export directory to config file"""
+        try:
+            config_path = self._get_config_file_path()
+            config = {}
+            # Load existing config if it exists
+            if os.path.exists(config_path):
+                try:
+                    with open(config_path, 'r') as f:
+                        config = json.load(f)
+                except:
+                    pass
+            # Update last export dir
+            config['last_export_dir'] = export_dir
+            # Save config
+            with open(config_path, 'w') as f:
+                json.dump(config, f, indent=2)
+        except Exception as e:
+            print(f"Warning: Could not save config: {e}")
 
 
 def main():
