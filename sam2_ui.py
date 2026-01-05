@@ -82,6 +82,7 @@ class SAM2VideoUI:
         self.scale_factor = 1.0
         self.click_points = []  # Store click coordinates with object IDs
         self.masks = {}  # Store masks for each frame {frame_idx: {obj_id: mask}}
+        self.has_segmentation = False  # Track if segmentation has been completed or loaded
         self.playing = False
         self.inference_state = None
         self.current_object_id = 1  # Currently selected object ID
@@ -133,7 +134,15 @@ class SAM2VideoUI:
         self.video_scale_factor = tk.DoubleVar(value=0.5)  # Scale factor for video resolution
         self.lazy_load_var = tk.BooleanVar(value=False)  # Load frames on demand
         self.video_cap_lazy = None  # Keep video capture open for lazy loading
-        
+
+        # Slider zoom functionality for precise navigation
+        self.slider_zoom_level = tk.IntVar(value=1)  # 1 = full range, 10/100/1000 = zoomed
+        self.slider_window_center = 0  # Center frame for zoomed slider window
+
+        # Playback speed control
+        self.playback_speed = tk.DoubleVar(value=1.0)  # 1.0 = normal speed
+        self.video_fps = 30  # Will be set from actual video FPS
+
         # Track original video dimensions for coordinate system consistency
         self.original_video_width = None
         self.original_video_height = None
@@ -250,10 +259,120 @@ class SAM2VideoUI:
         ttk.Button(file_frame, text="Load Video",
                   command=self.load_video, width=15).pack(fill=tk.X, pady=2)
 
+        ttk.Button(file_frame, text="Import Object List",
+                  command=self.import_object_list, width=15).pack(fill=tk.X, pady=2)
+        ttk.Button(file_frame, text="Export Object List",
+                  command=self.export_object_list, width=15).pack(fill=tk.X, pady=2)
+
+        ttk.Button(file_frame, text="Import Annotations",
+                  command=self.import_annotations, width=15).pack(fill=tk.X, pady=2)
+        ttk.Button(file_frame, text="Export Annotations",
+                  command=self.export_annotations, width=15).pack(fill=tk.X, pady=2)
+        
+        # Object Annotation
+        obj_frame = ttk.LabelFrame(scrollable_frame, text="Object Annotation", padding=10)
+        obj_frame.pack(fill=tk.X, pady=(0, 10))
+
+        # Current object selection with more space
+        current_obj_frame = ttk.Frame(obj_frame)
+        current_obj_frame.pack(fill=tk.X, pady=(0, 5))
+
+        ttk.Label(current_obj_frame, text="Current:").pack(side=tk.LEFT)
+
+        self.object_var = tk.IntVar(value=1)
+        self.object_spinbox = tk.Spinbox(current_obj_frame, from_=1, to=self.max_total_objects,
+                                        textvariable=self.object_var, width=5,
+                                        command=self.on_object_change,
+                                        bg='#404040', fg='white', insertbackground='white')
+        self.object_spinbox.pack(side=tk.LEFT, padx=(5, 5))
+
+        # Object color indicator
+        self.object_color_label = ttk.Label(current_obj_frame, text="",
+                                           foreground='cyan', font=('Arial', 16))
+        self.object_color_label.pack(side=tk.LEFT, padx=(5, 0))
+
+        # Object name entry
+        name_frame = ttk.Frame(obj_frame)
+        name_frame.pack(fill=tk.X, pady=5)
+
+        ttk.Label(name_frame, text="Name:").pack(side=tk.LEFT)
+        self.object_name_var = tk.StringVar(value="Object_1")
+        self.object_name_entry = tk.Entry(name_frame, textvariable=self.object_name_var,
+                                         bg='#404040', fg='white', insertbackground='white')
+        self.object_name_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(5, 5))
+        self.object_name_entry.bind('<Return>', self.update_object_name)
+
+        ttk.Button(name_frame, text="Save", command=self.update_object_name, width=5).pack(side=tk.RIGHT)
+
+        # Object control buttons
+        obj_buttons_frame = ttk.Frame(obj_frame)
+        obj_buttons_frame.pack(fill=tk.X, pady=5)
+
+        ttk.Button(obj_buttons_frame, text="Add New",
+                  command=self.add_new_object, width=10).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(obj_buttons_frame, text="Clear Obj",
+                  command=self.clear_current_object, width=10).pack(side=tk.LEFT)
+
+        # Object list with scrollbar
+        list_frame = ttk.Frame(obj_frame)
+        list_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+
+        # Create Treeview for object list
+        self.object_tree = ttk.Treeview(list_frame, columns=("name", "points", "masks"),
+                                       show="tree headings", height=8)
+        self.object_tree.heading("#0", text="ID")
+        self.object_tree.heading("name", text="Name")
+        self.object_tree.heading("points", text="Points")
+        self.object_tree.heading("masks", text="Masks")
+
+        self.object_tree.column("#0", width=40)
+        self.object_tree.column("name", width=100)
+        self.object_tree.column("points", width=60)
+        self.object_tree.column("masks", width=60)
+
+        # Scrollbar for object list
+        tree_scroll = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.object_tree.yview)
+        self.object_tree.configure(yscrollcommand=tree_scroll.set)
+
+        self.object_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        tree_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self.object_tree.bind('<ButtonRelease-1>', self.on_object_tree_select)
+
+        # ADDED: Mark this widget as having its own scrollbar
+        # When mouse is over this widget, it should handle its own scrolling
+        self.object_tree.bind('<Enter>', lambda e: setattr(self, '_mouse_over_scrollable', True))
+        self.object_tree.bind('<Leave>', lambda e: setattr(self, '_mouse_over_scrollable', False))
+
+        # Point management controls
+        ttk.Button(obj_frame, text="Show Frame Points",
+                  command=self.show_frame_points, width=15).pack(fill=tk.X, pady=2)
+
+        point_mgmt_frame = ttk.Frame(obj_frame)
+        point_mgmt_frame.pack(fill=tk.X, pady=2)
+
+        self.remove_point_button = tk.Button(point_mgmt_frame, text="Remove Point",
+                  command=self.toggle_point_removal_mode, width=12,
+                  bg='#404040', fg='white', activebackground='#505050')
+        self.remove_point_button.pack(side=tk.LEFT, padx=(0, 5))
+
+        ttk.Button(point_mgmt_frame, text="Clear All",
+                  command=self.clear_points, width=12).pack(side=tk.LEFT)
+
+        # Flash mask button (disabled until segmentation is complete)
+        self.flash_mask_button = ttk.Button(obj_frame, text="Flash Mask (F)",
+                                           command=self.flash_selected_object_mask,
+                                           width=15, state='disabled')
+        self.flash_mask_button.pack(fill=tk.X, pady=2)
+
+        # Model Configuration (Model selection + GPU selection merged)
+        model_frame = ttk.LabelFrame(scrollable_frame, text="Model Configuration", padding=10)
+        model_frame.pack(fill=tk.X, pady=(0, 10))
+
         # Model Type Selection (SAM2/SAM3) - only show if SAM3 is available
         if self.sam3_available:
-            ttk.Label(file_frame, text="Model Type:").pack(anchor=tk.W, pady=(10, 0))
-            model_type_frame = ttk.Frame(file_frame)
+            ttk.Label(model_frame, text="Model Type:").pack(anchor=tk.W, pady=(0, 0))
+            model_type_frame = ttk.Frame(model_frame)
             model_type_frame.pack(fill=tk.X, pady=(0, 5))
 
             ttk.Radiobutton(
@@ -274,17 +393,17 @@ class SAM2VideoUI:
 
             # Note about SAM3 capabilities
             note_label = ttk.Label(
-                file_frame,
+                model_frame,
                 text="Note: Text prompts coming soon",
                 foreground="gray",
                 font=("TkDefaultFont", 8, "italic")
             )
             note_label.pack(anchor=tk.W, pady=(0, 5))
 
-        # Model Selection - Shows all available models in sam2/checkpoints/
-        ttk.Label(file_frame, text="Model Variant:").pack(anchor=tk.W, pady=(5, 0))
+        # Model Variant Selection
+        ttk.Label(model_frame, text="Model Variant:").pack(anchor=tk.W, pady=(5, 0))
         self.model_combo = ttk.Combobox(
-            file_frame,
+            model_frame,
             textvariable=self.selected_model,
             values=self._format_model_list(),
             state="readonly",
@@ -293,159 +412,46 @@ class SAM2VideoUI:
         self.model_combo.pack(fill=tk.X, pady=(0, 5))
         self.model_combo.bind('<<ComboboxSelected>>', self.on_model_selection_change)
 
-        ttk.Button(file_frame, text="Load SAM2 Model",
+        ttk.Button(model_frame, text="Load SAM Model",
                   command=self.load_sam2_model, width=15).pack(fill=tk.X, pady=2)
 
         # Model status
-        self.model_status_label = ttk.Label(file_frame, text="Model Not Loaded",
+        self.model_status_label = ttk.Label(model_frame, text="Model Not Loaded",
                                            foreground='red')
         self.model_status_label.pack(pady=5)
-        
-        # GPU Selection
-        gpu_frame = ttk.LabelFrame(scrollable_frame, text="GPU Selection", padding=10)
-        gpu_frame.pack(fill=tk.X, pady=(0, 10))
-        
-        ttk.Label(gpu_frame, text="Device:").pack(anchor=tk.W)
-        self.gpu_combo = ttk.Combobox(gpu_frame, textvariable=self.selected_gpu, 
+
+        # GPU Device Selection
+        ttk.Label(model_frame, text="GPU Device:").pack(anchor=tk.W, pady=(5, 0))
+        self.gpu_combo = ttk.Combobox(model_frame, textvariable=self.selected_gpu,
                                      values=self.available_gpus, state="readonly", width=30)
         self.gpu_combo.pack(fill=tk.X, pady=(0, 5))
         self.gpu_combo.bind('<<ComboboxSelected>>', self.on_gpu_selection_change)
-        
+
         # GPU info display
-        self.gpu_info_label = ttk.Label(gpu_frame, text="", foreground='gray', font=('Arial', 8))
+        self.gpu_info_label = ttk.Label(model_frame, text="", foreground='gray', font=('Arial', 8))
         self.gpu_info_label.pack(anchor=tk.W)
-        
+
         # Update GPU info display
         self._update_gpu_info_display()
-        
-        # Enhanced Object Management
-        obj_frame = ttk.LabelFrame(scrollable_frame, text="Object Management", padding=10)
-        obj_frame.pack(fill=tk.X, pady=(0, 10))
-
-        # Import object list button (before object list)
-        ttk.Button(obj_frame, text="Import Object List",
-                  command=self.import_object_list, width=15).pack(fill=tk.X, pady=(0, 5))
-
-        # Current object selection with more space
-        current_obj_frame = ttk.Frame(obj_frame)
-        current_obj_frame.pack(fill=tk.X, pady=(0, 5))
-        
-        ttk.Label(current_obj_frame, text="Current:").pack(side=tk.LEFT)
-        
-        self.object_var = tk.IntVar(value=1)
-        self.object_spinbox = tk.Spinbox(current_obj_frame, from_=1, to=self.max_total_objects, 
-                                        textvariable=self.object_var, width=5, 
-                                        command=self.on_object_change,
-                                        bg='#404040', fg='white', insertbackground='white')
-        self.object_spinbox.pack(side=tk.LEFT, padx=(5, 5))
-        
-        # Object color indicator
-        self.object_color_label = ttk.Label(current_obj_frame, text="", 
-                                           foreground='cyan', font=('Arial', 16))
-        self.object_color_label.pack(side=tk.LEFT, padx=(5, 0))
-        
-        # Object name entry
-        name_frame = ttk.Frame(obj_frame)
-        name_frame.pack(fill=tk.X, pady=5)
-        
-        ttk.Label(name_frame, text="Name:").pack(side=tk.LEFT)
-        self.object_name_var = tk.StringVar(value="Object_1")
-        self.object_name_entry = tk.Entry(name_frame, textvariable=self.object_name_var,
-                                         bg='#404040', fg='white', insertbackground='white')
-        self.object_name_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(5, 5))
-        self.object_name_entry.bind('<Return>', self.update_object_name)
-        
-        ttk.Button(name_frame, text="Save", command=self.update_object_name, width=5).pack(side=tk.RIGHT)
-        
-        # Object control buttons
-        obj_buttons_frame = ttk.Frame(obj_frame)
-        obj_buttons_frame.pack(fill=tk.X, pady=5)
-        
-        ttk.Button(obj_buttons_frame, text="Add New", 
-                  command=self.add_new_object, width=10).pack(side=tk.LEFT, padx=(0, 5))
-        ttk.Button(obj_buttons_frame, text="Clear Obj", 
-                  command=self.clear_current_object, width=10).pack(side=tk.LEFT)
-        
-        # Object list with scrollbar
-        list_frame = ttk.Frame(obj_frame)
-        list_frame.pack(fill=tk.BOTH, expand=True, pady=5)
-        
-        # Create Treeview for object list
-        self.object_tree = ttk.Treeview(list_frame, columns=("name", "points", "masks"), 
-                                       show="tree headings", height=8)
-        self.object_tree.heading("#0", text="ID")
-        self.object_tree.heading("name", text="Name")
-        self.object_tree.heading("points", text="Points")
-        self.object_tree.heading("masks", text="Masks")
-        
-        self.object_tree.column("#0", width=40)
-        self.object_tree.column("name", width=100)
-        self.object_tree.column("points", width=60)
-        self.object_tree.column("masks", width=60)
-        
-        # Scrollbar for object list
-        tree_scroll = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.object_tree.yview)
-        self.object_tree.configure(yscrollcommand=tree_scroll.set)
-        
-        self.object_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        tree_scroll.pack(side=tk.RIGHT, fill=tk.Y)
-        
-        self.object_tree.bind('<ButtonRelease-1>', self.on_object_tree_select)
-        
-        # ADDED: Mark this widget as having its own scrollbar
-        # When mouse is over this widget, it should handle its own scrolling
-        self.object_tree.bind('<Enter>', lambda e: setattr(self, '_mouse_over_scrollable', True))
-        self.object_tree.bind('<Leave>', lambda e: setattr(self, '_mouse_over_scrollable', False))
-
-        # Export object list button (after object list)
-        ttk.Button(obj_frame, text="Export Object List",
-                  command=self.export_object_list, width=15).pack(fill=tk.X, pady=(5, 0))
 
         # Segmentation controls
         seg_frame = ttk.LabelFrame(scrollable_frame, text="Segmentation", padding=10)
         seg_frame.pack(fill=tk.X, pady=(0, 10))
 
-        # Annotation import/export first
-        ttk.Button(seg_frame, text="Import Annotations",
-                  command=self.import_annotations, width=15).pack(fill=tk.X, pady=2)
-        ttk.Button(seg_frame, text="Export Annotations",
-                  command=self.export_annotations, width=15).pack(fill=tk.X, pady=2)
-
-        # Import masks from processing output
-        ttk.Button(seg_frame, text="Import Masks",
-                  command=self.import_masks, width=15).pack(fill=tk.X, pady=2)
-
-        # Point management buttons
-        point_mgmt_frame = ttk.Frame(seg_frame)
-        point_mgmt_frame.pack(fill=tk.X, pady=2)
-
-        self.remove_point_button = tk.Button(point_mgmt_frame, text="Remove Point",
-                  command=self.toggle_point_removal_mode, width=12,
-                  bg='#404040', fg='white', activebackground='#505050')
-        self.remove_point_button.pack(side=tk.LEFT, padx=(0, 5))
-
-        ttk.Button(point_mgmt_frame, text="Clear All",
-                  command=self.clear_points, width=12).pack(side=tk.LEFT)
-
-        ttk.Button(seg_frame, text="Show Frame Points",
-                  command=self.show_frame_points, width=15).pack(fill=tk.X, pady=2)
-
-        # Segmentation execution last
         ttk.Button(seg_frame, text="Segment Video",
                   command=self.segment_video, width=15).pack(fill=tk.X, pady=2)
 
-        # Flash mask button
-        ttk.Button(seg_frame, text="Flash Mask (F)",
-                  command=self.flash_selected_object_mask, width=15).pack(fill=tk.X, pady=2)
-        
-        # Export controls
-        export_frame = ttk.LabelFrame(scrollable_frame, text="Export", padding=10)
-        export_frame.pack(fill=tk.X, pady=(0, 10))
+        ttk.Button(seg_frame, text="Import Segmentation",
+                  command=self.import_masks, width=15).pack(fill=tk.X, pady=2)
 
-        ttk.Button(export_frame, text="Export Video",
-                  command=self.export_video, width=15).pack(fill=tk.X, pady=2)
-        ttk.Button(export_frame, text="Export Masks",
+        # Optional export controls (exports happen automatically during segmentation)
+        ttk.Label(seg_frame, text="(Optional - exports happen automatically during segmentation)",
+                 foreground='gray', font=('Arial', 8, 'italic')).pack(anchor=tk.W, pady=(10, 5))
+
+        ttk.Button(seg_frame, text="Export Masks",
                   command=self.export_masks, width=15).pack(fill=tk.X, pady=2)
+        ttk.Button(seg_frame, text="Export Video",
+                  command=self.export_video, width=15).pack(fill=tk.X, pady=2)
 
         # Display options
         display_frame = ttk.LabelFrame(scrollable_frame, text="Display Options", padding=10)
@@ -557,7 +563,30 @@ class SAM2VideoUI:
         
         self.frame_label = ttk.Label(slider_frame, text="0/0")
         self.frame_label.pack(side=tk.RIGHT)
-        
+
+        # Slider zoom controls for precise navigation
+        zoom_frame = ttk.Frame(controls_frame)
+        zoom_frame.pack(fill=tk.X, pady=(0, 5))
+        ttk.Label(zoom_frame, text="Slider Zoom:").pack(side=tk.LEFT)
+        ttk.Button(zoom_frame, text="Full", command=lambda: self.set_slider_zoom(1), width=6).pack(side=tk.LEFT, padx=2)
+        ttk.Button(zoom_frame, text="10x", command=lambda: self.set_slider_zoom(10), width=6).pack(side=tk.LEFT, padx=2)
+        ttk.Button(zoom_frame, text="100x", command=lambda: self.set_slider_zoom(100), width=6).pack(side=tk.LEFT, padx=2)
+        ttk.Button(zoom_frame, text="1000x", command=lambda: self.set_slider_zoom(1000), width=6).pack(side=tk.LEFT, padx=2)
+        self.zoom_info_label = ttk.Label(zoom_frame, text="(Full range)", foreground='gray')
+        self.zoom_info_label.pack(side=tk.LEFT, padx=(10, 0))
+
+        # Playback speed control
+        speed_frame = ttk.Frame(controls_frame)
+        speed_frame.pack(fill=tk.X, pady=(0, 5))
+        ttk.Label(speed_frame, text="Playback Speed:").pack(side=tk.LEFT)
+        ttk.Button(speed_frame, text="0.25x", command=lambda: self.set_playback_speed(0.25), width=6).pack(side=tk.LEFT, padx=2)
+        ttk.Button(speed_frame, text="0.5x", command=lambda: self.set_playback_speed(0.5), width=6).pack(side=tk.LEFT, padx=2)
+        ttk.Button(speed_frame, text="1x", command=lambda: self.set_playback_speed(1.0), width=6).pack(side=tk.LEFT, padx=2)
+        ttk.Button(speed_frame, text="2x", command=lambda: self.set_playback_speed(2.0), width=6).pack(side=tk.LEFT, padx=2)
+        ttk.Button(speed_frame, text="4x", command=lambda: self.set_playback_speed(4.0), width=6).pack(side=tk.LEFT, padx=2)
+        self.speed_info_label = ttk.Label(speed_frame, text="(Normal)", foreground='gray')
+        self.speed_info_label.pack(side=tk.LEFT, padx=(10, 0))
+
         # Range selection for partial segmentation of long videos
         range_frame = ttk.Frame(controls_frame)
         range_frame.pack(fill=tk.X, pady=(0, 5))
@@ -570,38 +599,6 @@ class SAM2VideoUI:
         self.range_end_spin = tk.Spinbox(range_frame, from_=0, to=0, textvariable=self.range_end_var, width=8,
                                          bg='#404040', fg='white', insertbackground='white')
         self.range_end_spin.pack(side=tk.LEFT)
-        
-        # Large video optimization options
-        large_video_frame = ttk.LabelFrame(controls_frame, text="Large Video Options", padding=5)
-        large_video_frame.pack(fill=tk.X, pady=(5, 0))
-        
-        # Frame skipping option
-        skip_frame = ttk.Frame(large_video_frame)
-        skip_frame.pack(fill=tk.X, pady=(0, 2))
-        ttk.Checkbutton(skip_frame, text="Skip frames:", variable=self.downsample_frames_var).pack(side=tk.LEFT)
-        self.frame_skip_spin = tk.Spinbox(skip_frame, from_=1, to=10, textvariable=self.frame_skip_var, width=5,
-                                         bg='#404040', fg='white', insertbackground='white')
-        self.frame_skip_spin.pack(side=tk.LEFT, padx=(5, 0))
-        ttk.Label(skip_frame, text="(every N frames)").pack(side=tk.LEFT, padx=(5, 0))
-        
-        # Video scaling option
-        scale_frame = ttk.Frame(large_video_frame)
-        scale_frame.pack(fill=tk.X, pady=(2, 0))
-        ttk.Checkbutton(scale_frame, text="Scale video:", variable=self.scale_video_var).pack(side=tk.LEFT)
-        self.scale_spin = tk.Spinbox(scale_frame, from_=0.1, to=1.0, increment=0.1, textvariable=self.video_scale_factor, 
-                                   width=5, bg='#404040', fg='white', insertbackground='white')
-        self.scale_spin.pack(side=tk.LEFT, padx=(5, 0))
-        ttk.Label(scale_frame, text="(reduces memory usage)").pack(side=tk.LEFT, padx=(5, 0))
-        
-        # Lazy loading option
-        lazy_frame = ttk.Frame(large_video_frame)
-        lazy_frame.pack(fill=tk.X, pady=(2, 0))
-        ttk.Checkbutton(lazy_frame, text="Lazy load frames", variable=self.lazy_load_var).pack(side=tk.LEFT)
-        ttk.Label(lazy_frame, text="(load on demand - for very large videos)").pack(side=tk.LEFT, padx=(5, 0))
-
-        # Info about when settings apply
-        ttk.Label(large_video_frame, text="Note: any change made here applies to next video load",
-                  foreground='gray', font=('Arial', 8, 'italic')).pack(pady=(5, 0))
 
         # Info panel
         info_frame = ttk.Frame(controls_frame)
@@ -688,9 +685,10 @@ class SAM2VideoUI:
                             
                 self.update_object_list()
                 self.object_name_var.set(self.object_names[self.current_object_id])
-                
-                messagebox.showinfo("Import Complete", 
-                                  f"Successfully imported {imported_count} object names.")
+
+                custom_count = self._count_custom_objects()
+                messagebox.showinfo("Import Complete",
+                                  f"Successfully imported {custom_count} custom objects ({imported_count} total)")
                                   
         except Exception as e:
             messagebox.showerror("Import Error", f"Failed to import object list: {str(e)}")
@@ -773,9 +771,13 @@ class SAM2VideoUI:
             # Convert click points to export format
             # NOTE: Points are already in ORIGINAL coordinate system
             for point in self.click_points:
-                img_x, img_y, is_positive, obj_id, frame_idx = point
+                img_x, img_y, is_positive, obj_id, loaded_frame_idx = point
+
+                # Convert loaded frame index to original frame number
+                original_frame_num = self._get_original_frame_number(loaded_frame_idx)
+
                 annotation = {
-                    "frame_index": frame_idx,
+                    "frame_index": original_frame_num,  # Store ORIGINAL frame number
                     "x": float(img_x),  # These are in ORIGINAL video coordinates
                     "y": float(img_y),
                     "is_positive": is_positive,
@@ -863,27 +865,56 @@ class SAM2VideoUI:
                         f"Annotations may not appear in the correct locations.\n"
                         f"Please use the same source video."
                     )
-            
-            # Check for frame count mismatch
-            saved_total_frames = annotation_data.get("total_frames", 0)
-            current_total_frames = len(self.frames)
-            
-            if saved_total_frames != current_total_frames:
-                result = messagebox.askokcancel(
-                    "Frame Count Mismatch",
-                    f"Warning: Annotation file has {saved_total_frames} frames, "
-                    f"but current video has {current_total_frames} frames.\n\n"
-                    f"This may happen if:\n"
-                    f"- Video was loaded with different optimization settings\n"
-                    f"- Video was loaded with frame skipping enabled\n"
-                    f"- Different video file is loaded\n\n"
-                    f"Coordinate system: {coordinate_system}\n\n"
-                    f"Click OK to attempt import (may skip invalid frame indices)\n"
-                    f"or Cancel to abort.",
-                    icon='warning'
-                )
 
-                if not result:  # Cancel
+            # Check for frame count mismatch with smart detection
+            saved_total_frames = annotation_data.get("total_frames", 0)
+            current_loaded_frames = len(self.frames)
+            skip_frames = getattr(self, 'video_props', {}).get('skip_frames', 1)
+            total_original_frames = getattr(self, 'video_props', {}).get('total_original_frames', current_loaded_frames)
+
+            if saved_total_frames != current_loaded_frames:
+                # Check if mismatch is explained by frame skipping
+                if skip_frames > 1 and saved_total_frames == total_original_frames:
+                    # CASE 1: Frame skipping during video load - expected mismatch
+                    result = self._show_three_button_dialog(
+                        "Frame Skipping Detected",
+                        f"Annotation file contains {saved_total_frames} frames, but you loaded the video\n"
+                        f"with frame skipping (every {skip_frames} frames).\n\n"
+                        f"Only {current_loaded_frames} frames are loaded in memory.\n\n"
+                        f"Annotations for skipped frames will be preserved but won't be visible\n"
+                        f"until you reload without skipping.\n\n"
+                        f"What would you like to do?",
+                        "Reload Without Skipping",
+                        "Proceed Anyway",
+                        "Cancel"
+                    )
+
+                    if result == 0:  # Reload Without Skipping
+                        messagebox.showinfo("Reload Required",
+                            "Please reload the video without frame skipping:\n\n"
+                            "1. Close this dialog\n"
+                            "2. Go to File → Load Video\n"
+                            "3. When prompted for optimization, choose 'No Optimization'\n"
+                            "4. Then import annotations again")
+                        return
+                    elif result == 2:  # Cancel
+                        return
+                    # else: result == 1 (Proceed Anyway), continue with import
+
+                else:
+                    # CASE 2: Wrong file or corrupted annotation - unexpected mismatch
+                    messagebox.showerror(
+                        "Frame Count Mismatch",
+                        f"Error: Annotation file has {saved_total_frames} frames,\n"
+                        f"but loaded video has {total_original_frames} frames.\n\n"
+                        f"No frame skipping detected (skip_frames={skip_frames}).\n\n"
+                        f"This likely means:\n"
+                        f"• You loaded the wrong video file\n"
+                        f"• The annotation file is corrupted\n"
+                        f"• The video was edited after annotations were created\n\n"
+                        f"Import cannot proceed.\n"
+                        f"Please verify you have the correct video file."
+                    )
                     return
             
             # Ask user if they want to clear existing annotations
@@ -911,25 +942,28 @@ class SAM2VideoUI:
             
             for annotation in annotation_data["annotations"]:
                 try:
-                    frame_idx = annotation["frame_index"]
+                    original_frame_num = annotation["frame_index"]
                     x = annotation["x"]  # These are in ORIGINAL coordinates
                     y = annotation["y"]
                     is_positive = annotation["is_positive"]
                     obj_id = annotation["object_id"]
                     obj_name = annotation.get("object_name", f"Object_{obj_id}")
-                    
-                    # Validate frame index is within current video bounds
-                    if frame_idx >= len(self.frames):
+
+                    # Convert original frame number to loaded frame index
+                    loaded_idx = self._get_loaded_frame_index(original_frame_num)
+
+                    if loaded_idx is None:
+                        # Frame was skipped or out of bounds
                         skipped_count += 1
                         continue
-                    
-                    # ADDED: Coordinates are already in ORIGINAL system, 
+
+                    # ADDED: Coordinates are already in ORIGINAL system,
                     # they will be scaled during display automatically
                     # No conversion needed here!
-                    
-                    # Add the annotation point (coordinates are in ORIGINAL scale)
-                    self.click_points.append((x, y, is_positive, obj_id, frame_idx))
-                    
+
+                    # Add the annotation point (coordinates are in ORIGINAL scale, frame index is loaded)
+                    self.click_points.append((x, y, is_positive, obj_id, loaded_idx))
+
                     # Update object names and colors
                     if obj_id not in self.object_names:
                         self.object_names[obj_id] = obj_name
@@ -940,9 +974,9 @@ class SAM2VideoUI:
                                 self.object_colors[obj_id] = annotation_data["object_colors"][str(obj_id)]
                             else:
                                 self.object_colors[obj_id] = self._get_next_color()
-                    
-                    # Track annotated frames
-                    self.annotated_frames.add(frame_idx)
+
+                    # Track annotated frames (using loaded index)
+                    self.annotated_frames.add(loaded_idx)
                     
                     imported_count += 1
                     
@@ -955,21 +989,24 @@ class SAM2VideoUI:
             self.update_points_display()
             self.update_object_list()
             self.display_current_frame()
-            
+
             # Show success message with warnings if applicable
+            custom_count = self._count_custom_objects()
+            total_objects = len(self.object_names)
+
             message = f"Annotations imported successfully!\n\n" \
                     f"File: {file_path}\n" \
                     f"Imported annotations: {imported_count}\n"
-            
+
             if skipped_count > 0:
                 message += f"Skipped annotations: {skipped_count} (invalid frame indices)\n"
-            
+
             if coordinate_system == "original":
                 message += f"\n✓ Using original coordinate system (compatible with video scaling)"
-            
+
             message += f"\nTotal annotations: {len(self.click_points)}\n" \
-                    f"Objects: {len(self.object_names)}"
-            
+                    f"Objects: {custom_count} custom ({total_objects} total)"
+
             messagebox.showinfo("Import Complete", message)
             
         except Exception as e:
@@ -1059,6 +1096,10 @@ class SAM2VideoUI:
 
             num_objects = len(self.object_names)
             num_annotations = len(self.click_points)
+
+            # Enable Flash Mask button now that segmentation is loaded
+            self._enable_flash_mask_button()
+
             messagebox.showinfo("Success",
                               f"Loaded segmentation results successfully!\n\n"
                               f"Video: {os.path.basename(segmented_video_path)}\n"
@@ -1137,6 +1178,44 @@ class SAM2VideoUI:
 
         return original_video_path if original_video_path else None
 
+    def _get_original_frame_number(self, loaded_frame_idx):
+        """Convert loaded frame index to original video frame number"""
+        skip_frames = getattr(self, 'video_props', {}).get('skip_frames', 1)
+        return loaded_frame_idx * skip_frames
+
+    def _get_loaded_frame_index(self, original_frame_number):
+        """Convert original video frame number to loaded frame index"""
+        skip_frames = getattr(self, 'video_props', {}).get('skip_frames', 1)
+
+        # Check if this frame was skipped
+        if original_frame_number % skip_frames != 0:
+            return None
+
+        loaded_idx = original_frame_number // skip_frames
+
+        # Check bounds
+        if loaded_idx >= len(self.frames):
+            return None
+
+        return loaded_idx
+
+    def _count_custom_objects(self):
+        """Count objects with custom names (not default Object_N format)"""
+        return sum(1 for obj_id, name in self.object_names.items()
+                   if not name.startswith("Object_"))
+
+    def _reset_flash_state(self):
+        """Reset flash animation state"""
+        self.flash_in_progress = False
+        self.flash_obj_id = None
+        self.flash_white_on = False
+
+    def _enable_flash_mask_button(self):
+        """Enable Flash Mask button when segmentation is available"""
+        self.has_segmentation = True
+        if hasattr(self, 'flash_mask_button'):
+            self.flash_mask_button.config(state='normal')
+
     def flash_selected_object_mask(self):
         """Flash the mask for the currently selected object with white color"""
         current_obj_id = self.current_object_id
@@ -1169,9 +1248,7 @@ class SAM2VideoUI:
         def flash_step():
             if flash_count[0] >= max_flashes:
                 # Restore original state
-                self.flash_in_progress = False
-                self.flash_obj_id = None
-                self.flash_white_on = False
+                self._reset_flash_state()
                 self.display_current_frame()
                 return
 
@@ -1457,9 +1534,6 @@ class SAM2VideoUI:
             
     def load_video(self):
         """Load video file and extract frames"""
-        # Clean up temporary masks from previous video
-        self._cleanup_temp_masks()
-
         # Clean up any existing lazy loading
         if hasattr(self, 'video_cap_lazy') and self.video_cap_lazy:
             self.video_cap_lazy.release()
@@ -1520,23 +1594,39 @@ class SAM2VideoUI:
             self.frames = []
             self.masks = {}
             self.click_points = []
-            
+
+            # Reset Flash Mask button state when loading new video
+            self.has_segmentation = False
+            if hasattr(self, 'flash_mask_button'):
+                self.flash_mask_button.config(state='disabled')
+
             # Get video properties
             total_frames = int(self.video_cap.get(cv2.CAP_PROP_FRAME_COUNT))
             fps = self.video_cap.get(cv2.CAP_PROP_FPS)
             original_width = int(self.video_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             original_height = int(self.video_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            
-            # ADDED: Store original dimensions for coordinate consistency
+
+            # Store video properties
             self.original_video_width = original_width
             self.original_video_height = original_height
-            
+            self.video_fps = fps if fps > 0 else 30  # Store FPS for playback, default to 30 if invalid
+
+            # Reset slider zoom to full range for new video
+            self.slider_zoom_level.set(1)
+
             # Calculate current scale factor
             skip_frames = self.frame_skip_var.get() if self.downsample_frames_var.get() else 1
             scale_factor = self.video_scale_factor.get() if self.scale_video_var.get() else 1.0
-            
+
+            # Initialize video_props for frame index mapping
+            if not hasattr(self, 'video_props'):
+                self.video_props = {}
+            self.video_props['total_original_frames'] = total_frames  # Before any skipping
+            self.video_props['skip_frames'] = skip_frames
+
             # ADDED: Store current scale for coordinate conversions
             self.current_video_scale = scale_factor
+            print(f"[VIDEO LOAD] Set current_video_scale to {scale_factor}")
             
             # Calculate memory usage estimate
             bytes_per_frame = original_width * original_height * 3  # RGB
@@ -1549,30 +1639,34 @@ class SAM2VideoUI:
             # Adjust memory estimate based on optimizations
             optimized_memory_mb = estimated_memory_mb / skip_frames * (scale_factor ** 2)
             
-            # Show memory warning for large videos
+            # Show optimization dialog for large videos
             if estimated_memory_mb > 1000:  # > 1GB
-                result = self._show_three_button_dialog(
-                    "Large Video Detected",
-                    f"Video size: {total_frames} frames ({original_width}x{original_height})\n"
-                    f"Estimated memory: {estimated_memory_mb:.1f} MB\n"
-                    f"Optimized memory: {optimized_memory_mb:.1f} MB\n\n"
-                    f"Enable optimizations to reduce memory usage?\n"
-                    f"- Frame skipping: {skip_frames}x\n"
-                    f"- Video scaling: {scale_factor:.1f}x\n"
-                    f"- Lazy loading: Load frames on demand",
-                    "Use Optimizations",
-                    "Full Quality",
-                    "Cancel"
+                settings = self._show_optimization_settings_dialog(
+                    estimated_memory_mb, total_frames, original_width, original_height
                 )
-                if result is None:  # Cancel
+
+                if settings is None:  # User cancelled
                     self.video_cap.release()
                     return
-                elif result == 0:  # Use Optimizations
+                elif settings == 'defaults':  # Use default optimizations
+                    skip_frames = 2
+                    scale_factor = 0.5
                     self.downsample_frames_var.set(True)
                     self.scale_video_var.set(True)
                     self.lazy_load_var.set(True)
-                    skip_frames = self.frame_skip_var.get()
-                    scale_factor = self.video_scale_factor.get()
+                    self.frame_skip_var.set(skip_frames)
+                    self.video_scale_factor.set(scale_factor)
+                else:  # Custom settings (dict)
+                    skip_frames = settings['skip_frames']
+                    scale_factor = settings['scale_factor']
+                    self.downsample_frames_var.set(skip_frames > 1)
+                    self.scale_video_var.set(scale_factor < 1.0)
+                    self.lazy_load_var.set(settings['lazy_load'])
+                    self.frame_skip_var.set(skip_frames)
+                    self.video_scale_factor.set(scale_factor)
+
+                # Recalculate optimized memory
+                optimized_memory_mb = estimated_memory_mb / skip_frames * (scale_factor ** 2)
             
             # Handle lazy loading
             if self.lazy_load_var.get():
@@ -1655,10 +1749,12 @@ class SAM2VideoUI:
             self.original_video_width = original_width
             self.original_video_height = original_height
             self.current_video_scale = scale_factor
+            print(f"[LAZY LOAD] Set current_video_scale to {scale_factor}")
             
             # Store video properties for lazy loading
             self.video_props = {
                 'total_frames': total_frames,
+                'total_original_frames': total_frames,  # Original frame count before skipping
                 'original_width': original_width,
                 'original_height': original_height,
                 'fps': fps,
@@ -2121,12 +2217,16 @@ class SAM2VideoUI:
     def prev_frame(self):
         """Go to previous frame"""
         if self.frames and self.current_frame_idx > 0:
+            # Reset flash state when changing frames
+            self._reset_flash_state()
             self.current_frame_idx -= 1
             self.display_current_frame()
-            
+
     def next_frame(self):
         """Go to next frame"""
         if self.frames and self.current_frame_idx < len(self.frames) - 1:
+            # Reset flash state when changing frames
+            self._reset_flash_state()
             self.current_frame_idx += 1
             self.display_current_frame()
 
@@ -2244,19 +2344,101 @@ class SAM2VideoUI:
             obj_name = self.object_names.get(self.current_object_id, f"Object_{self.current_object_id}")
             messagebox.showinfo("Jump to Annotation", f"Wrapped to first annotated frame for {obj_name}")
             
+    def set_slider_zoom(self, zoom_level):
+        """Set slider zoom level for precise navigation"""
+        if not self.frames:
+            return
+
+        self.slider_zoom_level.set(zoom_level)
+        total_frames = len(self.frames)
+
+        if zoom_level == 1:
+            # Full range mode
+            self.slider_window_center = self.current_frame_idx
+            self.frame_slider.config(from_=0, to=total_frames - 1)
+            self.frame_var.set(self.current_frame_idx)
+            self.zoom_info_label.config(text="(Full range)")
+        else:
+            # Zoomed mode - slider shows window around current frame
+            window_size = max(100, total_frames // zoom_level)
+            self.slider_window_center = self.current_frame_idx
+
+            # Calculate window boundaries
+            half_window = window_size // 2
+            window_start = max(0, self.current_frame_idx - half_window)
+            window_end = min(total_frames - 1, self.current_frame_idx + half_window)
+
+            # Adjust if at boundaries
+            if window_end - window_start < window_size:
+                if window_start == 0:
+                    window_end = min(total_frames - 1, window_size)
+                elif window_end == total_frames - 1:
+                    window_start = max(0, total_frames - window_size)
+
+            # Update slider range to show window
+            self.frame_slider.config(from_=window_start, to=window_end)
+            self.frame_var.set(self.current_frame_idx)
+            self.zoom_info_label.config(text=f"(Frames {window_start}-{window_end})")
+
+        self.status_label.config(text=f"Slider zoom: {zoom_level}x")
+
+    def set_playback_speed(self, speed):
+        """Set playback speed multiplier"""
+        self.playback_speed.set(speed)
+        speed_labels = {0.25: "Very Slow", 0.5: "Slow", 1.0: "Normal", 2.0: "Fast", 4.0: "Very Fast"}
+        label_text = speed_labels.get(speed, f"{speed}x")
+        self.speed_info_label.config(text=f"({label_text})")
+        self.status_label.config(text=f"Playback speed: {speed}x")
+
     def on_slider_change(self, value):
         """Handle frame slider change"""
         if self.frames and not self.playing:
-            self.current_frame_idx = int(float(value))
+            # Reset flash state when manually changing frames
+            self._reset_flash_state()
+
+            new_frame_idx = int(float(value))
+            zoom_level = self.slider_zoom_level.get()
+
+            # In zoomed mode, update window center as user navigates
+            if zoom_level > 1:
+                total_frames = len(self.frames)
+                window_size = max(100, total_frames // zoom_level)
+                half_window = window_size // 2
+
+                # Check if we're near window boundaries, shift window if needed
+                current_slider_min = int(self.frame_slider.cget('from'))
+                current_slider_max = int(self.frame_slider.cget('to'))
+
+                # If navigating near edges, recenter window
+                if (new_frame_idx - current_slider_min < window_size // 4 or
+                    current_slider_max - new_frame_idx < window_size // 4):
+                    self.slider_window_center = new_frame_idx
+                    window_start = max(0, new_frame_idx - half_window)
+                    window_end = min(total_frames - 1, new_frame_idx + half_window)
+
+                    # Adjust window at boundaries
+                    if window_end - window_start < window_size:
+                        if window_start == 0:
+                            window_end = min(total_frames - 1, window_size)
+                        elif window_end == total_frames - 1:
+                            window_start = max(0, total_frames - window_size)
+
+                    # Update slider range
+                    self.frame_slider.config(from_=window_start, to=window_end)
+                    self.zoom_info_label.config(text=f"(Frames {window_start}-{window_end})")
+
+            self.current_frame_idx = new_frame_idx
             self.display_current_frame()
             
     def toggle_play(self):
         """Toggle video playback"""
         if not self.frames:
             return
-            
+
         self.playing = not self.playing
         if self.playing:
+            # Reset flash state when starting playback
+            self._reset_flash_state()
             self.play_button.config(text="Pause")
             threading.Thread(target=self.play_video, daemon=True).start()
         else:
@@ -2264,11 +2446,21 @@ class SAM2VideoUI:
             
     def play_video(self):
         """Play video in separate thread"""
+        # Calculate frame delay based on video FPS and speed multiplier
+        speed = self.playback_speed.get()
+        base_delay = 1.0 / self.video_fps  # Delay for original FPS
+        adjusted_delay = base_delay / speed  # Adjust for playback speed
+
         while self.playing and self.frames:
             if self.current_frame_idx < len(self.frames) - 1:
                 self.current_frame_idx += 1
                 self.root.after(0, self.display_current_frame)
-                threading.Event().wait(0.033)  # ~30 FPS
+
+                # Update slider position in zoomed mode
+                if self.slider_zoom_level.get() > 1:
+                    self.root.after(0, lambda: self.frame_var.set(self.current_frame_idx))
+
+                threading.Event().wait(adjusted_delay)
             else:
                 self.playing = False
                 self.root.after(0, lambda: self.play_button.config(text="Play"))
@@ -2368,6 +2560,119 @@ class SAM2VideoUI:
         dialog.protocol("WM_DELETE_WINDOW", on_button3)
 
         # Wait for dialog to close
+        self.root.wait_window(dialog)
+
+        return result[0]
+
+    def _show_optimization_settings_dialog(self, estimated_memory_mb, total_frames, width, height):
+        """
+        Show dialog for large video optimization settings
+
+        Returns:
+            None: User cancelled
+            'defaults': Use default optimization settings
+            dict: Custom settings with keys: skip_frames, scale_factor, lazy_load
+        """
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Large Video Optimization Settings")
+        dialog.geometry("550x550")
+        dialog.configure(bg='#2b2b2b')
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+
+        result = [None]
+
+        # Main content frame
+        content_frame = ttk.Frame(dialog, padding=20)
+        content_frame.pack(fill=tk.BOTH, expand=True)
+
+        # Title and info
+        ttk.Label(content_frame, text="Large Video Detected",
+                 font=('Arial', 14, 'bold')).pack(pady=(0, 10))
+
+        info_text = (f"Video: {total_frames} frames at {width}x{height}\n"
+                    f"Estimated memory usage: {estimated_memory_mb:.1f} MB\n\n"
+                    f"For large videos, optimization settings can reduce memory usage.")
+        ttk.Label(content_frame, text=info_text, justify=tk.LEFT).pack(pady=(0, 15))
+
+        # Settings frame
+        settings_frame = ttk.LabelFrame(content_frame, text="Optimization Settings", padding=10)
+        settings_frame.pack(fill=tk.X, pady=(0, 15))
+
+        # Temporary variables for dialog
+        skip_var = tk.BooleanVar(value=False)
+        skip_frames_var = tk.IntVar(value=2)
+        scale_var = tk.BooleanVar(value=False)
+        scale_factor_var = tk.DoubleVar(value=0.5)
+        lazy_var = tk.BooleanVar(value=False)
+
+        # Skip frames option
+        skip_frame = ttk.Frame(settings_frame)
+        skip_frame.pack(fill=tk.X, pady=(0, 5))
+        ttk.Checkbutton(skip_frame, text="Skip frames:", variable=skip_var).pack(side=tk.LEFT)
+        tk.Spinbox(skip_frame, from_=2, to=10, textvariable=skip_frames_var, width=5,
+                  bg='#404040', fg='white', insertbackground='white').pack(side=tk.LEFT, padx=(5, 5))
+        ttk.Label(skip_frame, text="(load every Nth frame)").pack(side=tk.LEFT)
+
+        # Scale video option
+        scale_frame = ttk.Frame(settings_frame)
+        scale_frame.pack(fill=tk.X, pady=(0, 5))
+        ttk.Checkbutton(scale_frame, text="Scale video:", variable=scale_var).pack(side=tk.LEFT)
+        tk.Spinbox(scale_frame, from_=0.1, to=1.0, increment=0.1, textvariable=scale_factor_var,
+                  width=5, bg='#404040', fg='white', insertbackground='white').pack(side=tk.LEFT, padx=(5, 5))
+        ttk.Label(scale_frame, text="(reduce resolution)").pack(side=tk.LEFT)
+
+        # Lazy loading option
+        lazy_frame = ttk.Frame(settings_frame)
+        lazy_frame.pack(fill=tk.X, pady=(0, 5))
+        ttk.Checkbutton(lazy_frame, text="Lazy load frames (load on-demand)",
+                       variable=lazy_var).pack(side=tk.LEFT)
+
+        # Button callbacks
+        def on_use_defaults():
+            result[0] = 'defaults'
+            dialog.destroy()
+
+        def on_custom_settings():
+            result[0] = {
+                'skip_frames': skip_frames_var.get() if skip_var.get() else 1,
+                'scale_factor': scale_factor_var.get() if scale_var.get() else 1.0,
+                'lazy_load': lazy_var.get()
+            }
+            dialog.destroy()
+
+        def on_no_optimization():
+            result[0] = {
+                'skip_frames': 1,
+                'scale_factor': 1.0,
+                'lazy_load': False
+            }
+            dialog.destroy()
+
+        def on_cancel():
+            result[0] = None
+            dialog.destroy()
+
+        # Button frame
+        button_frame = ttk.Frame(content_frame)
+
+        ttk.Label(content_frame, text="Choose an option:", font=('Arial', 10, 'bold')).pack(pady=(10, 5))
+
+        button_frame.pack(fill=tk.X)
+
+        ttk.Button(button_frame, text="Use Defaults (Skip: 2, Scale: 0.5, Lazy: On)",
+                  command=on_use_defaults, width=45).pack(pady=3)
+        ttk.Button(button_frame, text="Use Custom Settings (as configured above)",
+                  command=on_custom_settings, width=45).pack(pady=3)
+        ttk.Button(button_frame, text="No Optimization (Full Quality)",
+                  command=on_no_optimization, width=45).pack(pady=3)
+        ttk.Button(button_frame, text="Cancel", command=on_cancel, width=45).pack(pady=3)
+
+        # Handle window close
+        dialog.protocol("WM_DELETE_WINDOW", on_cancel)
+
+        # Wait for dialog
         self.root.wait_window(dialog)
 
         return result[0]
@@ -3296,6 +3601,9 @@ class SAM2VideoUI:
                     self.status_label.config(text=f"Segmentation complete! Generated {total_masks} masks for {len(unique_objects)} objects")
                     # Multi-frame annotation mode stays active for continued annotation
 
+                    # Enable Flash Mask button now that segmentation is complete
+                    self._enable_flash_mask_button()
+
                     self.show_masks_var.set(True)
                     self.update_object_list()
                     self.display_current_frame()
@@ -3398,7 +3706,7 @@ class SAM2VideoUI:
         print("Exporting segmented video...")
 
         video_output_path = os.path.join(output_dir, "segmented_video.mp4")
-        height, width = self.frames[0].shape[:2]
+        height, width = self.original_video_height, self.original_video_width
 
         # Use H.264 codec (matching process_annotations.py)
         for codec in ['avc1', 'H264', 'X264', 'mp4v']:
@@ -4544,13 +4852,12 @@ class SAM2VideoUI:
             output_dir: Directory to save masks
             metadata_list: List to append metadata to
         """
-        # Create masks subdirectory
-        masks_dir = os.path.join(output_dir, "masks")
-        os.makedirs(masks_dir, exist_ok=True)
+        # Ensure output directory exists (output_dir is already the masks directory)
+        os.makedirs(output_dir, exist_ok=True)
 
         # Generate filename
         mask_filename = f"frame_{frame_idx:05d}_obj_{obj_id}.png"
-        mask_path = os.path.join(masks_dir, mask_filename)
+        mask_path = os.path.join(output_dir, mask_filename)
 
         # Save mask to disk
         cv2.imwrite(mask_path, mask)
@@ -4631,7 +4938,7 @@ class SAM2VideoUI:
 
         # Try 2: Legacy pattern (for backward compatibility)
         mask_filename_legacy = f"frame_{frame_idx:05d}_obj_{obj_id}.png"
-        mask_path_legacy = os.path.join(self.mask_export_dir, "masks", mask_filename_legacy)
+        mask_path_legacy = os.path.join(self.mask_export_dir, mask_filename_legacy)
 
         if os.path.exists(mask_path_legacy):
             print(f"WARNING: Using legacy mask pattern for frame {frame_idx}, obj {obj_id}")
@@ -4650,16 +4957,6 @@ class SAM2VideoUI:
         print(f"WARNING: Mask file not found for frame {frame_idx}, obj {obj_id}")
         return None
 
-    def _cleanup_temp_masks(self):
-        """Clean up temporary mask directory"""
-        if hasattr(self, 'mask_export_dir') and self.mask_export_dir and os.path.exists(self.mask_export_dir):
-            try:
-                import shutil
-                shutil.rmtree(self.mask_export_dir)
-                print(f"Cleaned up temporary mask directory: {self.mask_export_dir}")
-            except Exception as e:
-                print(f"WARNING: Failed to clean up temporary masks: {e}")
-            self.mask_export_dir = None
 
 
 def main():
@@ -4703,9 +5000,6 @@ def main():
         # Clean up video capture if lazy loading
         if hasattr(app, 'video_cap_lazy') and app.video_cap_lazy:
             app.video_cap_lazy.release()
-
-        # Clean up temporary masks
-        app._cleanup_temp_masks()
 
         # CRITICAL: Always destroy root at the end
         root.destroy()
