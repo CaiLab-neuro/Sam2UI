@@ -135,6 +135,10 @@ class SAM2VideoUI:
         self.lazy_load_var = tk.BooleanVar(value=False)  # Load frames on demand
         self.video_cap_lazy = None  # Keep video capture open for lazy loading
 
+        # Button references for highlighting selected options
+        self.zoom_buttons = {}  # Map zoom level -> button widget
+        self.speed_buttons = {}  # Map speed -> button widget
+
         # Slider zoom functionality for precise navigation
         self.slider_zoom_level = tk.IntVar(value=1)  # 1 = full range, 10/100/1000 = zoomed
         self.slider_window_center = 0  # Center frame for zoomed slider window
@@ -568,10 +572,24 @@ class SAM2VideoUI:
         zoom_frame = ttk.Frame(controls_frame)
         zoom_frame.pack(fill=tk.X, pady=(0, 5))
         ttk.Label(zoom_frame, text="Slider Zoom:").pack(side=tk.LEFT)
-        ttk.Button(zoom_frame, text="Full", command=lambda: self.set_slider_zoom(1), width=6).pack(side=tk.LEFT, padx=2)
-        ttk.Button(zoom_frame, text="10x", command=lambda: self.set_slider_zoom(10), width=6).pack(side=tk.LEFT, padx=2)
-        ttk.Button(zoom_frame, text="100x", command=lambda: self.set_slider_zoom(100), width=6).pack(side=tk.LEFT, padx=2)
-        ttk.Button(zoom_frame, text="1000x", command=lambda: self.set_slider_zoom(1000), width=6).pack(side=tk.LEFT, padx=2)
+
+        # Create and store button references for highlighting
+        self.zoom_buttons[1] = ttk.Button(zoom_frame, text="Full",
+            command=lambda: self.set_slider_zoom(1), width=6)
+        self.zoom_buttons[1].pack(side=tk.LEFT, padx=2)
+
+        self.zoom_buttons[10] = ttk.Button(zoom_frame, text="10x",
+            command=lambda: self.set_slider_zoom(10), width=6)
+        self.zoom_buttons[10].pack(side=tk.LEFT, padx=2)
+
+        self.zoom_buttons[100] = ttk.Button(zoom_frame, text="100x",
+            command=lambda: self.set_slider_zoom(100), width=6)
+        self.zoom_buttons[100].pack(side=tk.LEFT, padx=2)
+
+        self.zoom_buttons[1000] = ttk.Button(zoom_frame, text="1000x",
+            command=lambda: self.set_slider_zoom(1000), width=6)
+        self.zoom_buttons[1000].pack(side=tk.LEFT, padx=2)
+
         self.zoom_info_label = ttk.Label(zoom_frame, text="(Full range)", foreground='gray')
         self.zoom_info_label.pack(side=tk.LEFT, padx=(10, 0))
 
@@ -579,13 +597,34 @@ class SAM2VideoUI:
         speed_frame = ttk.Frame(controls_frame)
         speed_frame.pack(fill=tk.X, pady=(0, 5))
         ttk.Label(speed_frame, text="Playback Speed:").pack(side=tk.LEFT)
-        ttk.Button(speed_frame, text="0.25x", command=lambda: self.set_playback_speed(0.25), width=6).pack(side=tk.LEFT, padx=2)
-        ttk.Button(speed_frame, text="0.5x", command=lambda: self.set_playback_speed(0.5), width=6).pack(side=tk.LEFT, padx=2)
-        ttk.Button(speed_frame, text="1x", command=lambda: self.set_playback_speed(1.0), width=6).pack(side=tk.LEFT, padx=2)
-        ttk.Button(speed_frame, text="2x", command=lambda: self.set_playback_speed(2.0), width=6).pack(side=tk.LEFT, padx=2)
-        ttk.Button(speed_frame, text="4x", command=lambda: self.set_playback_speed(4.0), width=6).pack(side=tk.LEFT, padx=2)
+
+        # Create and store button references for highlighting
+        self.speed_buttons[0.25] = ttk.Button(speed_frame, text="0.25x",
+            command=lambda: self.set_playback_speed(0.25), width=6)
+        self.speed_buttons[0.25].pack(side=tk.LEFT, padx=2)
+
+        self.speed_buttons[0.5] = ttk.Button(speed_frame, text="0.5x",
+            command=lambda: self.set_playback_speed(0.5), width=6)
+        self.speed_buttons[0.5].pack(side=tk.LEFT, padx=2)
+
+        self.speed_buttons[1.0] = ttk.Button(speed_frame, text="1x",
+            command=lambda: self.set_playback_speed(1.0), width=6)
+        self.speed_buttons[1.0].pack(side=tk.LEFT, padx=2)
+
+        self.speed_buttons[2.0] = ttk.Button(speed_frame, text="2x",
+            command=lambda: self.set_playback_speed(2.0), width=6)
+        self.speed_buttons[2.0].pack(side=tk.LEFT, padx=2)
+
+        self.speed_buttons[4.0] = ttk.Button(speed_frame, text="4x",
+            command=lambda: self.set_playback_speed(4.0), width=6)
+        self.speed_buttons[4.0].pack(side=tk.LEFT, padx=2)
+
         self.speed_info_label = ttk.Label(speed_frame, text="(Normal)", foreground='gray')
         self.speed_info_label.pack(side=tk.LEFT, padx=(10, 0))
+
+        # Initialize button highlighting
+        self._update_zoom_button_highlight()
+        self._update_speed_button_highlight()
 
         # Range selection for partial segmentation of long videos
         range_frame = ttk.Frame(controls_frame)
@@ -1002,7 +1041,7 @@ class SAM2VideoUI:
                 message += f"Skipped annotations: {skipped_count} (invalid frame indices)\n"
 
             if coordinate_system == "original":
-                message += f"\n✓ Using original coordinate system (compatible with video scaling)"
+                message += f"\n[OK] Using original coordinate system (compatible with video scaling)"
 
             message += f"\nTotal annotations: {len(self.click_points)}\n" \
                     f"Objects: {custom_count} custom ({total_objects} total)"
@@ -1626,7 +1665,7 @@ class SAM2VideoUI:
 
             # ADDED: Store current scale for coordinate conversions
             self.current_video_scale = scale_factor
-            print(f"[VIDEO LOAD] Set current_video_scale to {scale_factor}")
+            
             
             # Calculate memory usage estimate
             bytes_per_frame = original_width * original_height * 3  # RGB
@@ -1749,7 +1788,7 @@ class SAM2VideoUI:
             self.original_video_width = original_width
             self.original_video_height = original_height
             self.current_video_scale = scale_factor
-            print(f"[LAZY LOAD] Set current_video_scale to {scale_factor}")
+            
             
             # Store video properties for lazy loading
             self.video_props = {
@@ -2381,6 +2420,7 @@ class SAM2VideoUI:
             self.zoom_info_label.config(text=f"(Frames {window_start}-{window_end})")
 
         self.status_label.config(text=f"Slider zoom: {zoom_level}x")
+        self._update_zoom_button_highlight()
 
     def set_playback_speed(self, speed):
         """Set playback speed multiplier"""
@@ -2389,6 +2429,25 @@ class SAM2VideoUI:
         label_text = speed_labels.get(speed, f"{speed}x")
         self.speed_info_label.config(text=f"({label_text})")
         self.status_label.config(text=f"Playback speed: {speed}x")
+        self._update_speed_button_highlight()
+
+    def _update_zoom_button_highlight(self):
+        """Update zoom button styling to show current selection"""
+        current_zoom = self.slider_zoom_level.get()
+        for level, button in self.zoom_buttons.items():
+            if level == current_zoom:
+                button.config(relief='sunken', default='active')
+            else:
+                button.config(relief='raised', default='normal')
+
+    def _update_speed_button_highlight(self):
+        """Update speed button styling to show current selection"""
+        current_speed = self.playback_speed.get()
+        for speed, button in self.speed_buttons.items():
+            if speed == current_speed:
+                button.config(relief='sunken', default='active')
+            else:
+                button.config(relief='raised', default='normal')
 
     def on_slider_change(self, value):
         """Handle frame slider change"""
@@ -2410,8 +2469,8 @@ class SAM2VideoUI:
                 current_slider_max = int(self.frame_slider.cget('to'))
 
                 # If navigating near edges, recenter window
-                if (new_frame_idx - current_slider_min < window_size // 4 or
-                    current_slider_max - new_frame_idx < window_size // 4):
+                if (new_frame_idx - current_slider_min < window_size // 10 or
+                    current_slider_max - new_frame_idx < window_size // 10):
                     self.slider_window_center = new_frame_idx
                     window_start = max(0, new_frame_idx - half_window)
                     window_end = min(total_frames - 1, new_frame_idx + half_window)
@@ -2605,7 +2664,6 @@ class SAM2VideoUI:
         skip_frames_var = tk.IntVar(value=2)
         scale_var = tk.BooleanVar(value=False)
         scale_factor_var = tk.DoubleVar(value=0.5)
-        lazy_var = tk.BooleanVar(value=False)
 
         # Skip frames option
         skip_frame = ttk.Frame(settings_frame)
@@ -2623,13 +2681,8 @@ class SAM2VideoUI:
                   width=5, bg='#404040', fg='white', insertbackground='white').pack(side=tk.LEFT, padx=(5, 5))
         ttk.Label(scale_frame, text="(reduce resolution)").pack(side=tk.LEFT)
 
-        # Lazy loading option
-        lazy_frame = ttk.Frame(settings_frame)
-        lazy_frame.pack(fill=tk.X, pady=(0, 5))
-        ttk.Checkbutton(lazy_frame, text="Lazy load frames (load on-demand)",
-                       variable=lazy_var).pack(side=tk.LEFT)
-
         # Button callbacks
+        # Note: Lazy loading is always enabled for large videos to reduce memory usage
         def on_use_defaults():
             result[0] = 'defaults'
             dialog.destroy()
@@ -2638,7 +2691,7 @@ class SAM2VideoUI:
             result[0] = {
                 'skip_frames': skip_frames_var.get() if skip_var.get() else 1,
                 'scale_factor': scale_factor_var.get() if scale_var.get() else 1.0,
-                'lazy_load': lazy_var.get()
+                'lazy_load': True  # Always enabled for large videos
             }
             dialog.destroy()
 
@@ -2646,7 +2699,7 @@ class SAM2VideoUI:
             result[0] = {
                 'skip_frames': 1,
                 'scale_factor': 1.0,
-                'lazy_load': False
+                'lazy_load': True  # Always enabled for large videos
             }
             dialog.destroy()
 
@@ -2661,12 +2714,12 @@ class SAM2VideoUI:
 
         button_frame.pack(fill=tk.X)
 
-        ttk.Button(button_frame, text="Use Defaults (Skip: 2, Scale: 0.5, Lazy: On)",
+        ttk.Button(button_frame, text="No Optimization (Full Quality)",
+                  command=on_no_optimization, width=45).pack(pady=3)
+        ttk.Button(button_frame, text="Use Default Optimization (Skip: 2, Scale: 0.5)",
                   command=on_use_defaults, width=45).pack(pady=3)
         ttk.Button(button_frame, text="Use Custom Settings (as configured above)",
                   command=on_custom_settings, width=45).pack(pady=3)
-        ttk.Button(button_frame, text="No Optimization (Full Quality)",
-                  command=on_no_optimization, width=45).pack(pady=3)
         ttk.Button(button_frame, text="Cancel", command=on_cancel, width=45).pack(pady=3)
 
         # Handle window close
@@ -2725,10 +2778,32 @@ class SAM2VideoUI:
         except Exception as e:
             self.gpu_info_label.config(text=f"Error: {str(e)}")
 
-    def _detect_available_models(self):
-        """Detect available SAM2 models from checkpoints"""
+    def _detect_available_models(self, model_type=None):
+        """Detect available SAM2/SAM3 models from checkpoints
+
+        Args:
+            model_type: 'SAM2' or 'SAM3'. If None, defaults to current selection.
+        """
         from pathlib import Path
 
+        # Determine which model type to detect
+        if model_type is None:
+            # Check if attributes exist (may be called during initialization)
+            if hasattr(self, 'sam3_available') and hasattr(self, 'model_type_var'):
+                model_type = self.model_type_var.get() if self.sam3_available else "SAM2"
+            else:
+                model_type = "SAM2"  # Default to SAM2 during initialization
+
+        # SAM3 has only one variant - use HuggingFace model
+        if model_type == "SAM3":
+            # Check if SAM3 checkpoint exists
+            sam3_checkpoint_dir = Path(self.checkpoint_dir).parent.parent / "sam_models" / "sam3" / "checkpoints"
+            if sam3_checkpoint_dir.exists() and (sam3_checkpoint_dir / "sam3.pt").exists():
+                return ["auto", "SAM3|sam3.pt|sam3_hiera_l.yaml"]
+            else:
+                return ["auto"]
+
+        # SAM2 detection (original logic)
         checkpoint_dir = Path(self.checkpoint_dir)
         if not checkpoint_dir.exists():
             return ["auto"]
@@ -2845,10 +2920,17 @@ class SAM2VideoUI:
             self.current_model_info = None
             self.model_status_label.config(text="No model loaded", foreground='red')
 
-        # Update model dropdown to show appropriate models
-        # For SAM3, we'll keep the same model detection since both use similar checkpoint structure
-        # The difference is in which builder we use during loading
+        # Update model dropdown to show appropriate models for selected type
+        self.available_models = self._detect_available_models(model_type=new_type)
+        self.model_combo['values'] = self._format_model_list()
+
+        # Auto-select the first available model (auto or the only model for SAM3)
+        if self.available_models:
+            self.selected_model.set(self._format_model_list()[0])
+
         status_msg = f"{new_type} selected. Load a model to begin."
+        if new_type == "SAM3":
+            status_msg += " (Single variant - uses HuggingFace model)"
         self.status_label.config(text=status_msg)
 
     def on_model_selection_change(self, event=None):
@@ -3419,11 +3501,28 @@ class SAM2VideoUI:
                 
                 self.progress_var.set(45)
                 self.root.update()
-                
+
                 processed_frames = 0
-                
+                # Track propagation success for conditional success messages
+                propagation_success = True
+
+                # Check if using SAM3 (different API signature)
+                is_sam3 = hasattr(self.sam2_model, '__class__') and 'Sam3' in self.sam2_model.__class__.__name__
+
                 try:
-                    for out_frame_idx, out_obj_ids, out_mask_logits in self.sam2_model.propagate_in_video(self.inference_state):
+                    # SAM3 requires additional arguments for propagate_in_video
+                    if is_sam3:
+                        propagate_iterator = self.sam2_model.propagate_in_video(
+                            self.inference_state,
+                            start_frame_idx=0,
+                            max_frame_num_to_track=len(frames_to_save),
+                            reverse=False,
+                            propagate_preflight=True  # Required to consolidate points into cond_frame_outputs
+                        )
+                    else:
+                        propagate_iterator = self.sam2_model.propagate_in_video(self.inference_state)
+
+                    for out_frame_idx, out_obj_ids, out_mask_logits in propagate_iterator:
                         # Map limited video frame index back to original frame index
                         if self.limit_to_range_var.get():
                             if out_frame_idx >= len(frames_to_save):
@@ -3481,6 +3580,7 @@ class SAM2VideoUI:
                 except Exception as e:
                     print(f"Error during forward propagation: {e}")
                     traceback.print_exc()
+                    propagation_success = False  # Mark propagation as failed
                     messagebox.showwarning("Propagation Warning",
                                         f"Encountered issue during forward propagation: {str(e)}")
 
@@ -3495,9 +3595,21 @@ class SAM2VideoUI:
                         backward_processed = 0
                         frames_to_backward = earliest_frame  # Number of frames before first annotation
 
-                        for out_frame_idx, out_obj_ids, out_mask_logits in self.sam2_model.propagate_in_video(
-                            self.inference_state, reverse=True
-                        ):
+                        # SAM3 requires additional arguments for backward propagation
+                        if is_sam3:
+                            backward_iterator = self.sam2_model.propagate_in_video(
+                                self.inference_state,
+                                start_frame_idx=0,
+                                max_frame_num_to_track=frames_to_backward,
+                                reverse=True,
+                                propagate_preflight=True  # Required to consolidate points into cond_frame_outputs
+                            )
+                        else:
+                            backward_iterator = self.sam2_model.propagate_in_video(
+                                self.inference_state, reverse=True
+                            )
+
+                        for out_frame_idx, out_obj_ids, out_mask_logits in backward_iterator:
                             # Map limited video frame index back to original frame index
                             if self.limit_to_range_var.get():
                                 if out_frame_idx >= len(frames_to_save):
@@ -3557,6 +3669,7 @@ class SAM2VideoUI:
                     except Exception as e:
                         print(f"Error during backward propagation: {e}")
                         traceback.print_exc()
+                        propagation_success = False  # Mark propagation as failed
                         messagebox.showwarning("Backward Propagation Warning",
                                             f"Encountered issue during backward propagation: {str(e)}")
 
@@ -3574,8 +3687,16 @@ class SAM2VideoUI:
 
                 # Store export directory for later use (video export, cleanup)
                 self.mask_export_dir = export_dir
-                print(f"\nMasks saved to temporary directory: {export_dir}")
-                print(f"Metadata saved to: {metadata_path}")
+
+                # Only show success messages if propagation actually completed
+                if propagation_success and len(mask_metadata) > 0:
+                    print(f"\nMasks saved to temporary directory: {export_dir}")
+                    print(f"Metadata saved to: {metadata_path}")
+                elif len(mask_metadata) > 0:
+                    print(f"\n[WARNING] Propagation incomplete. Partial results ({len(mask_metadata)} masks) saved to: {export_dir}")
+                    print(f"Metadata saved to: {metadata_path}")
+                else:
+                    print(f"\n[ERROR] No masks generated. Check errors above.")
 
                 # For backward compatibility, populate self.masks with empty dicts
                 # (actual masks will be loaded from disk on demand)
@@ -3596,8 +3717,9 @@ class SAM2VideoUI:
                 unique_objects = set()
                 for frame_masks in self.masks.values():
                     unique_objects.update(frame_masks.keys())
-                
-                if total_masks > 0:
+
+                # Only proceed with export if propagation succeeded and we have masks
+                if propagation_success and total_masks > 0:
                     self.status_label.config(text=f"Segmentation complete! Generated {total_masks} masks for {len(unique_objects)} objects")
                     # Multi-frame annotation mode stays active for continued annotation
 
@@ -3651,13 +3773,13 @@ class SAM2VideoUI:
                                 "original_annotations": annotations_data
                             }, f, indent=2)
 
-                        print(f"✅ Results saved to: {output_base_dir}")
+                        print(f"[SUCCESS] Results saved to: {output_base_dir}")
                         print(f"   - Masks: {masks_output_dir}/ ({total_masks} files)")
                         print(f"   - Video: {output_base_dir}/segmented_video.mp4")
                         print(f"   - Metadata: {metadata_path}")
 
                     except Exception as e:
-                        print(f"⚠️ Warning: Failed to export results: {e}")
+                        print(f"[WARNING] Failed to export results: {e}")
                         traceback.print_exc()
 
                     messagebox.showinfo("Success",
@@ -3666,6 +3788,15 @@ class SAM2VideoUI:
                                       f"Total masks: {total_masks}\n"
                                       f"Frames processed: {len(frames_to_process)}\n\n"
                                       f"Results saved to:\n{output_base_dir}")
+                elif total_masks > 0:
+                    # Masks were generated but propagation had errors
+                    self.status_label.config(text=f"Partial results: {total_masks} masks generated with errors")
+                    print(f"[INFO] Skipping video export due to propagation errors.")
+                    messagebox.showwarning("Partial Success",
+                                          f"Segmentation completed with errors.\n"
+                                          f"Total masks: {total_masks}\n\n"
+                                          f"Partial results saved to:\n{export_dir}\n\n"
+                                          f"Video export skipped due to errors.")
                 else:
                     self.status_label.config(text="No masks generated")
                     messagebox.showwarning("Warning", "No masks were generated. Try different points.")
