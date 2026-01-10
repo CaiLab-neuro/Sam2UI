@@ -7,6 +7,7 @@ import os
 import json
 import tempfile
 import shutil
+import hashlib
 from pathlib import Path
 import traceback
 from omegaconf import OmegaConf, DictConfig
@@ -123,9 +124,6 @@ class SAM2VideoUI:
         self.using_sam3 = False
         
         # Range-based processing for long videos
-        self.limit_to_range_var = tk.BooleanVar(value=False)
-        self.range_start_var = tk.IntVar(value=0)
-        self.range_end_var = tk.IntVar(value=0)
         
         # Large video handling options
         self.downsample_frames_var = tk.BooleanVar(value=False)
@@ -160,6 +158,16 @@ class SAM2VideoUI:
         self.original_video_path_for_resegment = None  # Path for re-segmentation
         self.segmented_video_displayed = False  # Track if displaying segmented vs original
         self.results_output_dir = None  # Store output directory
+
+        # Session-based frame cache (cleaned up when app closes)
+        self.session_cache_dir = None  # Current temp directory for extracted frames
+        self.session_video_hash = None  # Hash of video being processed (to detect reuse)
+
+        # Segmentation quality visualization
+        self.inter_frame_changes = []  # Ratio of pixels changing category between frames
+        self.background_ratios = []     # Ratio of background pixels per frame
+        self.change_viz_canvas = None   # Canvas for inter-frame change visualization
+        self.bg_viz_canvas = None       # Canvas for background ratio visualization
 
         # Initialize default colors and names
         self._initialize_objects()
@@ -632,18 +640,26 @@ class SAM2VideoUI:
         self._update_zoom_button_highlight()
         self._update_speed_button_highlight()
 
-        # Range selection for partial segmentation of long videos
-        range_frame = ttk.Frame(controls_frame)
-        range_frame.pack(fill=tk.X, pady=(0, 5))
-        ttk.Checkbutton(range_frame, text="Limit to range", variable=self.limit_to_range_var).pack(side=tk.LEFT)
-        ttk.Label(range_frame, text="Start:").pack(side=tk.LEFT, padx=(10, 2))
-        self.range_start_spin = tk.Spinbox(range_frame, from_=0, to=0, textvariable=self.range_start_var, width=8,
-                                           bg='#404040', fg='white', insertbackground='white')
-        self.range_start_spin.pack(side=tk.LEFT)
-        ttk.Label(range_frame, text="End:").pack(side=tk.LEFT, padx=(10, 2))
-        self.range_end_spin = tk.Spinbox(range_frame, from_=0, to=0, textvariable=self.range_end_var, width=8,
-                                         bg='#404040', fg='white', insertbackground='white')
-        self.range_end_spin.pack(side=tk.LEFT)
+        # Segmentation quality indicators
+        viz_frame = ttk.LabelFrame(controls_frame, text="Segmentation Quality Indicators", padding=5)
+        viz_frame.pack(fill=tk.X, pady=(10, 0))
+
+        # Inter-frame change visualization
+        change_label = ttk.Label(viz_frame, text="Inter-frame Changes:")
+        change_label.pack(anchor=tk.W)
+
+        self.change_viz_canvas = tk.Canvas(viz_frame, height=30, bg='gray80')
+        self.change_viz_canvas.pack(fill=tk.X, pady=(2, 5))
+        self.change_viz_canvas.bind("<Button-1>", self._on_viz_canvas_click)
+
+        # Background ratio visualization
+        bg_label = ttk.Label(viz_frame, text="Background Ratio:")
+        bg_label.pack(anchor=tk.W)
+
+        self.bg_viz_canvas = tk.Canvas(viz_frame, height=30, bg='gray80')
+        self.bg_viz_canvas.pack(fill=tk.X, pady=(2, 0))
+        self.bg_viz_canvas.bind("<Button-1>", self._on_viz_canvas_click)
+
 
         # Info panel
         info_frame = ttk.Frame(controls_frame)
@@ -793,11 +809,18 @@ class SAM2VideoUI:
                 return
             
             # Prepare annotation data
+            # Convert annotated_frames from loaded indices to original frame numbers
+            annotated_frames_original = sorted([
+                self._get_original_frame_number(loaded_idx)
+                for loaded_idx in self.annotated_frames
+            ])
+
             annotation_data = {
                 "video_path": self.video_path,
-                "total_frames": len(self.frames),
+                # Use original total frame count (before any frame skipping)
+                "total_frames": self.video_props.get('total_original_frames', len(self.frames)) if hasattr(self, 'video_props') else len(self.frames),
                 "total_annotations": len(self.click_points),
-                "annotated_frames": sorted(list(self.annotated_frames)),
+                "annotated_frames": annotated_frames_original,  # Original frame numbers
                 "object_names": self.object_names,
                 "object_colors": {str(k): v for k, v in self.object_colors.items()},
                 
@@ -1061,7 +1084,7 @@ class SAM2VideoUI:
         """Load segmentation results: segmented video, annotations, and mask directory"""
         try:
             # Select output directory
-            output_dir = filedialog.askdirectory(title="Select Processing Output Directory")
+            output_dir = filedialog.askdirectory(title="Select Result Directory to Load")
             if not output_dir:
                 return
 
@@ -1101,7 +1124,9 @@ class SAM2VideoUI:
             self.click_points = []
             self.annotated_frames = set()
 
-            # Load segmented video
+            # Load segmented video for display
+            # Note: self.video_path is set to segmented video for UI display purposes
+            # Original video path is preserved in self.original_video_path_for_resegment (set above on line 1112)
             print(f"Loading segmented video: {segmented_video_path}")
             self.video_path = segmented_video_path
             self.segmented_video_displayed = True
@@ -1639,6 +1664,8 @@ class SAM2VideoUI:
             self.frames = []
             self.masks = {}
             self.click_points = []
+            self.segmented_video_displayed = False  # Reset flag when loading new original video
+            self.original_video_path_for_resegment = None  # Clear any previously stored original video path
 
             # Reset Flash Mask button state when loading new video
             self.has_segmentation = False
@@ -1770,11 +1797,6 @@ class SAM2VideoUI:
                 self.status_label.config(text=status_text)
                 
                 self.update_object_list()
-                # Initialize range spinboxes
-                self.range_start_var.set(0)
-                self.range_end_var.set(max(0, len(self.frames)-1))
-                self.range_start_spin.config(to=max(0, len(self.frames)-1))
-                self.range_end_spin.config(to=max(0, len(self.frames)-1))
             else:
                 raise ValueError("No frames could be extracted from video")
                 
@@ -1829,11 +1851,6 @@ class SAM2VideoUI:
             self.status_label.config(text=status_text)
             
             self.update_object_list()
-            # Initialize range spinboxes
-            self.range_start_var.set(0)
-            self.range_end_var.set(max(0, frames_to_load-1))
-            self.range_start_spin.config(to=max(0, frames_to_load-1))
-            self.range_end_spin.config(to=max(0, frames_to_load-1))
             
         except Exception as e:
             if self.video_cap_lazy:
@@ -1880,6 +1897,338 @@ class SAM2VideoUI:
             
         except Exception as e:
             print(f"Error loading frame {frame_idx}: {e}")
+            return None
+
+    def _get_frame_dimensions(self):
+        """
+        Get frame dimensions (height, width) that works in all loading modes.
+
+        Returns:
+            tuple: (height, width) or None if unavailable
+
+        Priority order:
+        1. From video_props (most reliable, set during lazy loading)
+        2. From original_video_width/height instance variables
+        3. From loaded frame (eager mode or cached frame)
+        4. From lazy load (load first frame on demand)
+        5. From video_cap metadata (fallback)
+        """
+        # 1. Check video_props (lazy mode)
+        if hasattr(self, 'video_props') and self.video_props:
+            if 'original_height' in self.video_props and 'original_width' in self.video_props:
+                return (self.video_props['original_height'], self.video_props['original_width'])
+
+        # 2. Check instance variables
+        if self.original_video_height is not None and self.original_video_width is not None:
+            return (self.original_video_height, self.original_video_width)
+
+        # 3. Check if we have frames loaded (eager mode)
+        if self.frames and len(self.frames) > 0:
+            if self.frames[0] is not None:  # Not None in eager mode
+                return self.frames[0].shape[:2]
+
+            # 4. Lazy mode: Try to load first frame
+            if hasattr(self, '_load_frame_lazy'):
+                first_frame = self._load_frame_lazy(0)
+                if first_frame is not None:
+                    return first_frame.shape[:2]
+
+        # 5. Fallback to video capture metadata
+        video_cap = None
+        if hasattr(self, 'video_cap_lazy') and self.video_cap_lazy:
+            video_cap = self.video_cap_lazy
+        elif hasattr(self, 'video_cap') and self.video_cap:
+            video_cap = self.video_cap
+
+        if video_cap:
+            try:
+                height = int(video_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                width = int(video_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                if height > 0 and width > 0:
+                    return (height, width)
+            except:
+                pass
+
+        # Could not determine dimensions
+        print("Warning: Could not determine frame dimensions")
+        return None
+
+    def _get_session_cache_dir(self, video_path):
+        """
+        Get or create session-based cache directory for this video.
+        Reuses cache within session if same video, creates new temp dir otherwise.
+
+        Args:
+            video_path: Path to video file
+
+        Returns:
+            str: Absolute path to cache directory
+        """
+        try:
+            # Get video metadata for hash
+            abs_path = os.path.abspath(video_path)
+            file_size = os.path.getsize(abs_path)
+            mtime = os.path.getmtime(abs_path)
+
+            # Create video hash (identifies video uniquely)
+            cache_key = f"{abs_path}|{file_size}|{int(mtime)}"
+            video_hash = hashlib.md5(cache_key.encode()).hexdigest()
+
+            # Check if we can reuse existing session cache
+            if self.session_cache_dir and self.session_video_hash == video_hash:
+                # Same video, reuse existing cache
+                if os.path.exists(self.session_cache_dir):
+                    print(f"Reusing session cache: {self.session_cache_dir}")
+                    return self.session_cache_dir
+
+            # Different video or no cache yet - clean up old cache if exists
+            if self.session_cache_dir and os.path.exists(self.session_cache_dir):
+                print(f"Cleaning up old session cache: {self.session_cache_dir}")
+                shutil.rmtree(self.session_cache_dir, ignore_errors=True)
+
+            # Create new temp directory for this session
+            self.session_cache_dir = tempfile.mkdtemp(prefix='sam2_frames_')
+            self.session_video_hash = video_hash
+            print(f"Created session cache: {self.session_cache_dir}")
+
+            return self.session_cache_dir
+
+        except Exception as e:
+            print(f"Error getting session cache dir: {e}")
+            # Fallback to simple temp directory
+            return tempfile.mkdtemp(prefix='sam2_frames_')
+
+    def _validate_frame_cache(self, cache_dir, expected_count):
+        """
+        Check if cached frames are valid and complete.
+
+        Args:
+            cache_dir: Directory to check
+            expected_count: Expected number of frame files
+
+        Returns:
+            bool: True if cache is valid, False otherwise
+        """
+        try:
+            if not os.path.exists(cache_dir):
+                return False
+
+            # Count frame files
+            frame_files = sorted([f for f in os.listdir(cache_dir)
+                                 if f.endswith('.jpg') and f[:-4].isdigit()])
+
+            if len(frame_files) != expected_count:
+                print(f"Cache incomplete: {len(frame_files)} frames, expected {expected_count}")
+                return False
+
+            # Validate a few sample frames are readable
+            samples = [0, len(frame_files)//2, len(frame_files)-1]
+            for idx in samples:
+                if idx < len(frame_files):
+                    frame_path = os.path.join(cache_dir, frame_files[idx])
+                    test_frame = cv2.imread(frame_path)
+                    if test_frame is None:
+                        print(f"Cache corrupted: cannot read {frame_files[idx]}")
+                        return False
+
+            return True
+
+        except Exception as e:
+            print(f"Error validating cache: {e}")
+            return False
+
+    def _calculate_segmentation_quality_metrics(self):
+        """
+        Calculate inter-frame changes and background ratios.
+        Called after segmentation completes.
+        """
+        if not self.masks:
+            return
+
+        print("Calculating segmentation quality metrics...")
+
+        num_frames = len(self.frames)
+        self.inter_frame_changes = []
+        self.background_ratios = []
+
+        # Get frame dimensions
+        dims = self._get_frame_dimensions()
+        if dims is None:
+            print("Cannot calculate metrics: frame dimensions unknown")
+            return
+
+        height, width = dims
+        total_pixels = height * width
+
+        prev_combined_mask = None
+
+        for frame_idx in range(num_frames):
+            # Create combined mask for this frame (all objects)
+            combined_mask = np.zeros((height, width), dtype=np.uint8)
+
+            if frame_idx in self.masks:
+                for obj_id in self.masks[frame_idx]:
+                    mask = self._load_mask(frame_idx, obj_id)
+                    if mask is not None:
+                        # Resize if needed
+                        if mask.shape != (height, width):
+                            from PIL import Image as PILImage
+                            mask_pil = PILImage.fromarray(mask)
+                            mask_pil = mask_pil.resize((width, height), PILImage.NEAREST)
+                            mask = np.array(mask_pil)
+
+                        # Mark object pixels (any non-zero value)
+                        combined_mask[mask > 0] = obj_id
+
+            # Calculate background ratio
+            object_pixels = np.count_nonzero(combined_mask)
+            bg_ratio = 1.0 - (object_pixels / total_pixels)
+            self.background_ratios.append(bg_ratio)
+
+            # Calculate inter-frame change
+            if prev_combined_mask is None:
+                # First frame: no previous frame to compare
+                self.inter_frame_changes.append(0.0)
+            else:
+                # Count pixels that changed category
+                changed_pixels = np.count_nonzero(combined_mask != prev_combined_mask)
+                change_ratio = changed_pixels / total_pixels
+                self.inter_frame_changes.append(change_ratio)
+
+            prev_combined_mask = combined_mask.copy()
+
+        print(f"Calculated metrics for {num_frames} frames")
+        if len(self.inter_frame_changes) > 1:
+            print(f"  Mean inter-frame change: {np.mean(self.inter_frame_changes[1:]):.3f}")
+        print(f"  Mean background ratio: {np.mean(self.background_ratios):.3f}")
+
+        # Update visualization
+        self._update_quality_visualizations()
+
+    def _update_quality_visualizations(self):
+        """
+        Render inter-frame changes and background ratios on canvas.
+        """
+        if not self.change_viz_canvas or not self.bg_viz_canvas:
+            return
+
+        # Clear canvases
+        self.change_viz_canvas.delete("all")
+        self.bg_viz_canvas.delete("all")
+
+        if not self.inter_frame_changes or not self.background_ratios:
+            return
+
+        # Get canvas dimensions
+        canvas_width = self.change_viz_canvas.winfo_width()
+        canvas_height = 30
+
+        if canvas_width <= 1:  # Canvas not yet rendered
+            self.root.update()
+            canvas_width = self.change_viz_canvas.winfo_width()
+
+        num_frames = len(self.inter_frame_changes)
+        if num_frames == 0:
+            return
+
+        # Calculate pixels per frame
+        pixels_per_frame = max(1, canvas_width / num_frames)
+
+        # Render inter-frame changes
+        for i, change_ratio in enumerate(self.inter_frame_changes):
+            x0 = i * pixels_per_frame
+            x1 = (i + 1) * pixels_per_frame
+
+            # Color: white (no change) to red (high change)
+            intensity = int(255 * (1 - change_ratio))
+            color = f'#{255:02x}{intensity:02x}{intensity:02x}'
+
+            self.change_viz_canvas.create_rectangle(
+                x0, 0, x1, canvas_height,
+                fill=color, outline=''
+            )
+
+        # Render background ratios
+        for i, bg_ratio in enumerate(self.background_ratios):
+            x0 = i * pixels_per_frame
+            x1 = (i + 1) * pixels_per_frame
+
+            # Color: green (low bg) to yellow (high bg)
+            # Low BG (mostly objects) = good = green
+            # High BG (mostly empty) = yellow/warning
+            if bg_ratio < 0.5:
+                # 0-50% bg: green
+                g = 255
+                r = int(510 * bg_ratio)
+            else:
+                # 50-100% bg: yellow to orange
+                r = 255
+                g = int(255 * (2 - 2 * bg_ratio))
+
+            color = f'#{r:02x}{g:02x}00'
+
+            self.bg_viz_canvas.create_rectangle(
+                x0, 0, x1, canvas_height,
+                fill=color, outline=''
+            )
+
+        # Draw current frame indicator
+        if hasattr(self, 'current_frame_idx'):
+            x_pos = self.current_frame_idx * pixels_per_frame
+            self.change_viz_canvas.create_line(
+                x_pos, 0, x_pos, canvas_height,
+                fill='blue', width=2
+            )
+            self.bg_viz_canvas.create_line(
+                x_pos, 0, x_pos, canvas_height,
+                fill='blue', width=2
+            )
+
+    def _on_viz_canvas_click(self, event):
+        """
+        Handle clicks on visualization canvas to jump to frame.
+        """
+        if not self.inter_frame_changes:
+            return
+
+        canvas_width = event.widget.winfo_width()
+        num_frames = len(self.inter_frame_changes)
+
+        # Calculate which frame was clicked
+        click_ratio = event.x / canvas_width
+        target_frame = int(click_ratio * num_frames)
+        target_frame = max(0, min(target_frame, num_frames - 1))
+
+        # Jump to frame
+        self.current_frame_idx = target_frame
+        self.frame_var.set(target_frame)
+        self.display_current_frame()
+        self._update_quality_visualizations()
+
+    def _get_session_cache_key(self, video_path, frame_indices):
+        """
+        Generate a cache key for session-level frame reuse.
+
+        Args:
+            video_path: Path to the video file
+            frame_indices: List of frame indices to extract
+
+        Returns:
+            str: Cache key based on video path, size, mtime, and frame range
+        """
+        try:
+            # Get video file metadata
+            abs_path = os.path.abspath(video_path)
+            file_size = os.path.getsize(abs_path)
+            mtime = os.path.getmtime(abs_path)
+
+            # Create key from path, size, mtime, and frame range
+            frame_range = f"{min(frame_indices)}-{max(frame_indices)}" if frame_indices else "all"
+            cache_key = f"{abs_path}|{file_size}|{mtime:.0f}|{frame_range}"
+
+            return cache_key
+        except Exception as e:
+            print(f"Warning: Could not generate cache key: {e}")
             return None
 
     def display_current_frame(self):
@@ -1954,7 +2303,7 @@ class SAM2VideoUI:
                 height, width = display_frame.shape[:2]
                 combined_overlay = np.zeros((height, width, 3), dtype=np.float32)
                 overlap_count = np.zeros((height, width), dtype=np.int32)
-
+                
                 for mask_bool, obj_color, obj_id in mask_data_list:
                     # Add color to overlapping regions (accumulate for averaging)
                     combined_overlay[mask_bool] += obj_color
@@ -1967,7 +2316,7 @@ class SAM2VideoUI:
 
                 # Single blend operation - fixes cumulative darkening bug
                 alpha = self.mask_opacity_var.get() if hasattr(self, 'mask_opacity_var') else 0.4
-                print(f"  Blending {len(mask_data_list)} masks with alpha={alpha}")
+                
                 display_frame = cv2.addWeighted(display_frame, 1-alpha, combined_overlay, alpha, 0)
         
         # Draw click points only for the current frame
@@ -2058,6 +2407,9 @@ class SAM2VideoUI:
         if self.multi_frame_annotation_mode and self.current_frame_idx in self.annotated_frames:
             frame_text += " (annotated)"
         self.frame_label.config(text=frame_text)
+
+        # Update quality visualization indicators
+        self._update_quality_visualizations()
 
     def on_canvas_resize(self, event):
         """Handle canvas resize events with debouncing"""
@@ -2756,7 +3108,7 @@ class SAM2VideoUI:
             
             if device == "cpu":
                 info_text = "Using CPU (slower but works on any system)"
-            elif device == "cuda":
+            elif device == "cuda" or device == "cuda:0":
                 if torch and torch.cuda.is_available():
                     gpu_name = torch.cuda.get_device_name(0)
                     gpu_memory = torch.cuda.get_device_properties(0).total_memory / (1024**3)
@@ -3002,7 +3354,7 @@ class SAM2VideoUI:
                 return torch.autocast(device_type=device_type, enabled=False)
             elif hasattr(torch.cuda, 'amp') and hasattr(torch.cuda.amp, 'autocast'):
                 # Fallback for older PyTorch versions with CUDA autocast
-                return torch.cuda.amp.autocast(enabled=False)
+                return torch.amp.autocast(enabled=False)
             else:
                 # Fallback to no_grad
                 return torch.no_grad()
@@ -3216,7 +3568,7 @@ class SAM2VideoUI:
             return
             
         if not self.model_loaded or not self.sam2_model:
-            messagebox.showwarning("Warning", "Please load SAM2 model first")
+            messagebox.showwarning("Warning", "Please load a SAM model first")
             return
             
         if not self.click_points:
@@ -3268,12 +3620,6 @@ class SAM2VideoUI:
             self.progress_var.set(0)
             self.root.update()
 
-            # Create temporary directory for frames (still needed for SAM2 processing)
-            temp_dir = tempfile.mkdtemp(prefix='sam2_frames_')
-
-            # Use the user-selected directory for mask output (no temp directory)
-            export_dir = masks_output_dir
-
             # Check if we need to use original video for re-segmentation
             segmentation_video_path = None
             if self.segmented_video_displayed:
@@ -3281,67 +3627,59 @@ class SAM2VideoUI:
                 if not segmentation_video_path:
                     return  # User cancelled
 
+            # Determine which frames to process based on processing range
+            # IMPORTANT: For segmentation, we need to use ORIGINAL frame numbers, not loaded frame indices
+            # Get total original frames from video properties
+            total_original_frames = self.video_props.get('total_original_frames', len(self.frames)) if hasattr(self, 'video_props') else len(self.frames)
+
+            # Process ALL original frames (not just loaded frames)
+            # IMPORTANT: Process EVERY frame, ignore skip_frames (that's only for UI display)
+            frames_to_process = list(range(0, total_original_frames))
+            print(f"Processing full video: {len(frames_to_process)} frames (every frame at original resolution)")
+
+            # Get or reuse session-based cache directory
+            # Reuses cache if same video within session, creates new if different video
+            source_video = segmentation_video_path or self.video_path
+            temp_dir = self._get_session_cache_dir(source_video)
+
+            # Use the user-selected directory for mask output (no temp directory)
+            export_dir = masks_output_dir
+
             try:
-                # Determine which frames to save based on processing range
-                if self.limit_to_range_var.get():
-                    start_idx = max(0, min(self.range_start_var.get(), len(self.frames)-1))
-                    end_idx = max(0, min(self.range_end_var.get(), len(self.frames)-1))
-                    if end_idx < start_idx:
-                        start_idx, end_idx = end_idx, start_idx
-                    frames_to_save = list(range(start_idx, end_idx + 1))
-                    self.status_label.config(text=f"Saving frames {start_idx+1}-{end_idx+1} for processing...")
-                    print(f"Processing limited range: frames {start_idx+1} to {end_idx+1} (total: {len(frames_to_save)} frames)")
-                else:
-                    frames_to_save = list(range(len(self.frames)))
-                    print(f"Processing full video: {len(frames_to_save)} frames")
-                
-                # Save only the frames we need to process
-                if segmentation_video_path:
-                    # Re-segmentation: Extract frames from original video
-                    print(f"Re-segmentation mode: Extracting frames from original video")
-                    cap = cv2.VideoCapture(segmentation_video_path)
 
-                    for save_idx, frame_idx in enumerate(frames_to_save):
-                        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-                        ret, frame_bgr = cap.read()
-                        if not ret:
-                            print(f"Warning: Could not read frame {frame_idx} from original video, skipping...")
-                            continue
+                # ALWAYS extract frames from original video at original resolution
+                # Ignore any UI optimization settings (frame skipping, downsampling)
+                # For segmentation, we need full quality regardless of how video was loaded in UI
+                source_video = segmentation_video_path or self.video_path
+                print(f"Extracting frames at original resolution from: {source_video}")
 
-                        frame_path = os.path.join(temp_dir, f"{save_idx:05d}.jpg")
-                        cv2.imwrite(frame_path, frame_bgr)
+                # Show note if video was loaded with optimizations
+                if hasattr(self, 'video_props'):
+                    skip_frames_ui = self.video_props.get('skip_frames', 1)
+                    if skip_frames_ui > 1 or self.current_video_scale != 1.0:
+                        print(f"  Note: Video loaded with optimizations (skip={skip_frames_ui}, scale={self.current_video_scale})")
+                        print(f"        But SAM will process at original resolution")
 
-                        progress = (save_idx / len(frames_to_save)) * 30
-                        self.progress_var.set(progress)
-                        if save_idx % 10 == 0:
-                            self.root.update_idletasks()
+                cap = cv2.VideoCapture(source_video)
 
-                    cap.release()
-                else:
-                    # Normal segmentation: Use loaded frames
-                    for save_idx, frame_idx in enumerate(frames_to_save):
-                        # Handle lazy loading - load frame on demand if needed
-                        if self.lazy_load_var.get() and hasattr(self, 'video_props'):
-                            frame = self._load_frame_lazy(frame_idx)
-                            if frame is None:
-                                # Skip this frame if it can't be loaded
-                                print(f"Warning: Could not load frame {frame_idx}, skipping...")
-                                continue
-                        else:
-                            frame = self.frames[frame_idx]
-                            if frame is None:
-                                print(f"Warning: Frame {frame_idx} is None, skipping...")
-                                continue
+                for save_idx, original_frame_num in enumerate(frames_to_process):
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, original_frame_num)
+                    ret, frame_bgr = cap.read()
+                    if not ret:
+                        print(f"Warning: Could not read frame {original_frame_num}, skipping...")
+                        continue
 
-                        frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-                        frame_path = os.path.join(temp_dir, f"{save_idx:05d}.jpg")
-                        cv2.imwrite(frame_path, frame_bgr)
-                    
-                    progress = (save_idx / len(frames_to_save)) * 30
+                    # Save at ORIGINAL resolution (no scaling)
+                    frame_path = os.path.join(temp_dir, f"{save_idx:05d}.jpg")
+                    cv2.imwrite(frame_path, frame_bgr)
+
+                    progress = (save_idx / len(frames_to_process)) * 30
                     self.progress_var.set(progress)
                     if save_idx % 10 == 0:
                         self.root.update_idletasks()
-                
+
+                cap.release()
+
                 self.status_label.config(text="Initializing SAM2 inference...")
                 self.progress_var.set(35)
                 self.root.update()
@@ -3358,12 +3696,31 @@ class SAM2VideoUI:
 
                 # Initialize fresh state with current frames
                 # Enable memory optimizations (always on)
-                self.inference_state = self.sam2_model.init_state(
-                    video_path=temp_dir,
-                    offload_video_to_cpu=True,  # Reduce GPU memory usage
-                    offload_state_to_cpu=True   # Offload model state to CPU when not in use
-                )
-                print("Memory optimizations enabled: CPU offloading")
+
+                # Get the device the model is on
+                device = self._get_selected_device()
+
+                # Temporarily set default CUDA device to match model's device
+                # This ensures init_state loads frames to the correct device
+                original_device = None
+                if device.startswith("cuda:") and torch.cuda.is_available():
+                    gpu_id = int(device.split(":")[1])
+                    original_device = torch.cuda.current_device()
+                    torch.cuda.set_device(gpu_id)
+                    print(f"Set default CUDA device to {gpu_id} for init_state")
+
+                try:
+                    self.inference_state = self.sam2_model.init_state(
+                        video_path=temp_dir,
+                        offload_video_to_cpu=True,  # Reduce GPU memory usage
+                        offload_state_to_cpu=True   # Offload model state to CPU when not in use
+                    )
+                    print("Memory optimizations enabled: CPU offloading")
+                finally:
+                    # Restore original default CUDA device
+                    if original_device is not None:
+                        torch.cuda.set_device(original_device)
+                        print(f"Restored default CUDA device to {original_device}")
 
                 # Calculate coordinate scaling if re-segmenting
                 coord_scale_x = 1.0
@@ -3374,7 +3731,11 @@ class SAM2VideoUI:
                     orig_height = int(cap_temp.get(cv2.CAP_PROP_FRAME_HEIGHT))
                     cap_temp.release()
 
-                    seg_height, seg_width = self.frames[0].shape[:2]
+                    # Get dimensions using unified method (works in all modes)
+                    dims = self._get_frame_dimensions()
+                    if dims is None:
+                        raise ValueError("Cannot determine segmented video dimensions")
+                    seg_height, seg_width = dims
                     coord_scale_x = orig_width / seg_width
                     coord_scale_y = orig_height / seg_height
 
@@ -3384,37 +3745,37 @@ class SAM2VideoUI:
 
                 # Group click points by frame and by object ID
                 points_by_frame_and_object = {}
-                for x, y, is_pos, obj_id, frame_idx in self.click_points:
-                    # Map original frame index to limited video index
-                    if self.limit_to_range_var.get():
-                        if frame_idx not in frames_to_save:
-                            continue  # Skip points outside the processing range
-                        limited_frame_idx = frames_to_save.index(frame_idx)
-                    else:
-                        limited_frame_idx = frame_idx
+                for x, y, is_pos, obj_id, loaded_frame_idx in self.click_points:
+                    # Convert loaded frame index to original frame number
+                    original_frame_num = self._get_original_frame_number(loaded_frame_idx)
+
+                    # Check if this frame is in our processing list
+                    if original_frame_num not in frames_to_process:
+                        continue  # Skip points outside the processing range
+
+                    # Get sequential index in frames_to_process (for SAM input)
+                    sequential_frame_idx = frames_to_process.index(original_frame_num)
                     
                     # Handle coordinate scaling for re-segmentation
                     if coord_scale_x != 1.0 or coord_scale_y != 1.0:
                         # Re-segmentation: Scale from segmented video dimensions to original video dimensions
                         scaled_x = x * coord_scale_x
                         scaled_y = y * coord_scale_y
-                    # ADDED: Convert from ORIGINAL coordinates to CURRENT frame coordinates
-                    # for SAM2 processing
-                    elif self.current_video_scale != 1.0 and self.original_video_width:
-                        scaled_x = x * self.current_video_scale
-                        scaled_y = y * self.current_video_scale
                     else:
+                        # Coordinates are stored at original resolution
+                        # Since frames are now always extracted at original resolution (even when UI displays downsampled),
+                        # no coordinate scaling is needed
                         scaled_x = x
                         scaled_y = y
                     
-                    if limited_frame_idx not in points_by_frame_and_object:
-                        points_by_frame_and_object[limited_frame_idx] = {}
-                    if obj_id not in points_by_frame_and_object[limited_frame_idx]:
-                        points_by_frame_and_object[limited_frame_idx][obj_id] = {'points': [], 'labels': []}
-                    
+                    if sequential_frame_idx not in points_by_frame_and_object:
+                        points_by_frame_and_object[sequential_frame_idx] = {}
+                    if obj_id not in points_by_frame_and_object[sequential_frame_idx]:
+                        points_by_frame_and_object[sequential_frame_idx][obj_id] = {'points': [], 'labels': []}
+
                     # Use SCALED coordinates for SAM2 (matching current frame size)
-                    points_by_frame_and_object[limited_frame_idx][obj_id]['points'].append([scaled_x, scaled_y])
-                    points_by_frame_and_object[limited_frame_idx][obj_id]['labels'].append(1 if is_pos else 0)
+                    points_by_frame_and_object[sequential_frame_idx][obj_id]['points'].append([scaled_x, scaled_y])
+                    points_by_frame_and_object[sequential_frame_idx][obj_id]['labels'].append(1 if is_pos else 0)
                     
                     
                 
@@ -3434,6 +3795,13 @@ class SAM2VideoUI:
                 # Check if using SAM3 (different API signature for add_new_points_or_box)
                 is_sam3 = hasattr(self.sam2_model, '__class__') and 'Sam3' in self.sam2_model.__class__.__name__
 
+                # Get frame dimensions using unified method (works for both SAM2 and SAM3)
+                dims = self._get_frame_dimensions()
+                if dims is None:
+                    raise ValueError("Cannot determine frame dimensions")
+                frame_height, frame_width = dims
+                print(f"Frame dimensions for coordinate conversion: {frame_width}x{frame_height}")
+
                 # Process each annotation frame and its objects
                 for ann_frame in annotation_frames:
                     obj_dict = points_by_frame_and_object[ann_frame]
@@ -3448,34 +3816,55 @@ class SAM2VideoUI:
                         try:
                             # Get device
                             device = self._get_selected_device()
-                            
+
+                            # ===== SAM3: Convert pixel coordinates to relative [0-1] coordinates =====
+                            if is_sam3:
+                                # SAM3 requires relative coordinates [0-1]
+                                rel_points = [[x / frame_width, y / frame_height] for x, y in points]
+                                points_to_use = np.array(rel_points, dtype=np.float32)
+
+                                print(f"  SAM3 coordinate conversion for {obj_name} on frame {ann_frame}:")
+                                if len(points) > 0:
+                                    print(f"    Example: Pixel {points[0]} → Relative [{rel_points[0][0]:.4f}, {rel_points[0][1]:.4f}]")
+                            else:
+                                # SAM2 uses pixel coordinates
+                                points_to_use = points
+                            # ======================================================================
+
                             # Convert to tensors with Float32 (autocast will handle BFloat16 conversion)
-                            points_tensor = torch.from_numpy(points).to(dtype=torch.float32, device=device)
+                            points_tensor = torch.from_numpy(points_to_use).to(dtype=torch.float32, device=device)
                             labels_tensor = torch.from_numpy(labels).to(dtype=torch.int64, device=device)
-                            
+
                             # Make sure tensors are contiguous
                             points_tensor = points_tensor.contiguous()
                             labels_tensor = labels_tensor.contiguous()
 
-                            # Build kwargs for add_new_points_or_box
-                            kwargs = {
-                                'inference_state': self.inference_state,
-                                'frame_idx': ann_frame,
-                                'obj_id': obj_id,
-                                'points': points_tensor,
-                                'labels': labels_tensor,
-                                'clear_old_points': False,
-                            }
-
-                            # SAM3-specific: Tell it to treat coordinates as pixels, not relative (0-1)
+                            # ===== SAM3: Use add_new_points (NOT add_new_points_or_box) =====
                             if is_sam3:
-                                kwargs['rel_coordinates'] = False
-
-                            # Use add_new_points_or_box directly (add_new_points is deprecated)
-                            # autocast context handles dtype conversion automatically
-                            _ = self.sam2_model.add_new_points_or_box(**kwargs)
-                                    
-                            print(f"Successfully added {len(points)} points for {obj_name} on frame {ann_frame}")
+                                # SAM3 add_new_points returns 4 values
+                                _, out_obj_ids, low_res_masks, video_res_masks = self.sam2_model.add_new_points(
+                                    inference_state=self.inference_state,
+                                    frame_idx=ann_frame,
+                                    obj_id=obj_id,
+                                    points=points_tensor,
+                                    labels=labels_tensor,
+                                    clear_old_points=False,
+                                )
+                                print(f"  Successfully added {len(points)} points for {obj_name} on frame {ann_frame}")
+                                print(f"  Returned {len(out_obj_ids)} object IDs: {out_obj_ids}")
+                            # ================================================================
+                            else:
+                                # ===== SAM2: Use add_new_points_or_box =====
+                                _ = self.sam2_model.add_new_points_or_box(
+                                    inference_state=self.inference_state,
+                                    frame_idx=ann_frame,
+                                    obj_id=obj_id,
+                                    points=points_tensor,
+                                    labels=labels_tensor,
+                                    clear_old_points=False,
+                                )
+                                print(f"  Successfully added {len(points)} points for {obj_name} on frame {ann_frame}")
+                            # ============================================
                             
                         except Exception as e:
                             error_msg = f"Error adding points for {obj_name} on frame {ann_frame}: {e}"
@@ -3484,17 +3873,9 @@ class SAM2VideoUI:
                             messagebox.showerror("Segmentation Error", error_msg)
                             return
                 
-                # Determine processing range
-                if self.limit_to_range_var.get():
-                    start_idx = max(0, min(self.range_start_var.get(), len(self.frames)-1))
-                    end_idx = max(0, min(self.range_end_var.get(), len(self.frames)-1))
-                    if end_idx < start_idx:
-                        start_idx, end_idx = end_idx, start_idx
-                    frames_to_process = list(range(start_idx, end_idx + 1))
-                    self.status_label.config(text=f"Propagating through selected range {start_idx+1}-{end_idx+1}...")
-                else:
-                    self.status_label.config(text="Propagating through entire video...")
-                    frames_to_process = list(range(len(self.frames)))
+                # Process entire video
+                self.status_label.config(text="Propagating through entire video...")
+                frames_to_process = list(range(len(self.frames)))
                 
                 # Store the processing range for later use
                 self.processing_range = frames_to_process
@@ -3515,7 +3896,7 @@ class SAM2VideoUI:
                         propagate_iterator = self.sam2_model.propagate_in_video(
                             self.inference_state,
                             start_frame_idx=0,
-                            max_frame_num_to_track=len(frames_to_save),
+                            max_frame_num_to_track=len(frames_to_process),
                             reverse=False,
                             propagate_preflight=True  # Required to consolidate points into cond_frame_outputs
                         )
@@ -3529,31 +3910,24 @@ class SAM2VideoUI:
                         else:
                             out_frame_idx, out_obj_ids, out_mask_logits = result
 
-                        # Map limited video frame index back to original frame index
-                        if self.limit_to_range_var.get():
-                            if out_frame_idx >= len(frames_to_save):
-                                continue
-                            original_frame_idx = frames_to_save[out_frame_idx]
-                        else:
-                            original_frame_idx = out_frame_idx
-
-                        # Only process frames that are in our target range
-                        if original_frame_idx not in frames_to_process:
+                        # Map sequential frame index back to original frame number
+                        if out_frame_idx >= len(frames_to_process):
                             continue
-                            
+                        original_frame_num = frames_to_process[out_frame_idx]
+
                         # Process each object mask
                         for i, out_obj_id in enumerate(out_obj_ids):
                             # Only keep masks for objects that were annotated anywhere
                             if any(out_obj_id in obj_dict for obj_dict in points_by_frame_and_object.values()):
                                 mask_logits = out_mask_logits[i]
-                                
+
                                 # Convert from BFloat16 to Float32 only when moving to CPU for numpy
                                 if hasattr(mask_logits, 'cpu'):
                                     # Convert to float32 for CPU operations (numpy doesn't support bfloat16)
                                     mask_logits = mask_logits.float().cpu()
                                 if hasattr(mask_logits, 'numpy'):
                                     mask_logits = mask_logits.numpy()
-                                
+
                                 # Convert to binary mask
                                 mask = (mask_logits > 0.0)
 
@@ -3563,7 +3937,7 @@ class SAM2VideoUI:
 
                                 # Always export to disk (streaming) for memory efficiency
                                 mask_uint8 = (mask * 255).astype(np.uint8)
-                                self._export_mask_to_disk(original_frame_idx, out_obj_id, mask_uint8, export_dir, mask_metadata)
+                                self._export_mask_to_disk(original_frame_num, out_obj_id, mask_uint8, export_dir, mask_metadata)
 
                                 # Explicitly delete tensors
                                 del mask_logits
@@ -3590,100 +3964,92 @@ class SAM2VideoUI:
                     messagebox.showwarning("Propagation Warning",
                                         f"Encountered issue during forward propagation: {str(e)}")
 
-                # BACKWARD PROPAGATION - if earliest annotation is not at frame 0
-                earliest_frame = min(annotation_frames) if annotation_frames else 0
+                # BACKWARD PROPAGATION 
 
-                if earliest_frame > 0:
-                    self.status_label.config(text=f"Propagating backward from frame {earliest_frame+1}...")
-                    self.root.update()
+                
+                self.status_label.config(text=f"Propagating backward ...")
+                self.root.update()
 
-                    try:
-                        backward_processed = 0
-                        frames_to_backward = earliest_frame  # Number of frames before first annotation
+                try:
+                    backward_processed = 0
+                    frames_to_backward = len(frames_to_process)  # Total number of frames to process
 
-                        # SAM3 requires additional arguments for backward propagation
+                    # SAM3 requires additional arguments for backward propagation
+                    if is_sam3:
+                        backward_iterator = self.sam2_model.propagate_in_video(
+                            self.inference_state,
+                            start_frame_idx=frames_to_backward - 1,
+                            max_frame_num_to_track=frames_to_backward,
+                            reverse=True,
+                            propagate_preflight=True  # Required to consolidate points into cond_frame_outputs
+                        )
+                    else:
+                        backward_iterator = self.sam2_model.propagate_in_video(
+                            self.inference_state, reverse=True
+                        )
+
+                    for result in backward_iterator:
+                        # Unpack based on model type (SAM3 returns 5 values, SAM2 returns 3)
                         if is_sam3:
-                            backward_iterator = self.sam2_model.propagate_in_video(
-                                self.inference_state,
-                                start_frame_idx=0,
-                                max_frame_num_to_track=frames_to_backward,
-                                reverse=True,
-                                propagate_preflight=True  # Required to consolidate points into cond_frame_outputs
-                            )
+                            out_frame_idx, out_obj_ids, out_low_res_masks, out_mask_logits, out_obj_scores = result
                         else:
-                            backward_iterator = self.sam2_model.propagate_in_video(
-                                self.inference_state, reverse=True
-                            )
+                            out_frame_idx, out_obj_ids, out_mask_logits = result
 
-                        for result in backward_iterator:
-                            # Unpack based on model type (SAM3 returns 5 values, SAM2 returns 3)
-                            if is_sam3:
-                                out_frame_idx, out_obj_ids, out_low_res_masks, out_mask_logits, out_obj_scores = result
-                            else:
-                                out_frame_idx, out_obj_ids, out_mask_logits = result
+                        # Map sequential frame index back to original frame number
+                        if out_frame_idx >= len(frames_to_process):
+                            continue
+                        original_frame_num = frames_to_process[out_frame_idx]
 
-                            # Map limited video frame index back to original frame index
-                            if self.limit_to_range_var.get():
-                                if out_frame_idx >= len(frames_to_save):
-                                    continue
-                                original_frame_idx = frames_to_save[out_frame_idx]
-                            else:
-                                original_frame_idx = out_frame_idx
+                        # Process each object mask
+                        for i, out_obj_id in enumerate(out_obj_ids):
+                            if any(out_obj_id in obj_dict for obj_dict in points_by_frame_and_object.values()):
+                                mask_logits = out_mask_logits[i]
 
-                            # Only process frames before the earliest annotation
-                            if original_frame_idx >= earliest_frame:
-                                continue
+                                # Convert from BFloat16 to Float32 only when moving to CPU for numpy
+                                if hasattr(mask_logits, 'cpu'):
+                                    mask_logits = mask_logits.float().cpu()
+                                if hasattr(mask_logits, 'numpy'):
+                                    mask_logits = mask_logits.numpy()
 
-                            # Process each object mask
-                            for i, out_obj_id in enumerate(out_obj_ids):
-                                if any(out_obj_id in obj_dict for obj_dict in points_by_frame_and_object.values()):
-                                    mask_logits = out_mask_logits[i]
+                                # Convert to binary mask
+                                mask = (mask_logits > 0.0)
 
-                                    # Convert from BFloat16 to Float32 only when moving to CPU for numpy
-                                    if hasattr(mask_logits, 'cpu'):
-                                        mask_logits = mask_logits.float().cpu()
-                                    if hasattr(mask_logits, 'numpy'):
-                                        mask_logits = mask_logits.numpy()
+                                # Ensure mask is 2D
+                                if len(mask.shape) > 2:
+                                    mask = mask.squeeze()
 
-                                    # Convert to binary mask
-                                    mask = (mask_logits > 0.0)
+                                # Always export to disk (streaming) for memory efficiency
+                                mask_uint8 = (mask * 255).astype(np.uint8)
+                                self._export_mask_to_disk(original_frame_num, out_obj_id, mask_uint8, export_dir, mask_metadata)
 
-                                    # Ensure mask is 2D
-                                    if len(mask.shape) > 2:
-                                        mask = mask.squeeze()
+                                # Explicitly delete tensors
+                                del mask_logits
+                                del mask
 
-                                    # Always export to disk (streaming) for memory efficiency
-                                    mask_uint8 = (mask * 255).astype(np.uint8)
-                                    self._export_mask_to_disk(original_frame_idx, out_obj_id, mask_uint8, export_dir, mask_metadata)
+                        # Clean up old frames from cache to prevent memory growth
+                        self._cleanup_frame_cache(out_frame_idx, self.inference_state)
 
-                                    # Explicitly delete tensors
-                                    del mask_logits
-                                    del mask
+                        # Monitor memory usage
+                        self._monitor_memory(out_frame_idx, len(frames_to_process))
 
-                            # Clean up old frames from cache to prevent memory growth
-                            self._cleanup_frame_cache(out_frame_idx, self.inference_state)
+                        backward_processed += 1
+                        # Update progress (backward propagation gets remaining progress from 50% to 100%)
+                        if frames_to_backward > 0:
+                            backward_progress = 50 + (backward_processed / frames_to_backward) * 50
+                            self.progress_var.set(min(backward_progress, 100))
 
-                            # Monitor memory usage
-                            self._monitor_memory(out_frame_idx, earliest_frame)
+                        if backward_processed % 10 == 0:
+                            self.status_label.config(text=f"Backward: Processing frame {backward_processed}/{frames_to_backward}")
+                            self.root.update_idletasks()
 
-                            backward_processed += 1
-                            # Update progress (backward propagation gets remaining progress from 50% to 100%)
-                            if frames_to_backward > 0:
-                                backward_progress = 50 + (backward_processed / frames_to_backward) * 50
-                                self.progress_var.set(min(backward_progress, 100))
+                        
 
-                            if backward_processed % 10 == 0:
-                                self.status_label.config(text=f"Backward: Processing frame {backward_processed}/{frames_to_backward}")
-                                self.root.update_idletasks()
-
-                            print(f"Backward propagation complete: processed {backward_processed} frames")
-
-                    except Exception as e:
-                        print(f"Error during backward propagation: {e}")
-                        traceback.print_exc()
-                        propagation_success = False  # Mark propagation as failed
-                        messagebox.showwarning("Backward Propagation Warning",
-                                            f"Encountered issue during backward propagation: {str(e)}")
+                except Exception as e:
+                    print(f"Error during backward propagation: {e}")
+                    traceback.print_exc()
+                    propagation_success = False  # Mark propagation as failed
+                    messagebox.showwarning("Backward Propagation Warning",
+                                        f"Encountered issue during backward propagation: {str(e)}")
 
                 # Save metadata and temporary directory
                 metadata_path = os.path.join(export_dir, "segmentation_metadata.json")
@@ -3691,7 +4057,7 @@ class SAM2VideoUI:
                     import json
                     json.dump({
                         'video_path': self.video_path,
-                        'total_frames': len(self.frames),
+                        'total_frames': total_original_frames,
                         'objects': {obj_id: self.object_names.get(obj_id, f"Object {obj_id}")
                                    for obj_id in self.object_names.keys()},
                         'masks': mask_metadata
@@ -3745,20 +4111,21 @@ class SAM2VideoUI:
                     # Export segmented video and metadata
                     try:
                         # Prepare annotations data (matching process_annotations.py format)
+                        # Convert loaded frame indices to original frame numbers
                         annotations_data = {
                             "video_path": self.video_path,
-                            "total_frames": len(self.frames),
+                            "total_frames": total_original_frames,
                             "object_names": self.object_names,
                             "object_colors": self.object_colors,
                             "annotations": [
                                 {
-                                    "frame_index": frame_idx,
+                                    "frame_index": self._get_original_frame_number(loaded_frame_idx),
                                     "object_id": obj_id,
                                     "x": x,
                                     "y": y,
                                     "is_positive": is_pos
                                 }
-                                for x, y, is_pos, obj_id, frame_idx in self.click_points
+                                for x, y, is_pos, obj_id, loaded_frame_idx in self.click_points
                             ]
                         }
 
@@ -3778,7 +4145,9 @@ class SAM2VideoUI:
                                     "objects_detected": list(self.object_names.keys())
                                 },
                                 "file_paths": {
-                                    "original_video_path": str(Path(self.video_path).resolve()) if self.video_path else None,
+                                    # Use original_video_path_for_resegment if available (when re-segmenting loaded results),
+                                    # otherwise use video_path (when segmenting freshly loaded video)
+                                    "original_video_path": str(Path(self.original_video_path_for_resegment).resolve()) if self.original_video_path_for_resegment else (str(Path(self.video_path).resolve()) if self.video_path else None),
                                     "segmented_video_filename": "segmented_video.mp4",
                                     "metadata_filename": "processing_metadata.json"
                                 },
@@ -3789,6 +4158,53 @@ class SAM2VideoUI:
                         print(f"   - Masks: {masks_output_dir}/ ({total_masks} files)")
                         print(f"   - Video: {output_base_dir}/segmented_video.mp4")
                         print(f"   - Metadata: {metadata_path}")
+
+                        # Reload the segmented video into UI for playback
+                        self.status_label.config(text="Loading segmented video into UI...")
+                        self.root.update()
+
+                        try:
+                            segmented_video_path = os.path.join(output_base_dir, "segmented_video.mp4")
+                            if os.path.exists(segmented_video_path):
+                                # Clear old frames
+                                self.frames = []
+
+                                # Open segmented video
+                                reload_cap = cv2.VideoCapture(segmented_video_path)
+                                frame_count = int(reload_cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+                                print(f"Loading {frame_count} frames from segmented video...")
+
+                                # Load frames into memory (they're already processed, so eager loading is fine)
+                                for idx in range(frame_count):
+                                    ret, frame = reload_cap.read()
+                                    if not ret:
+                                        break
+                                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                                    self.frames.append(frame_rgb)
+
+                                reload_cap.release()
+
+                                # Update UI controls
+                                self.frame_slider.config(to=len(self.frames)-1)
+                                self.current_frame_idx = 0
+                                self.frame_var.set(0)
+                                self.segmented_video_displayed = True
+
+                                # Display first frame
+                                self.display_current_frame()
+
+                                print(f"Loaded {len(self.frames)} frames from segmented video")
+                            else:
+                                print("WARNING: Segmented video not found, keeping current frames")
+
+                        except Exception as reload_error:
+                            print(f"Warning: Could not reload segmented video: {reload_error}")
+                            traceback.print_exc()
+                            # Continue anyway - segmentation succeeded even if reload failed
+
+                        # Calculate segmentation quality metrics
+                        self._calculate_segmentation_quality_metrics()
 
                     except Exception as e:
                         print(f"[WARNING] Failed to export results: {e}")
@@ -3814,11 +4230,9 @@ class SAM2VideoUI:
                     messagebox.showwarning("Warning", "No masks were generated. Try different points.")
                 
             finally:
-                # Clean up
-                try:
-                    shutil.rmtree(temp_dir)
-                except Exception as e:
-                    print(f"Could not clean up temp directory: {e}")
+                # Session cache is preserved for reuse within session only
+                # It will be cleaned up when app closes or different video is processed
+                pass
                 
         except Exception as e:
             self.progress_bar.pack_forget()
@@ -3876,7 +4290,18 @@ class SAM2VideoUI:
                 print(f"WARNING: Could not load frame {frame_idx}, skipping")
                 continue
 
-            overlay_frame = frame.copy()
+            # Resize frame to original dimensions if it was scaled
+            # (This ensures masks and frames have matching dimensions for blending)
+            if frame.shape[:2] != (height, width):
+                print(f"WARNING: Frame size mismatch detected at frame {frame_idx}")
+                print(f"  Frame size: {frame.shape[1]}x{frame.shape[0]} (WxH)")
+                print(f"  Expected size: {width}x{height} (WxH)")
+                print(f"  Resizing frame to match mask dimensions...")
+                frame_resized = cv2.resize(frame, (width, height), interpolation=cv2.INTER_LINEAR)
+            else:
+                frame_resized = frame
+
+            overlay_frame = frame_resized.copy()
 
             # Check if this frame has masks
             if frame_idx in self.masks and self.masks[frame_idx]:
@@ -4914,7 +5339,9 @@ class SAM2VideoUI:
             # Setup autocast context for BFloat16 (following SAM2 notebook pattern)
             if device != "cpu" and torch.cuda.is_available():
                 # Enable autocast for BFloat16 as per SAM2 official notebook
-                self.autocast_context = torch.autocast("cuda", dtype=torch.bfloat16)
+                # Note: torch.autocast with device_type="cuda" applies to all CUDA devices,
+                # not just the default one, so this is safe for multi-GPU setups
+                self.autocast_context = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
                 self.autocast_context.__enter__()
 
                 # Enable TF32 for Ampere GPUs (compute capability >= 8.0)
@@ -5203,6 +5630,12 @@ def main():
         # Clean up video capture if lazy loading
         if hasattr(app, 'video_cap_lazy') and app.video_cap_lazy:
             app.video_cap_lazy.release()
+
+        # Clean up session-based frame cache
+        if hasattr(app, 'session_cache_dir') and app.session_cache_dir:
+            if os.path.exists(app.session_cache_dir):
+                print(f"Cleaning up session cache: {app.session_cache_dir}")
+                shutil.rmtree(app.session_cache_dir, ignore_errors=True)
 
         # CRITICAL: Always destroy root at the end
         root.destroy()
