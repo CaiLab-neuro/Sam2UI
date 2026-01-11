@@ -8,6 +8,7 @@ import json
 import tempfile
 import shutil
 import hashlib
+import glob
 from pathlib import Path
 import traceback
 from omegaconf import OmegaConf, DictConfig
@@ -3646,39 +3647,45 @@ class SAM2VideoUI:
             export_dir = masks_output_dir
 
             try:
+                # Check if frames already exist in cache (session reuse)
+                existing_frames = sorted(glob.glob(os.path.join(temp_dir, "*.jpg")))
+                if len(existing_frames) == len(frames_to_process):
+                    print(f"Reusing {len(existing_frames)} cached frames from: {temp_dir}")
+                    self.status_label.config(text="Using cached frames...")
+                    self.progress_var.set(30)
+                else:
+                    # Extract frames from original video at original resolution
+                    # Ignore any UI optimization settings (frame skipping, downsampling)
+                    # For segmentation, we need full quality regardless of how video was loaded in UI
+                    source_video = segmentation_video_path or self.video_path
+                    print(f"Extracting frames at original resolution from: {source_video}")
 
-                # ALWAYS extract frames from original video at original resolution
-                # Ignore any UI optimization settings (frame skipping, downsampling)
-                # For segmentation, we need full quality regardless of how video was loaded in UI
-                source_video = segmentation_video_path or self.video_path
-                print(f"Extracting frames at original resolution from: {source_video}")
+                    # Show note if video was loaded with optimizations
+                    if hasattr(self, 'video_props'):
+                        skip_frames_ui = self.video_props.get('skip_frames', 1)
+                        if skip_frames_ui > 1 or self.current_video_scale != 1.0:
+                            print(f"  Note: Video loaded with optimizations (skip={skip_frames_ui}, scale={self.current_video_scale})")
+                            print(f"        But SAM will process at original resolution")
 
-                # Show note if video was loaded with optimizations
-                if hasattr(self, 'video_props'):
-                    skip_frames_ui = self.video_props.get('skip_frames', 1)
-                    if skip_frames_ui > 1 or self.current_video_scale != 1.0:
-                        print(f"  Note: Video loaded with optimizations (skip={skip_frames_ui}, scale={self.current_video_scale})")
-                        print(f"        But SAM will process at original resolution")
+                    cap = cv2.VideoCapture(source_video)
 
-                cap = cv2.VideoCapture(source_video)
+                    for save_idx, original_frame_num in enumerate(frames_to_process):
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, original_frame_num)
+                        ret, frame_bgr = cap.read()
+                        if not ret:
+                            print(f"Warning: Could not read frame {original_frame_num}, skipping...")
+                            continue
 
-                for save_idx, original_frame_num in enumerate(frames_to_process):
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, original_frame_num)
-                    ret, frame_bgr = cap.read()
-                    if not ret:
-                        print(f"Warning: Could not read frame {original_frame_num}, skipping...")
-                        continue
+                        # Save at ORIGINAL resolution (no scaling)
+                        frame_path = os.path.join(temp_dir, f"{save_idx:05d}.jpg")
+                        cv2.imwrite(frame_path, frame_bgr)
 
-                    # Save at ORIGINAL resolution (no scaling)
-                    frame_path = os.path.join(temp_dir, f"{save_idx:05d}.jpg")
-                    cv2.imwrite(frame_path, frame_bgr)
+                        progress = (save_idx / len(frames_to_process)) * 30
+                        self.progress_var.set(progress)
+                        if save_idx % 10 == 0:
+                            self.root.update_idletasks()
 
-                    progress = (save_idx / len(frames_to_process)) * 30
-                    self.progress_var.set(progress)
-                    if save_idx % 10 == 0:
-                        self.root.update_idletasks()
-
-                cap.release()
+                    cap.release()
 
                 self.status_label.config(text="Initializing SAM2 inference...")
                 self.progress_var.set(35)
@@ -3875,7 +3882,8 @@ class SAM2VideoUI:
                 
                 # Process entire video
                 self.status_label.config(text="Propagating through entire video...")
-                frames_to_process = list(range(len(self.frames)))
+                # Use total_original_frames (not len(self.frames) which is only loaded frames for UI)
+                frames_to_process = list(range(0, total_original_frames))
                 
                 # Store the processing range for later use
                 self.processing_range = frames_to_process
