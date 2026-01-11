@@ -172,7 +172,67 @@ class SAM2Processor:
         except Exception as e:
             print(f"ERROR: Failed to load annotations: {e}")
             return None
-    
+
+    def _compress_video_with_ffmpeg(self, input_path, output_path, crf=23, preset='medium'):
+        """
+        Re-encode video with FFmpeg using CRF compression.
+
+        Args:
+            input_path: Temp uncompressed video
+            output_path: Final compressed video
+            crf: Quality (0-51, lower=better, 23=medium)
+            preset: Encoding speed (medium recommended)
+
+        Returns:
+            bool: True if successful
+        """
+        import subprocess
+        import shutil
+
+        ffmpeg_path = shutil.which('ffmpeg')
+        if not ffmpeg_path:
+            print("WARNING: ffmpeg not found, skipping compression")
+            shutil.move(input_path, output_path)
+            return False
+
+        try:
+            print(f"Compressing with FFmpeg (CRF={crf})...")
+
+            cmd = [
+                ffmpeg_path,
+                '-i', input_path,
+                '-c:v', 'libx264',
+                '-crf', str(crf),
+                '-preset', preset,
+                '-movflags', '+faststart',
+                '-y',
+                output_path
+            ]
+
+            result = subprocess.run(cmd, stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, text=True)
+
+            if result.returncode != 0:
+                print(f"FFmpeg error: {result.stderr}")
+                shutil.move(input_path, output_path)
+                return False
+
+            # Report compression stats
+            original_size = os.path.getsize(input_path)
+            compressed_size = os.path.getsize(output_path)
+            reduction = (1 - compressed_size / original_size) * 100
+
+            print(f"Compressed: {original_size/1e6:.1f}MB → {compressed_size/1e6:.1f}MB ({reduction:.1f}% reduction)")
+
+            os.remove(input_path)  # Delete temp
+            return True
+
+        except Exception as e:
+            print(f"WARNING: FFmpeg failed: {e}")
+            if os.path.exists(input_path):
+                shutil.move(input_path, output_path)
+            return False
+
     def get_video_info(self, video_path):
         """Get video frame count and properties without loading all frames"""
         print(f"Reading video info from {video_path}...")
@@ -603,15 +663,16 @@ class SAM2Processor:
             return None
 
     def export_video(self, masks_by_frame, video_path, object_names, object_colors,
-                    output_dir, fps=30, overlay_opacity=0.4):
-        """Export segmented video with overlays"""
+                    output_dir, fps=30, overlay_opacity=0.4, compress=True, crf=23):
+        """Export segmented video with overlays and optional compression"""
         print("Exporting segmented video...")
 
         frames = self.load_video_frames_for_export(video_path)
         if not frames:
             return False
-        
-        video_output_path = Path(output_dir) / "segmented_video.mp4"
+
+        video_output_path_final = Path(output_dir) / "segmented_video.mp4"
+        video_output_path_temp = Path(output_dir) / "segmented_video.temp.mp4" if compress else video_output_path_final
         
         height, width = frames[0].shape[:2]
 
@@ -619,7 +680,7 @@ class SAM2Processor:
         # Try different codec identifiers based on system availability
         for codec in ['avc1', 'H264', 'X264', 'mp4v']:
             fourcc = cv2.VideoWriter_fourcc(*codec)
-            out = cv2.VideoWriter(str(video_output_path), fourcc, fps, (width, height))
+            out = cv2.VideoWriter(str(video_output_path_temp), fourcc, fps, (width, height))
             if out.isOpened():
                 if codec != 'mp4v':
                     print(f"  Using {codec} codec for video encoding")
@@ -702,9 +763,25 @@ class SAM2Processor:
             
             if processed_frames % 100 == 0:
                 print(f"   Processed {processed_frames}/{len(frames)} frames...")
-        
+
         out.release()
-        print(f"OK: Exported segmented video to {video_output_path}")
+
+        # Compress with FFmpeg if requested
+        if compress:
+            print("Compressing video with FFmpeg...")
+            success = self._compress_video_with_ffmpeg(
+                str(video_output_path_temp),
+                str(video_output_path_final),
+                crf=crf,
+                preset='medium'
+            )
+            if success:
+                print(f"OK: Exported and compressed segmented video to {video_output_path_final}")
+            else:
+                print(f"OK: Exported segmented video to {video_output_path_final} (compression skipped)")
+        else:
+            print(f"OK: Exported segmented video to {video_output_path_final}")
+
         return True
     
     def export_metadata(self, annotations_data, masks_by_frame, output_dir, num_frames=None, video_path=None):

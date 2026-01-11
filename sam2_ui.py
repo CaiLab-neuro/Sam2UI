@@ -124,13 +124,7 @@ class SAM2VideoUI:
         self.model_type_var = tk.StringVar(value="SAM2")  # Default to SAM2
         self.using_sam3 = False
         
-        # Range-based processing for long videos
-        
-        # Large video handling options
-        self.downsample_frames_var = tk.BooleanVar(value=False)
-        self.frame_skip_var = tk.IntVar(value=1)  # Skip every N frames
-        self.scale_video_var = tk.BooleanVar(value=False)
-        self.video_scale_factor = tk.DoubleVar(value=0.5)  # Scale factor for video resolution
+        # Lazy loading option for large videos
         self.lazy_load_var = tk.BooleanVar(value=False)  # Load frames on demand
         self.video_cap_lazy = None  # Keep video capture open for lazy loading
 
@@ -144,30 +138,38 @@ class SAM2VideoUI:
         # Slider zoom functionality for precise navigation
         self.slider_zoom_level = tk.IntVar(value=1)  # 1 = full range, 10/100/1000 = zoomed
         self.slider_window_center = 0  # Center frame for zoomed slider window
+        self.zoom_jump_scheduled = None  # Timer ID for delayed jump
+        self.last_jump_notification = 0  # Timestamp of last notification
+        self.slider_manual_change = False  # Track if slider change is from user dragging
 
         # Playback speed control
         self.playback_speed = tk.DoubleVar(value=1.0)  # 1.0 = normal speed
         self.video_fps = 30  # Will be set from actual video FPS
 
-        # Track original video dimensions for coordinate system consistency
-        self.original_video_width = None
-        self.original_video_height = None
-        self.current_video_scale = 1.0  # Current scale applied to loaded frames
+        # Video dimensions stored in video_props dict
 
         # State for loading segmentation results
         self.loaded_from_results = False  # Flag if loaded from results
         self.original_video_path_for_resegment = None  # Path for re-segmentation
         self.segmented_video_displayed = False  # Track if displaying segmented vs original
+        self.has_prerendered_masks = False  # Track if frames have masks baked in (performance optimization)
         self.results_output_dir = None  # Store output directory
 
         # Session-based frame cache (cleaned up when app closes)
         self.session_cache_dir = None  # Current temp directory for extracted frames
         self.session_video_hash = None  # Hash of video being processed (to detect reuse)
 
+        # Mask loading cache (for flash mask feature)
+        self.mask_cache = {}  # Cache: {(frame_idx, obj_id): mask_array}
+        self.mask_cache_size = 50  # LRU cache limit
+
         # Segmentation quality visualization
         self.inter_frame_changes = []  # Ratio of pixels changing category between frames
         self.background_ratios = []     # Ratio of background pixels per frame
         self.change_viz_canvas = None   # Canvas for inter-frame change visualization
+        self.quality_bg_rendered = False  # Track if background colorbars are cached
+        self.change_viz_image = None    # Cached PhotoImage for change visualization
+        self.bg_viz_image = None        # Cached PhotoImage for background visualization
         self.bg_viz_canvas = None       # Canvas for background ratio visualization
 
         # Initialize default colors and names
@@ -575,10 +577,14 @@ class SAM2VideoUI:
         ttk.Label(slider_frame, text="Frame:").pack(side=tk.LEFT)
         
         self.frame_var = tk.IntVar()
-        self.frame_slider = ttk.Scale(slider_frame, from_=0, to=100, 
+        self.frame_slider = ttk.Scale(slider_frame, from_=0, to=100,
                                      orient=tk.HORIZONTAL, variable=self.frame_var,
                                      command=self.on_slider_change)
         self.frame_slider.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(10, 10))
+
+        # Bind mouse events to track manual slider dragging
+        self.frame_slider.bind('<ButtonPress-1>', lambda e: setattr(self, 'slider_manual_change', True))
+        self.frame_slider.bind('<ButtonRelease-1>', lambda e: setattr(self, 'slider_manual_change', False))
         
         self.frame_label = ttk.Label(slider_frame, text="0/0")
         self.frame_label.pack(side=tk.RIGHT)
@@ -810,44 +816,23 @@ class SAM2VideoUI:
                 return
             
             # Prepare annotation data
-            # Convert annotated_frames from loaded indices to original frame numbers
-            annotated_frames_original = sorted([
-                self._get_original_frame_number(loaded_idx)
-                for loaded_idx in self.annotated_frames
-            ])
-
             annotation_data = {
                 "video_path": self.video_path,
-                # Use original total frame count (before any frame skipping)
-                "total_frames": self.video_props.get('total_original_frames', len(self.frames)) if hasattr(self, 'video_props') else len(self.frames),
+                "total_frames": len(self.frames),
                 "total_annotations": len(self.click_points),
-                "annotated_frames": annotated_frames_original,  # Original frame numbers
+                "annotated_frames": sorted(self.annotated_frames),
                 "object_names": self.object_names,
                 "object_colors": {str(k): v for k, v in self.object_colors.items()},
-                
-                # ADDED: Store original video dimensions and current scale
-                "video_metadata": {
-                    "original_width": self.original_video_width,
-                    "original_height": self.original_video_height,
-                    "current_scale": self.current_video_scale,
-                    "frame_skip": self.frame_skip_var.get() if self.downsample_frames_var.get() else 1,
-                    "lazy_load": self.lazy_load_var.get()
-                },
-                
                 "annotations": []
             }
-            
-            # Convert click points to export format
-            # NOTE: Points are already in ORIGINAL coordinate system
-            for point in self.click_points:
-                img_x, img_y, is_positive, obj_id, loaded_frame_idx = point
 
-                # Convert loaded frame index to original frame number
-                original_frame_num = self._get_original_frame_number(loaded_frame_idx)
+            # Convert click points to export format
+            for point in self.click_points:
+                img_x, img_y, is_positive, obj_id, frame_idx = point
 
                 annotation = {
-                    "frame_index": original_frame_num,  # Store ORIGINAL frame number
-                    "x": float(img_x),  # These are in ORIGINAL video coordinates
+                    "frame_index": frame_idx,
+                    "x": float(img_x),
                     "y": float(img_y),
                     "is_positive": is_positive,
                     "object_id": obj_id,
@@ -912,79 +897,17 @@ class SAM2VideoUI:
             
             # ADDED: Check for coordinate system compatibility
             saved_metadata = annotation_data.get("video_metadata", {})
-            saved_width = saved_metadata.get("original_width")
-            saved_height = saved_metadata.get("original_height")
-            saved_scale = saved_metadata.get("current_scale", 1.0)
-            
-            coordinate_system = annotation_data.get("export_info", {}).get("coordinate_system", "unknown")
-            
-            # Check if we need to warn about coordinate system
-            needs_scaling_warning = False
-            scale_correction_factor = 1.0
-            
-            if saved_width and saved_height and self.original_video_width:
-                # Check if original video dimensions match
-                if saved_width != self.original_video_width or saved_height != self.original_video_height:
-                    needs_scaling_warning = True
-                    messagebox.showwarning(
-                        "Video Dimension Mismatch",
-                        f"Warning: Annotations were created for a video with different dimensions!\n\n"
-                        f"Saved annotations: {saved_width}x{saved_height}\n"
-                        f"Current video: {self.original_video_width}x{self.original_video_height}\n\n"
-                        f"Annotations may not appear in the correct locations.\n"
-                        f"Please use the same source video."
-                    )
-
-            # Check for frame count mismatch with smart detection
+            # Check for frame count mismatch
             saved_total_frames = annotation_data.get("total_frames", 0)
-            current_loaded_frames = len(self.frames)
-            skip_frames = getattr(self, 'video_props', {}).get('skip_frames', 1)
-            total_original_frames = getattr(self, 'video_props', {}).get('total_original_frames', current_loaded_frames)
+            current_total_frames = len(self.frames)
 
-            if saved_total_frames != current_loaded_frames:
-                # Check if mismatch is explained by frame skipping
-                if skip_frames > 1 and saved_total_frames == total_original_frames:
-                    # CASE 1: Frame skipping during video load - expected mismatch
-                    result = self._show_three_button_dialog(
-                        "Frame Skipping Detected",
-                        f"Annotation file contains {saved_total_frames} frames, but you loaded the video\n"
-                        f"with frame skipping (every {skip_frames} frames).\n\n"
-                        f"Only {current_loaded_frames} frames are loaded in memory.\n\n"
-                        f"Annotations for skipped frames will be preserved but won't be visible\n"
-                        f"until you reload without skipping.\n\n"
-                        f"What would you like to do?",
-                        "Reload Without Skipping",
-                        "Proceed Anyway",
-                        "Cancel"
-                    )
-
-                    if result == 0:  # Reload Without Skipping
-                        messagebox.showinfo("Reload Required",
-                            "Please reload the video without frame skipping:\n\n"
-                            "1. Close this dialog\n"
-                            "2. Go to File → Load Video\n"
-                            "3. When prompted for optimization, choose 'No Optimization'\n"
-                            "4. Then import annotations again")
-                        return
-                    elif result == 2:  # Cancel
-                        return
-                    # else: result == 1 (Proceed Anyway), continue with import
-
-                else:
-                    # CASE 2: Wrong file or corrupted annotation - unexpected mismatch
-                    messagebox.showerror(
-                        "Frame Count Mismatch",
-                        f"Error: Annotation file has {saved_total_frames} frames,\n"
-                        f"but loaded video has {total_original_frames} frames.\n\n"
-                        f"No frame skipping detected (skip_frames={skip_frames}).\n\n"
-                        f"This likely means:\n"
-                        f"• You loaded the wrong video file\n"
-                        f"• The annotation file is corrupted\n"
-                        f"• The video was edited after annotations were created\n\n"
-                        f"Import cannot proceed.\n"
-                        f"Please verify you have the correct video file."
-                    )
-                    return
+            if saved_total_frames != current_total_frames:
+                messagebox.showwarning(
+                    "Frame Count Mismatch",
+                    f"Warning: Annotation file has {saved_total_frames} frames,\n"
+                    f"but loaded video has {current_total_frames} frames.\n\n"
+                    f"Some annotations may be skipped if they reference out-of-bounds frames."
+                )
             
             # Ask user if they want to clear existing annotations
             if self.click_points:
@@ -1008,30 +931,24 @@ class SAM2VideoUI:
             # Import annotations with frame validation
             imported_count = 0
             skipped_count = 0
-            
+
             for annotation in annotation_data["annotations"]:
                 try:
-                    original_frame_num = annotation["frame_index"]
-                    x = annotation["x"]  # These are in ORIGINAL coordinates
+                    frame_idx = annotation["frame_index"]
+                    x = annotation["x"]
                     y = annotation["y"]
                     is_positive = annotation["is_positive"]
                     obj_id = annotation["object_id"]
                     obj_name = annotation.get("object_name", f"Object_{obj_id}")
 
-                    # Convert original frame number to loaded frame index
-                    loaded_idx = self._get_loaded_frame_index(original_frame_num)
-
-                    if loaded_idx is None:
-                        # Frame was skipped or out of bounds
+                    # Simple bounds check
+                    if frame_idx >= len(self.frames):
+                        print(f"Warning: Frame {frame_idx} out of bounds, skipping")
                         skipped_count += 1
                         continue
 
-                    # ADDED: Coordinates are already in ORIGINAL system,
-                    # they will be scaled during display automatically
-                    # No conversion needed here!
-
-                    # Add the annotation point (coordinates are in ORIGINAL scale, frame index is loaded)
-                    self.click_points.append((x, y, is_positive, obj_id, loaded_idx))
+                    # Add the annotation point
+                    self.click_points.append((x, y, is_positive, obj_id, frame_idx))
 
                     # Update object names and colors
                     if obj_id not in self.object_names:
@@ -1044,11 +961,11 @@ class SAM2VideoUI:
                             else:
                                 self.object_colors[obj_id] = self._get_next_color()
 
-                    # Track annotated frames (using loaded index)
-                    self.annotated_frames.add(loaded_idx)
-                    
+                    # Track annotated frames
+                    self.annotated_frames.add(frame_idx)
+
                     imported_count += 1
-                    
+
                 except KeyError as e:
                     print(f"Warning: Skipping invalid annotation: {e}")
                     skipped_count += 1
@@ -1069,9 +986,6 @@ class SAM2VideoUI:
 
             if skipped_count > 0:
                 message += f"Skipped annotations: {skipped_count} (invalid frame indices)\n"
-
-            if coordinate_system == "original":
-                message += f"\n[OK] Using original coordinate system (compatible with video scaling)"
 
             message += f"\nTotal annotations: {len(self.click_points)}\n" \
                     f"Objects: {custom_count} custom ({total_objects} total)"
@@ -1131,6 +1045,7 @@ class SAM2VideoUI:
             print(f"Loading segmented video: {segmented_video_path}")
             self.video_path = segmented_video_path
             self.segmented_video_displayed = True
+            self.has_prerendered_masks = True  # Frames have masks baked in
             self.results_output_dir = output_dir
             self.load_video_frames()
 
@@ -1164,6 +1079,9 @@ class SAM2VideoUI:
             self.loaded_from_results = True
             self.update_object_list()
             self.display_current_frame()
+
+            # Load quality metrics if available
+            self._load_quality_metrics(output_dir)
 
             num_objects = len(self.object_names)
             num_annotations = len(self.click_points)
@@ -1223,23 +1141,16 @@ class SAM2VideoUI:
 
     def _get_original_video_for_resegmentation(self):
         """Get original video path for re-segmentation when working with loaded results"""
-        # Check if we have stored path from metadata
+        # Automatically use stored path from metadata if available and valid
         if self.original_video_path_for_resegment and os.path.exists(self.original_video_path_for_resegment):
-            # Confirm with user
-            result = messagebox.askyesno(
-                "Use Stored Original Video?",
-                f"Found original video path in metadata:\n\n"
-                f"{self.original_video_path_for_resegment}\n\n"
-                f"Use this video for re-segmentation?"
-            )
-            if result:
-                return self.original_video_path_for_resegment
+            print(f"Using original video from metadata: {self.original_video_path_for_resegment}")
+            return self.original_video_path_for_resegment
 
-        # Prompt user to locate original video
+        # Only prompt user if no valid path is stored
         messagebox.showinfo(
             "Select Original Video",
             "Re-segmentation requires the original video (not the segmented version).\n\n"
-            "Please select the original video file."
+            "Original video path not found in metadata. Please select the original video file."
         )
 
         original_video_path = filedialog.askopenfilename(
@@ -1248,27 +1159,6 @@ class SAM2VideoUI:
         )
 
         return original_video_path if original_video_path else None
-
-    def _get_original_frame_number(self, loaded_frame_idx):
-        """Convert loaded frame index to original video frame number"""
-        skip_frames = getattr(self, 'video_props', {}).get('skip_frames', 1)
-        return loaded_frame_idx * skip_frames
-
-    def _get_loaded_frame_index(self, original_frame_number):
-        """Convert original video frame number to loaded frame index"""
-        skip_frames = getattr(self, 'video_props', {}).get('skip_frames', 1)
-
-        # Check if this frame was skipped
-        if original_frame_number % skip_frames != 0:
-            return None
-
-        loaded_idx = original_frame_number // skip_frames
-
-        # Check bounds
-        if loaded_idx >= len(self.frames):
-            return None
-
-        return loaded_idx
 
     def _count_custom_objects(self):
         """Count objects with custom names (not default Object_N format)"""
@@ -1432,57 +1322,6 @@ class SAM2VideoUI:
                         f"Imported {imported_count} annotations\n"
                         f"Skipped {skipped_count} annotations with invalid frame indices")
 
-    def _import_annotations_scale_indices(self, annotation_data):
-        """Import annotations, scaling frame indices proportionally"""
-        saved_frames = annotation_data.get("total_frames", 1)
-        current_frames = len(self.frames)
-        scale_factor = current_frames / saved_frames
-        
-        imported_count = 0
-        
-        for annotation in annotation_data["annotations"]:
-            try:
-                original_frame_idx = annotation["frame_index"]
-                # Scale the frame index
-                scaled_frame_idx = int(original_frame_idx * scale_factor)
-                
-                # Clamp to valid range
-                scaled_frame_idx = max(0, min(scaled_frame_idx, current_frames - 1))
-                
-                x = annotation["x"]
-                y = annotation["y"]
-                is_positive = annotation["is_positive"]
-                obj_id = annotation["object_id"]
-                obj_name = annotation.get("object_name", f"Object_{obj_id}")
-                
-                # Add the annotation point with scaled frame index
-                self.click_points.append((x, y, is_positive, obj_id, scaled_frame_idx))
-                
-                # Update object names and colors
-                if obj_id not in self.object_names:
-                    self.object_names[obj_id] = obj_name
-                    if obj_id not in self.object_colors:
-                        if "object_colors" in annotation_data and str(obj_id) in annotation_data["object_colors"]:
-                            self.object_colors[obj_id] = annotation_data["object_colors"][str(obj_id)]
-                        else:
-                            self.object_colors[obj_id] = self._get_next_color()
-                
-                # Track annotated frames
-                self.annotated_frames.add(scaled_frame_idx)
-                imported_count += 1
-                
-            except KeyError:
-                continue
-        
-        # Update UI
-        self.update_points_display()
-        self.update_object_list()
-        self.display_current_frame()
-        
-        messagebox.showinfo("Import Complete", 
-                        f"Imported {imported_count} annotations with scaled frame indices\n"
-                        f"Scale factor: {scale_factor:.3f}")
-
     def _get_next_color(self):
         """Get next available color for a new object"""
         # Find first unused object ID to get its color
@@ -1528,17 +1367,8 @@ class SAM2VideoUI:
         closest_point_idx = None
         
         for point_idx, (px, py, is_pos, obj_id, f_idx) in frame_points:
-            # CRITICAL FIX: Convert stored ORIGINAL coordinates to CURRENT (scaled) coordinates
-            # for distance comparison with the click location
-            if self.current_video_scale != 1.0 and self.original_video_width:
-                scaled_px = px * self.current_video_scale
-                scaled_py = py * self.current_video_scale
-            else:
-                scaled_px = px
-                scaled_py = py
-            
-            # Calculate distance from click to point (both in current/scaled coordinates now)
-            distance = ((x - scaled_px) ** 2 + (y - scaled_py) ** 2) ** 0.5
+            # Calculate distance from click to point
+            distance = ((x - px) ** 2 + (y - py) ** 2) ** 0.5
             
             if distance < min_distance:
                 min_distance = distance
@@ -1638,10 +1468,10 @@ class SAM2VideoUI:
                 (cv2.CAP_GSTREAMER, "GStreamer"),
                 (cv2.CAP_ANY, "Auto")
             ]
-            
+
             self.video_cap = None
             successful_backend = None
-            
+
             for backend, name in backends:
                 try:
                     self.video_cap = cv2.VideoCapture(self.video_path, backend)
@@ -1653,19 +1483,20 @@ class SAM2VideoUI:
                 except Exception as e:
                     print(f"Failed to open with {name} backend: {e}")
                     continue
-            
+
             if not self.video_cap or not self.video_cap.isOpened():
                 raise ValueError(
                     "Could not open video file with any backend.\n"
                     "Please install required codecs or convert video to MP4 format."
                 )
-            
+
             self.status_label.config(text=f"Video loaded using {successful_backend} backend")
-            
+
             self.frames = []
             self.masks = {}
             self.click_points = []
             self.segmented_video_displayed = False  # Reset flag when loading new original video
+            self.has_prerendered_masks = False  # Reset prerendered masks flag
             self.original_video_path_for_resegment = None  # Clear any previously stored original video path
 
             # Reset Flash Mask button state when loading new video
@@ -1676,183 +1507,96 @@ class SAM2VideoUI:
             # Get video properties
             total_frames = int(self.video_cap.get(cv2.CAP_PROP_FRAME_COUNT))
             fps = self.video_cap.get(cv2.CAP_PROP_FPS)
-            original_width = int(self.video_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            original_height = int(self.video_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            width = int(self.video_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(self.video_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
             # Store video properties
-            self.original_video_width = original_width
-            self.original_video_height = original_height
-            self.video_fps = fps if fps > 0 else 30  # Store FPS for playback, default to 30 if invalid
+            self.video_props = {
+                'total_frames': total_frames,
+                'width': width,
+                'height': height,
+                'fps': fps if fps > 0 else 30
+            }
+            self.video_fps = self.video_props['fps']  # Store FPS for playback
 
             # Reset slider zoom to full range for new video
             self.slider_zoom_level.set(1)
 
-            # Calculate current scale factor
-            skip_frames = self.frame_skip_var.get() if self.downsample_frames_var.get() else 1
-            scale_factor = self.video_scale_factor.get() if self.scale_video_var.get() else 1.0
-
-            # Initialize video_props for frame index mapping
-            if not hasattr(self, 'video_props'):
-                self.video_props = {}
-            self.video_props['total_original_frames'] = total_frames  # Before any skipping
-            self.video_props['skip_frames'] = skip_frames
-
-            # ADDED: Store current scale for coordinate conversions
-            self.current_video_scale = scale_factor
-            
-            
-            # Calculate memory usage estimate
-            bytes_per_frame = original_width * original_height * 3  # RGB
-            estimated_memory_mb = (total_frames * bytes_per_frame) / (1024 * 1024)
-            
-            # Check if we need optimization
-            skip_frames = self.frame_skip_var.get() if self.downsample_frames_var.get() else 1
-            scale_factor = self.video_scale_factor.get() if self.scale_video_var.get() else 1.0
-            
-            # Adjust memory estimate based on optimizations
-            optimized_memory_mb = estimated_memory_mb / skip_frames * (scale_factor ** 2)
-            
-            # Show optimization dialog for large videos
-            if estimated_memory_mb > 1000:  # > 1GB
-                settings = self._show_optimization_settings_dialog(
-                    estimated_memory_mb, total_frames, original_width, original_height
-                )
-
-                if settings is None:  # User cancelled
-                    self.video_cap.release()
-                    return
-                elif settings == 'defaults':  # Use default optimizations
-                    skip_frames = 2
-                    scale_factor = 0.5
-                    self.downsample_frames_var.set(True)
-                    self.scale_video_var.set(True)
-                    self.lazy_load_var.set(True)
-                    self.frame_skip_var.set(skip_frames)
-                    self.video_scale_factor.set(scale_factor)
-                else:  # Custom settings (dict)
-                    skip_frames = settings['skip_frames']
-                    scale_factor = settings['scale_factor']
-                    self.downsample_frames_var.set(skip_frames > 1)
-                    self.scale_video_var.set(scale_factor < 1.0)
-                    self.lazy_load_var.set(settings['lazy_load'])
-                    self.frame_skip_var.set(skip_frames)
-                    self.video_scale_factor.set(scale_factor)
-
-                # Recalculate optimized memory
-                optimized_memory_mb = estimated_memory_mb / skip_frames * (scale_factor ** 2)
-            
-            # Handle lazy loading
+            # Handle lazy loading if enabled
             if self.lazy_load_var.get():
-                self._setup_lazy_loading(total_frames, original_width, original_height, fps, skip_frames, scale_factor)
+                self._setup_lazy_loading(total_frames, width, height, self.video_props['fps'])
                 return
-            
-            self.status_label.config(text=f"Loading {total_frames} frames (optimized: {optimized_memory_mb:.1f} MB)...")
+
+            # Eager loading: load all frames
+            self.status_label.config(text=f"Loading {total_frames} frames...")
             self.progress_bar.pack(fill=tk.X, pady=(5, 0))
             self.root.update()
-            
+
             frame_count = 0
-            loaded_count = 0
-            
+
             while True:
                 ret, frame = self.video_cap.read()
                 if not ret:
                     break
-                
-                # Skip frames if enabled
-                if frame_count % skip_frames != 0:
-                    frame_count += 1
-                    continue
-                
-                # Scale frame if enabled
-                if scale_factor < 1.0:
-                    new_width = int(original_width * scale_factor)
-                    new_height = int(original_height * scale_factor)
-                    frame = cv2.resize(frame, (new_width, new_height), interpolation=cv2.INTER_AREA)
-                
+
                 # Convert BGR to RGB
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 self.frames.append(frame_rgb)
-                loaded_count += 1
                 frame_count += 1
-                
+
                 # Update progress
                 progress = (frame_count / total_frames) * 100
                 self.progress_var.set(progress)
-                if loaded_count % 10 == 0:
+                if frame_count % 10 == 0:
                     self.root.update_idletasks()
-            
+
             self.video_cap.release()
             self.progress_bar.pack_forget()
-            
+
             if self.frames:
                 self.current_frame_idx = 0
                 self.frame_slider.config(to=len(self.frames)-1)
                 self.display_current_frame()
-                
-                # Update status with optimization info
-                status_text = f"Video loaded: {len(self.frames)} frames @ {fps:.1f} FPS"
-                if skip_frames > 1:
-                    status_text += f" (skipped {skip_frames-1} frames)"
-                if scale_factor < 1.0:
-                    status_text += f" (scaled {scale_factor:.1f}x)"
-                self.status_label.config(text=status_text)
-                
+
+                self.status_label.config(text=f"Video loaded: {len(self.frames)} frames @ {self.video_fps:.1f} FPS")
+
                 self.update_object_list()
             else:
                 raise ValueError("No frames could be extracted from video")
-                
+
         except Exception as e:
             self.progress_bar.pack_forget()
             raise e
 
-    def _setup_lazy_loading(self, total_frames, original_width, original_height, fps, skip_frames, scale_factor):
+    def _setup_lazy_loading(self, total_frames, width, height, fps):
         """Setup lazy loading for very large videos"""
         try:
             # Keep video capture open for lazy loading
             self.video_cap_lazy = cv2.VideoCapture(self.video_path)
             if not self.video_cap_lazy.isOpened():
                 raise ValueError("Could not open video file for lazy loading")
-            
-            # ADDED: Store original dimensions
-            self.original_video_width = original_width
-            self.original_video_height = original_height
-            self.current_video_scale = scale_factor
-            
-            
+
             # Store video properties for lazy loading
             self.video_props = {
                 'total_frames': total_frames,
-                'total_original_frames': total_frames,  # Original frame count before skipping
-                'original_width': original_width,
-                'original_height': original_height,
-                'fps': fps,
-                'skip_frames': skip_frames,
-                'scale_factor': scale_factor
+                'width': width,
+                'height': height,
+                'fps': fps
             }
-            
-            # Calculate how many frames we'll actually load
-            frames_to_load = total_frames // skip_frames
-            if total_frames % skip_frames != 0:
-                frames_to_load += 1
-            
-            # Initialize frame cache (empty frames list)
-            self.frames = [None] * frames_to_load
+
+            # Initialize frame cache (empty frames list - all frames, no skipping)
+            self.frames = [None] * total_frames
             self.frame_cache = {}  # Cache for loaded frames
-            
+
             # Initialize UI
             self.current_frame_idx = 0
-            self.frame_slider.config(to=frames_to_load-1)
+            self.frame_slider.config(to=total_frames-1)
             self.display_current_frame()
-            
-            status_text = f"Lazy loading: {frames_to_load} frames @ {fps:.1f} FPS"
-            if skip_frames > 1:
-                status_text += f" (skipped {skip_frames-1} frames)"
-            if scale_factor < 1.0:
-                status_text += f" (scaled {scale_factor:.1f}x)"
-            self.status_label.config(text=status_text)
-            
+
+            self.status_label.config(text=f"Lazy loading: {total_frames} frames @ {fps:.1f} FPS")
+
             self.update_object_list()
-            
+
         except Exception as e:
             if self.video_cap_lazy:
                 self.video_cap_lazy.release()
@@ -1862,40 +1606,31 @@ class SAM2VideoUI:
         """Load a specific frame on demand"""
         if frame_idx in self.frame_cache:
             return self.frame_cache[frame_idx]
-        
+
         if not self.video_cap_lazy or not hasattr(self, 'video_props'):
             return None
-        
+
         try:
-            # Calculate original frame index
-            original_frame_idx = frame_idx * self.video_props['skip_frames']
-            
             # Seek to the frame
-            self.video_cap_lazy.set(cv2.CAP_PROP_POS_FRAMES, original_frame_idx)
+            self.video_cap_lazy.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
             ret, frame = self.video_cap_lazy.read()
-            
+
             if not ret:
                 return None
-            
-            # Scale frame if enabled
-            if self.video_props['scale_factor'] < 1.0:
-                new_width = int(self.video_props['original_width'] * self.video_props['scale_factor'])
-                new_height = int(self.video_props['original_height'] * self.video_props['scale_factor'])
-                frame = cv2.resize(frame, (new_width, new_height), interpolation=cv2.INTER_AREA)
-            
+
             # Convert BGR to RGB
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            
+
             # Cache the frame (limit cache size to prevent memory issues)
             if len(self.frame_cache) > 50:  # Keep only last 50 frames in cache
                 # Remove oldest frames
                 oldest_keys = sorted(self.frame_cache.keys())[:10]
                 for key in oldest_keys:
                     del self.frame_cache[key]
-            
+
             self.frame_cache[frame_idx] = frame_rgb
             return frame_rgb
-            
+
         except Exception as e:
             print(f"Error loading frame {frame_idx}: {e}")
             return None
@@ -1908,33 +1643,28 @@ class SAM2VideoUI:
             tuple: (height, width) or None if unavailable
 
         Priority order:
-        1. From video_props (most reliable, set during lazy loading)
-        2. From original_video_width/height instance variables
-        3. From loaded frame (eager mode or cached frame)
-        4. From lazy load (load first frame on demand)
-        5. From video_cap metadata (fallback)
+        1. From video_props (most reliable)
+        2. From loaded frame (eager mode or cached frame)
+        3. From lazy load (load first frame on demand)
+        4. From video_cap metadata (fallback)
         """
-        # 1. Check video_props (lazy mode)
+        # 1. Check video_props
         if hasattr(self, 'video_props') and self.video_props:
-            if 'original_height' in self.video_props and 'original_width' in self.video_props:
-                return (self.video_props['original_height'], self.video_props['original_width'])
+            if 'height' in self.video_props and 'width' in self.video_props:
+                return (self.video_props['height'], self.video_props['width'])
 
-        # 2. Check instance variables
-        if self.original_video_height is not None and self.original_video_width is not None:
-            return (self.original_video_height, self.original_video_width)
-
-        # 3. Check if we have frames loaded (eager mode)
+        # 2. Check if we have frames loaded (eager mode)
         if self.frames and len(self.frames) > 0:
             if self.frames[0] is not None:  # Not None in eager mode
                 return self.frames[0].shape[:2]
 
-            # 4. Lazy mode: Try to load first frame
+            # 3. Lazy mode: Try to load first frame
             if hasattr(self, '_load_frame_lazy'):
                 first_frame = self._load_frame_lazy(0)
                 if first_frame is not None:
                     return first_frame.shape[:2]
 
-        # 5. Fallback to video capture metadata
+        # 4. Fallback to video capture metadata
         video_cap = None
         if hasattr(self, 'video_cap_lazy') and self.video_cap_lazy:
             video_cap = self.video_cap_lazy
@@ -2106,9 +1836,146 @@ class SAM2VideoUI:
         # Update visualization
         self._update_quality_visualizations()
 
+    def _render_quality_backgrounds(self):
+        """
+        Pre-render background colorbars as images (called once when metrics loaded).
+        This is much faster than creating hundreds of rectangles on every update.
+        """
+        if not self.change_viz_canvas or not self.bg_viz_canvas:
+            return False
+
+        if not self.inter_frame_changes or not self.background_ratios:
+            return False
+
+        # Get canvas dimensions
+        canvas_width = self.change_viz_canvas.winfo_width()
+        canvas_height = 30
+
+        if canvas_width <= 1:  # Canvas not yet rendered
+            self.root.update()
+            canvas_width = self.change_viz_canvas.winfo_width()
+
+        if canvas_width <= 1:
+            return False
+
+        num_frames = len(self.inter_frame_changes)
+        if num_frames == 0:
+            return False
+
+        try:
+            from PIL import Image, ImageDraw
+
+            # Create image for inter-frame changes
+            change_img = Image.new('RGB', (canvas_width, canvas_height))
+            change_draw = ImageDraw.Draw(change_img)
+
+            pixels_per_frame = canvas_width / num_frames
+
+            for i, change_ratio in enumerate(self.inter_frame_changes):
+                x0 = int(i * pixels_per_frame)
+                x1 = int((i + 1) * pixels_per_frame)
+
+                # Color: white (no change) to red (high change)
+                intensity = int(255 * (1 - change_ratio))
+                color = (255, intensity, intensity)
+
+                change_draw.rectangle([x0, 0, x1, canvas_height], fill=color)
+
+            self.change_viz_image = ImageTk.PhotoImage(change_img)
+
+            # Create image for background ratios
+            bg_img = Image.new('RGB', (canvas_width, canvas_height))
+            bg_draw = ImageDraw.Draw(bg_img)
+
+            for i, bg_ratio in enumerate(self.background_ratios):
+                x0 = int(i * pixels_per_frame)
+                x1 = int((i + 1) * pixels_per_frame)
+
+                # Color: green (low bg) to yellow (high bg)
+                if bg_ratio < 0.5:
+                    g = 255
+                    r = int(510 * bg_ratio)
+                else:
+                    r = 255
+                    g = int(255 * (2 - 2 * bg_ratio))
+
+                color = (r, g, 0)
+                bg_draw.rectangle([x0, 0, x1, canvas_height], fill=color)
+
+            self.bg_viz_image = ImageTk.PhotoImage(bg_img)
+
+            self.quality_bg_rendered = True
+            print("Quality visualization backgrounds cached successfully")
+            return True
+
+        except Exception as e:
+            print(f"WARNING: Failed to render quality backgrounds: {e}")
+            return False
+
+    def _update_quality_indicator(self):
+        """
+        Update only the blue frame indicator line (fast operation).
+        Should be called on every frame change.
+        """
+        if not self.change_viz_canvas or not self.bg_viz_canvas:
+            return
+
+        if not self.quality_bg_rendered:
+            # Backgrounds not cached yet, do full render
+            self._update_quality_visualizations()
+            return
+
+        # Get canvas dimensions
+        canvas_width = self.change_viz_canvas.winfo_width()
+        canvas_height = 30
+
+        if canvas_width <= 1:
+            return
+
+        num_frames = len(self.inter_frame_changes)
+        if num_frames == 0:
+            return
+
+        # Clear and redraw backgrounds
+        self.change_viz_canvas.delete("all")
+        self.bg_viz_canvas.delete("all")
+
+        # Draw cached background images
+        self.change_viz_canvas.create_image(0, 0, anchor='nw', image=self.change_viz_image)
+        self.bg_viz_canvas.create_image(0, 0, anchor='nw', image=self.bg_viz_image)
+
+        # Draw current frame indicator
+        if hasattr(self, 'current_frame_idx'):
+            pixels_per_frame = canvas_width / num_frames
+            x_pos = self.current_frame_idx * pixels_per_frame
+            self.change_viz_canvas.create_line(
+                x_pos, 0, x_pos, canvas_height,
+                fill='blue', width=2
+            )
+            self.bg_viz_canvas.create_line(
+                x_pos, 0, x_pos, canvas_height,
+                fill='blue', width=2
+            )
+
     def _update_quality_visualizations(self):
         """
-        Render inter-frame changes and background ratios on canvas.
+        Full update of quality visualizations (render backgrounds + indicator).
+        Called when metrics are first loaded or calculated.
+        """
+        # Invalidate cache
+        self.quality_bg_rendered = False
+
+        # Render backgrounds
+        if self._render_quality_backgrounds():
+            # Update indicator
+            self._update_quality_indicator()
+        else:
+            # Fallback to old method if caching fails
+            self._update_quality_visualizations_fallback()
+
+    def _update_quality_visualizations_fallback(self):
+        """
+        Fallback method using canvas rectangles (slower but always works).
         """
         if not self.change_viz_canvas or not self.bg_viz_canvas:
             return
@@ -2185,6 +2052,53 @@ class SAM2VideoUI:
                 fill='blue', width=2
             )
 
+    def _save_quality_metrics(self, output_dir):
+        """Save quality metrics to quality_metrics.npz in output directory"""
+        if not self.inter_frame_changes or not self.background_ratios:
+            print("No quality metrics to save")
+            return False
+
+        try:
+            import numpy as np
+            metrics_path = os.path.join(output_dir, "quality_metrics.npz")
+
+            np.savez_compressed(
+                metrics_path,
+                inter_frame_changes=np.array(self.inter_frame_changes),
+                background_ratios=np.array(self.background_ratios),
+                frame_count=len(self.inter_frame_changes)
+            )
+
+            print(f"Saved quality metrics to {metrics_path}")
+            return True
+        except Exception as e:
+            print(f"WARNING: Failed to save quality metrics: {e}")
+            return False
+
+    def _load_quality_metrics(self, output_dir):
+        """Load quality metrics from quality_metrics.npz if available"""
+        metrics_path = os.path.join(output_dir, "quality_metrics.npz")
+
+        if not os.path.exists(metrics_path):
+            print("No quality metrics file found (OK for older results)")
+            return False
+
+        try:
+            import numpy as np
+            data = np.load(metrics_path)
+
+            self.inter_frame_changes = data['inter_frame_changes'].tolist()
+            self.background_ratios = data['background_ratios'].tolist()
+
+            print(f"Loaded quality metrics: {len(self.inter_frame_changes)} values")
+            self._update_quality_visualizations()  # Refresh color bars
+            return True
+        except Exception as e:
+            print(f"WARNING: Failed to load quality metrics: {e}")
+            self.inter_frame_changes = []
+            self.background_ratios = []
+            return False
+
     def _on_viz_canvas_click(self, event):
         """
         Handle clicks on visualization canvas to jump to frame.
@@ -2259,66 +2173,72 @@ class SAM2VideoUI:
         
         # Apply mask overlay if enabled and masks exist
         if self.show_masks_var.get() and self.current_frame_idx in self.masks:
-            frame_masks = self.masks[self.current_frame_idx]
+            # OPTIMIZATION: If displaying pre-rendered segmented video, skip mask loading
+            # The frames already have masks baked in from the segmented video
+            if self.has_prerendered_masks:
+                # Frames already contain mask overlay - nothing to do
+                # display_frame already has masks from segmented video
+                pass
+            else:
+                # Original video mode: load masks from disk and overlay
+                frame_masks = self.masks[self.current_frame_idx]
 
-            
+                # Collect all mask data first (to avoid cumulative blending bug)
+                mask_data_list = []
+                for obj_id in frame_masks.keys():
+                    # Load mask from disk (memory optimization)
+                    mask = self._load_mask(self.current_frame_idx, obj_id)
+                    if mask is None:
+                        continue
+                    # If flash is in progress, only show the flashing object
+                    if self.flash_in_progress and obj_id != self.flash_obj_id:
+                        continue
 
-            # Collect all mask data first (to avoid cumulative blending bug)
-            mask_data_list = []
-            for obj_id in frame_masks.keys():
-                # Load mask from disk (memory optimization)
-                mask = self._load_mask(self.current_frame_idx, obj_id)
-                if mask is None:
-                    continue
-                # If flash is in progress, only show the flashing object
-                if self.flash_in_progress and obj_id != self.flash_obj_id:
-                    continue
+                    if len(mask.shape) == 2:  # Single channel mask
 
-                if len(mask.shape) == 2:  # Single channel mask
-                    
-                    # Get object color
-                    obj_color = self.object_colors.get(obj_id, [255, 255, 255])
+                        # Get object color
+                        obj_color = self.object_colors.get(obj_id, [255, 255, 255])
 
-                    # Check if mask needs resizing
-                    if mask.shape != (display_frame.shape[0], display_frame.shape[1]):
-                        print(f"  WARNING: Mask size {mask.shape} doesn't match frame size "
-                              f"({display_frame.shape[0]}, {display_frame.shape[1]})")
-                        print(f"  Resizing mask...")
-                        from PIL import Image as PILImage
-                        mask_pil = PILImage.fromarray(mask)
-                        mask_pil = mask_pil.resize((display_frame.shape[1], display_frame.shape[0]), PILImage.NEAREST)
-                        mask = np.array(mask_pil)
-                        print(f"  Resized mask to: {mask.shape}")
+                        # Check if mask needs resizing
+                        if mask.shape != (display_frame.shape[0], display_frame.shape[1]):
+                            print(f"  WARNING: Mask size {mask.shape} doesn't match frame size "
+                                  f"({display_frame.shape[0]}, {display_frame.shape[1]})")
+                            print(f"  Resizing mask...")
+                            from PIL import Image as PILImage
+                            mask_pil = PILImage.fromarray(mask)
+                            mask_pil = mask_pil.resize((display_frame.shape[1], display_frame.shape[0]), PILImage.NEAREST)
+                            mask = np.array(mask_pil)
+                            print(f"  Resized mask to: {mask.shape}")
 
-                    # Convert mask to boolean
-                    mask_bool = mask > 0
+                        # Convert mask to boolean
+                        mask_bool = mask > 0
 
-                    # If flashing, override color to white
-                    if self.flash_in_progress and obj_id == self.flash_obj_id and self.flash_white_on:
-                        obj_color = [255, 255, 255]
+                        # If flashing, override color to white
+                        if self.flash_in_progress and obj_id == self.flash_obj_id and self.flash_white_on:
+                            obj_color = [255, 255, 255]
 
-                    mask_data_list.append((mask_bool, obj_color, obj_id))
+                        mask_data_list.append((mask_bool, obj_color, obj_id))
 
-            # FIXED: Single-pass blending to avoid cumulative darkening
-            if mask_data_list:
-                height, width = display_frame.shape[:2]
-                combined_overlay = np.zeros((height, width, 3), dtype=np.float32)
-                overlap_count = np.zeros((height, width), dtype=np.int32)
-                
-                for mask_bool, obj_color, obj_id in mask_data_list:
-                    # Add color to overlapping regions (accumulate for averaging)
-                    combined_overlay[mask_bool] += obj_color
-                    overlap_count[mask_bool] += 1
+                # FIXED: Single-pass blending to avoid cumulative darkening
+                if mask_data_list:
+                    height, width = display_frame.shape[:2]
+                    combined_overlay = np.zeros((height, width, 3), dtype=np.float32)
+                    overlap_count = np.zeros((height, width), dtype=np.int32)
 
-                # Average colors where masks overlap
-                mask_pixels = overlap_count > 0
-                combined_overlay[mask_pixels] /= overlap_count[mask_pixels, np.newaxis]
-                combined_overlay = combined_overlay.astype(np.uint8)
+                    for mask_bool, obj_color, obj_id in mask_data_list:
+                        # Add color to overlapping regions (accumulate for averaging)
+                        combined_overlay[mask_bool] += obj_color
+                        overlap_count[mask_bool] += 1
 
-                # Single blend operation - fixes cumulative darkening bug
-                alpha = self.mask_opacity_var.get() if hasattr(self, 'mask_opacity_var') else 0.4
-                
-                display_frame = cv2.addWeighted(display_frame, 1-alpha, combined_overlay, alpha, 0)
+                    # Average colors where masks overlap
+                    mask_pixels = overlap_count > 0
+                    combined_overlay[mask_pixels] /= overlap_count[mask_pixels, np.newaxis]
+                    combined_overlay = combined_overlay.astype(np.uint8)
+
+                    # Single blend operation - fixes cumulative darkening bug
+                    alpha = self.mask_opacity_var.get() if hasattr(self, 'mask_opacity_var') else 0.4
+
+                    display_frame = cv2.addWeighted(display_frame, 1-alpha, combined_overlay, alpha, 0)
         
         # Draw click points only for the current frame
         for i, (x, y, is_positive, obj_id, frame_idx) in enumerate(self.click_points):
@@ -2326,20 +2246,12 @@ class SAM2VideoUI:
                 continue
             # Only draw points for current object or if showing all
             if obj_id == self.current_object_id or not hasattr(self, 'current_object_id'):
-                # ADDED: Convert from ORIGINAL coordinates to CURRENT frame coordinates
-                if self.current_video_scale != 1.0 and self.original_video_width:
-                    scaled_x = x * self.current_video_scale
-                    scaled_y = y * self.current_video_scale
-                else:
-                    scaled_x = x
-                    scaled_y = y
-                
                 obj_color = self.object_colors.get(obj_id, [255, 255, 255])
                 color = tuple(obj_color) if is_positive else (255, 0, 0)
 
-                # Draw circle using SCALED coordinates
-                cv2.circle(display_frame, (int(scaled_x), int(scaled_y)), 8, color, -1)
-                cv2.circle(display_frame, (int(scaled_x), int(scaled_y)), 10, (255, 255, 255), 2)
+                # Draw circle
+                cv2.circle(display_frame, (int(x), int(y)), 8, color, -1)
+                cv2.circle(display_frame, (int(x), int(y)), 10, (255, 255, 255), 2)
 
                 # Draw symbol using lines instead of text for perfect alignment
                 line_length = 6
@@ -2350,25 +2262,25 @@ class SAM2VideoUI:
                     # Draw + (vertical and horizontal lines)
                     # Vertical line
                     cv2.line(display_frame,
-                            (int(scaled_x), int(scaled_y - line_length)),
-                            (int(scaled_x), int(scaled_y + line_length)),
+                            (int(x), int(y - line_length)),
+                            (int(x), int(y + line_length)),
                             white, line_thickness)
                     # Horizontal line
                     cv2.line(display_frame,
-                            (int(scaled_x - line_length), int(scaled_y)),
-                            (int(scaled_x + line_length), int(scaled_y)),
+                            (int(x - line_length), int(y)),
+                            (int(x + line_length), int(y)),
                             white, line_thickness)
                 else:
                     # Draw - (horizontal line only)
                     cv2.line(display_frame,
-                            (int(scaled_x - line_length), int(scaled_y)),
-                            (int(scaled_x + line_length), int(scaled_y)),
+                            (int(x - line_length), int(y)),
+                            (int(x + line_length), int(y)),
                             white, line_thickness)
                 
                 # Draw object name
                 obj_name = self.object_names.get(obj_id, f"Obj{obj_id}")[:8]
-                cv2.putText(display_frame, obj_name, (int(scaled_x)+15, int(scaled_y)-10), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 2)
+                cv2.putText(display_frame, obj_name, (int(x)+15, int(y)-10), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2)
         
         # Convert to PIL and display
         pil_image = Image.fromarray(display_frame)
@@ -2409,8 +2321,9 @@ class SAM2VideoUI:
             frame_text += " (annotated)"
         self.frame_label.config(text=frame_text)
 
-        # Update quality visualization indicators
-        self._update_quality_visualizations()
+        # Update quality visualization indicators (fast indicator update only)
+        if self.inter_frame_changes and self.background_ratios:
+            self._update_quality_indicator()
 
     def on_canvas_resize(self, event):
         """Handle canvas resize events with debouncing"""
@@ -2512,17 +2425,8 @@ class SAM2VideoUI:
             # Ensure coordinates are within current frame bounds
             img_height, img_width = self.current_frame.shape[:2]
             if 0 <= img_x < img_width and 0 <= img_y < img_height:
-                # ADDED: Convert to ORIGINAL video coordinates before storing
-                # This ensures annotations work regardless of current scaling
-                if self.current_video_scale != 1.0 and self.original_video_width:
-                    original_x = img_x / self.current_video_scale
-                    original_y = img_y / self.current_video_scale
-                else:
-                    original_x = img_x
-                    original_y = img_y
-                
-                # Store frame-aware point with ORIGINAL coordinates
-                self.click_points.append((original_x, original_y, is_positive, 
+                # Store frame-aware point
+                self.click_points.append((img_x, img_y, is_positive,
                                         self.current_object_id, self.current_frame_idx))
                 
                 # Track annotated frames in multi-frame annotation mode
@@ -2813,36 +2717,95 @@ class SAM2VideoUI:
             zoom_level = self.slider_zoom_level.get()
 
             # In zoomed mode, update window center as user navigates
-            if zoom_level > 1:
+            # ONLY apply delay when user is manually dragging the slider
+            if zoom_level > 1 and self.slider_manual_change:
                 total_frames = len(self.frames)
                 window_size = max(100, total_frames // zoom_level)
                 half_window = window_size // 2
 
-                # Check if we're near window boundaries, shift window if needed
+                # Check if we're near window boundaries, schedule delayed window shift if needed
                 current_slider_min = int(self.frame_slider.cget('from'))
                 current_slider_max = int(self.frame_slider.cget('to'))
 
-                # If navigating near edges, recenter window
+                # If navigating near edges, schedule delayed recenter
                 if (new_frame_idx - current_slider_min < window_size // 10 or
                     current_slider_max - new_frame_idx < window_size // 10):
-                    self.slider_window_center = new_frame_idx
-                    window_start = max(0, new_frame_idx - half_window)
-                    window_end = min(total_frames - 1, new_frame_idx + half_window)
 
-                    # Adjust window at boundaries
-                    if window_end - window_start < window_size:
-                        if window_start == 0:
-                            window_end = min(total_frames - 1, window_size)
-                        elif window_end == total_frames - 1:
-                            window_start = max(0, total_frames - window_size)
+                    # Cancel any pending jump
+                    if self.zoom_jump_scheduled:
+                        self.root.after_cancel(self.zoom_jump_scheduled)
 
-                    # Update slider range
-                    self.frame_slider.config(from_=window_start, to=window_end)
-                    self.zoom_info_label.config(text=f"(Frames {window_start}-{window_end})")
+                    # Schedule jump after 500ms delay
+                    self.zoom_jump_scheduled = self.root.after(30,
+                        lambda: self._execute_zoom_jump(new_frame_idx, window_size, total_frames))
 
             self.current_frame_idx = new_frame_idx
             self.display_current_frame()
-            
+
+    def _execute_zoom_jump(self, new_frame_idx, window_size, total_frames):
+        """Execute delayed zoom window jump with notification"""
+        half_window = window_size // 2
+
+        # Get old range for notification
+        old_min = int(self.frame_slider.cget('from'))
+        old_max = int(self.frame_slider.cget('to'))
+
+        # Recenter window on new_frame_idx
+        self.slider_window_center = new_frame_idx
+        window_start = max(0, new_frame_idx - half_window)
+        window_end = min(total_frames - 1, new_frame_idx + half_window)
+
+        # Adjust window at boundaries
+        if window_end - window_start < window_size:
+            if window_start == 0:
+                window_end = min(total_frames - 1, window_size)
+            elif window_end == total_frames - 1:
+                window_start = max(0, total_frames - window_size)
+
+        # Update slider range
+        self.frame_slider.config(from_=window_start, to=window_end)
+
+        # Update zoom info label
+        zoom_level = self.slider_zoom_level.get()
+        self.zoom_info_label.config(text=f"(Frames {window_start}-{window_end})")
+
+        # Flash notification
+        # self._flash_zoom_jump_notification(old_min, old_max, window_start, window_end)
+
+        self.zoom_jump_scheduled = None
+
+    def _flash_zoom_jump_notification(self, old_min, old_max, new_min, new_max):
+        """Flash status label to notify user of zoom window jump"""
+        import time
+
+        # Throttle notifications (max 1 per second)
+        current_time = time.time()
+        if current_time - self.last_jump_notification < 1.0:
+            return
+        self.last_jump_notification = current_time
+
+        # Show jump notification
+        old_text = self.status_label.cget('text')
+        old_bg = self.status_label.cget('background')
+
+        jump_msg = f"Zoom window shifted: [{old_min}-{old_max}] → [{new_min}-{new_max}]"
+
+        # Flash 3 times (similar to flash_mask feature)
+        def flash_cycle(count):
+            if count <= 0:
+                self.status_label.config(text=old_text, background=old_bg)
+                return
+
+            # Toggle between highlight and normal
+            if count % 2 == 1:
+                self.status_label.config(text=jump_msg, background='yellow')
+            else:
+                self.status_label.config(text=jump_msg, background=old_bg)
+
+            self.root.after(300, lambda: flash_cycle(count - 1))
+
+        flash_cycle(6)  # 3 full cycles (on/off)
+
     def toggle_play(self):
         """Toggle video playback"""
         if not self.frames:
@@ -2973,113 +2936,6 @@ class SAM2VideoUI:
         dialog.protocol("WM_DELETE_WINDOW", on_button3)
 
         # Wait for dialog to close
-        self.root.wait_window(dialog)
-
-        return result[0]
-
-    def _show_optimization_settings_dialog(self, estimated_memory_mb, total_frames, width, height):
-        """
-        Show dialog for large video optimization settings
-
-        Returns:
-            None: User cancelled
-            'defaults': Use default optimization settings
-            dict: Custom settings with keys: skip_frames, scale_factor, lazy_load
-        """
-        dialog = tk.Toplevel(self.root)
-        dialog.title("Large Video Optimization Settings")
-        dialog.geometry("550x550")
-        dialog.configure(bg='#2b2b2b')
-        dialog.transient(self.root)
-        dialog.grab_set()
-        dialog.resizable(False, False)
-
-        result = [None]
-
-        # Main content frame
-        content_frame = ttk.Frame(dialog, padding=20)
-        content_frame.pack(fill=tk.BOTH, expand=True)
-
-        # Title and info
-        ttk.Label(content_frame, text="Large Video Detected",
-                 font=('Arial', 14, 'bold')).pack(pady=(0, 10))
-
-        info_text = (f"Video: {total_frames} frames at {width}x{height}\n"
-                    f"Estimated memory usage: {estimated_memory_mb:.1f} MB\n\n"
-                    f"For large videos, optimization settings can reduce memory usage.")
-        ttk.Label(content_frame, text=info_text, justify=tk.LEFT).pack(pady=(0, 15))
-
-        # Settings frame
-        settings_frame = ttk.LabelFrame(content_frame, text="Optimization Settings", padding=10)
-        settings_frame.pack(fill=tk.X, pady=(0, 15))
-
-        # Temporary variables for dialog
-        skip_var = tk.BooleanVar(value=False)
-        skip_frames_var = tk.IntVar(value=2)
-        scale_var = tk.BooleanVar(value=False)
-        scale_factor_var = tk.DoubleVar(value=0.5)
-
-        # Skip frames option
-        skip_frame = ttk.Frame(settings_frame)
-        skip_frame.pack(fill=tk.X, pady=(0, 5))
-        ttk.Checkbutton(skip_frame, text="Skip frames:", variable=skip_var).pack(side=tk.LEFT)
-        tk.Spinbox(skip_frame, from_=2, to=10, textvariable=skip_frames_var, width=5,
-                  bg='#404040', fg='white', insertbackground='white').pack(side=tk.LEFT, padx=(5, 5))
-        ttk.Label(skip_frame, text="(load every Nth frame)").pack(side=tk.LEFT)
-
-        # Scale video option
-        scale_frame = ttk.Frame(settings_frame)
-        scale_frame.pack(fill=tk.X, pady=(0, 5))
-        ttk.Checkbutton(scale_frame, text="Scale video:", variable=scale_var).pack(side=tk.LEFT)
-        tk.Spinbox(scale_frame, from_=0.1, to=1.0, increment=0.1, textvariable=scale_factor_var,
-                  width=5, bg='#404040', fg='white', insertbackground='white').pack(side=tk.LEFT, padx=(5, 5))
-        ttk.Label(scale_frame, text="(reduce resolution)").pack(side=tk.LEFT)
-
-        # Button callbacks
-        # Note: Lazy loading is always enabled for large videos to reduce memory usage
-        def on_use_defaults():
-            result[0] = 'defaults'
-            dialog.destroy()
-
-        def on_custom_settings():
-            result[0] = {
-                'skip_frames': skip_frames_var.get() if skip_var.get() else 1,
-                'scale_factor': scale_factor_var.get() if scale_var.get() else 1.0,
-                'lazy_load': True  # Always enabled for large videos
-            }
-            dialog.destroy()
-
-        def on_no_optimization():
-            result[0] = {
-                'skip_frames': 1,
-                'scale_factor': 1.0,
-                'lazy_load': True  # Always enabled for large videos
-            }
-            dialog.destroy()
-
-        def on_cancel():
-            result[0] = None
-            dialog.destroy()
-
-        # Button frame
-        button_frame = ttk.Frame(content_frame)
-
-        ttk.Label(content_frame, text="Choose an option:", font=('Arial', 10, 'bold')).pack(pady=(10, 5))
-
-        button_frame.pack(fill=tk.X)
-
-        ttk.Button(button_frame, text="No Optimization (Full Quality)",
-                  command=on_no_optimization, width=45).pack(pady=3)
-        ttk.Button(button_frame, text="Use Default Optimization (Skip: 2, Scale: 0.5)",
-                  command=on_use_defaults, width=45).pack(pady=3)
-        ttk.Button(button_frame, text="Use Custom Settings (as configured above)",
-                  command=on_custom_settings, width=45).pack(pady=3)
-        ttk.Button(button_frame, text="Cancel", command=on_cancel, width=45).pack(pady=3)
-
-        # Handle window close
-        dialog.protocol("WM_DELETE_WINDOW", on_cancel)
-
-        # Wait for dialog
         self.root.wait_window(dialog)
 
         return result[0]
@@ -3615,7 +3471,7 @@ class SAM2VideoUI:
             return
 
         try:
-            self.status_label.config(text="Preparing frames for SAM2...")
+            self.status_label.config(text="Preparing frames for SAM model...")
 
             self.progress_bar.pack(fill=tk.X, pady=(5, 0))
             self.progress_var.set(0)
@@ -3628,15 +3484,10 @@ class SAM2VideoUI:
                 if not segmentation_video_path:
                     return  # User cancelled
 
-            # Determine which frames to process based on processing range
-            # IMPORTANT: For segmentation, we need to use ORIGINAL frame numbers, not loaded frame indices
-            # Get total original frames from video properties
-            total_original_frames = self.video_props.get('total_original_frames', len(self.frames)) if hasattr(self, 'video_props') else len(self.frames)
-
-            # Process ALL original frames (not just loaded frames)
-            # IMPORTANT: Process EVERY frame, ignore skip_frames (that's only for UI display)
-            frames_to_process = list(range(0, total_original_frames))
-            print(f"Processing full video: {len(frames_to_process)} frames (every frame at original resolution)")
+            # Process all frames
+            total_frames = len(self.frames)
+            frames_to_process = list(range(0, total_frames))
+            print(f"Processing full video: {len(frames_to_process)} frames at original resolution")
 
             # Get or reuse session-based cache directory
             # Reuses cache if same video within session, creates new if different video
@@ -3654,18 +3505,9 @@ class SAM2VideoUI:
                     self.status_label.config(text="Using cached frames...")
                     self.progress_var.set(30)
                 else:
-                    # Extract frames from original video at original resolution
-                    # Ignore any UI optimization settings (frame skipping, downsampling)
-                    # For segmentation, we need full quality regardless of how video was loaded in UI
+                    # Extract frames from original video
                     source_video = segmentation_video_path or self.video_path
-                    print(f"Extracting frames at original resolution from: {source_video}")
-
-                    # Show note if video was loaded with optimizations
-                    if hasattr(self, 'video_props'):
-                        skip_frames_ui = self.video_props.get('skip_frames', 1)
-                        if skip_frames_ui > 1 or self.current_video_scale != 1.0:
-                            print(f"  Note: Video loaded with optimizations (skip={skip_frames_ui}, scale={self.current_video_scale})")
-                            print(f"        But SAM will process at original resolution")
+                    print(f"Extracting frames from: {source_video}")
 
                     cap = cv2.VideoCapture(source_video)
 
@@ -3752,16 +3594,13 @@ class SAM2VideoUI:
 
                 # Group click points by frame and by object ID
                 points_by_frame_and_object = {}
-                for x, y, is_pos, obj_id, loaded_frame_idx in self.click_points:
-                    # Convert loaded frame index to original frame number
-                    original_frame_num = self._get_original_frame_number(loaded_frame_idx)
-
+                for x, y, is_pos, obj_id, frame_idx in self.click_points:
                     # Check if this frame is in our processing list
-                    if original_frame_num not in frames_to_process:
+                    if frame_idx not in frames_to_process:
                         continue  # Skip points outside the processing range
 
                     # Get sequential index in frames_to_process (for SAM input)
-                    sequential_frame_idx = frames_to_process.index(original_frame_num)
+                    sequential_frame_idx = frames_to_process.index(frame_idx)
                     
                     # Handle coordinate scaling for re-segmentation
                     if coord_scale_x != 1.0 or coord_scale_y != 1.0:
@@ -3882,8 +3721,8 @@ class SAM2VideoUI:
                 
                 # Process entire video
                 self.status_label.config(text="Propagating through entire video...")
-                # Use total_original_frames (not len(self.frames) which is only loaded frames for UI)
-                frames_to_process = list(range(0, total_original_frames))
+                # Process all frames
+                frames_to_process = list(range(0, len(self.frames)))
                 
                 # Store the processing range for later use
                 self.processing_range = frames_to_process
@@ -3958,8 +3797,8 @@ class SAM2VideoUI:
                         self._monitor_memory(out_frame_idx, len(frames_to_process))
 
                         processed_frames += 1
-                        progress = 45 + (processed_frames / max(1, len(frames_to_process))) * 55
-                        self.progress_var.set(min(progress, 100))
+                        progress = (processed_frames / max(1, len(frames_to_process))) * 50
+                        self.progress_var.set(min(progress, 50))
                         
                         if processed_frames % 10 == 0:
                             self.status_label.config(text=f"Processing frame {processed_frames}/{len(frames_to_process)}")
@@ -4065,7 +3904,7 @@ class SAM2VideoUI:
                     import json
                     json.dump({
                         'video_path': self.video_path,
-                        'total_frames': total_original_frames,
+                        'total_frames': len(self.frames),
                         'objects': {obj_id: self.object_names.get(obj_id, f"Object {obj_id}")
                                    for obj_id in self.object_names.keys()},
                         'masks': mask_metadata
@@ -4119,28 +3958,27 @@ class SAM2VideoUI:
                     # Export segmented video and metadata
                     try:
                         # Prepare annotations data (matching process_annotations.py format)
-                        # Convert loaded frame indices to original frame numbers
                         annotations_data = {
                             "video_path": self.video_path,
-                            "total_frames": total_original_frames,
+                            "total_frames": len(self.frames),
                             "object_names": self.object_names,
                             "object_colors": self.object_colors,
                             "annotations": [
                                 {
-                                    "frame_index": self._get_original_frame_number(loaded_frame_idx),
+                                    "frame_index": frame_idx,
                                     "object_id": obj_id,
                                     "x": x,
                                     "y": y,
                                     "is_positive": is_pos
                                 }
-                                for x, y, is_pos, obj_id, loaded_frame_idx in self.click_points
+                                for x, y, is_pos, obj_id, frame_idx in self.click_points
                             ]
                         }
 
                         # Export segmented video with overlays
                         self.status_label.config(text="Exporting segmented video...")
                         self.root.update()
-                        video_exported = self._export_segmented_video(output_base_dir, masks_output_dir)
+                        video_exported = self._export_segmented_video(output_base_dir, masks_output_dir, source_video_path=source_video)
 
                         # Save processing metadata (matching process_annotations.py format)
                         metadata_path = os.path.join(output_base_dir, "processing_metadata.json")
@@ -4198,6 +4036,7 @@ class SAM2VideoUI:
                                 self.current_frame_idx = 0
                                 self.frame_var.set(0)
                                 self.segmented_video_displayed = True
+                                self.has_prerendered_masks = True  # Frames have masks baked in
 
                                 # Display first frame
                                 self.display_current_frame()
@@ -4213,6 +4052,9 @@ class SAM2VideoUI:
 
                         # Calculate segmentation quality metrics
                         self._calculate_segmentation_quality_metrics()
+
+                        # Save quality metrics to disk
+                        self._save_quality_metrics(output_base_dir)
 
                     except Exception as e:
                         print(f"[WARNING] Failed to export results: {e}")
@@ -4263,20 +4105,50 @@ class SAM2VideoUI:
 
         return True, "All annotations valid"
 
-    def _export_segmented_video(self, output_dir, masks_dir, fps=30, overlay_opacity=0.4):
+    def _export_segmented_video(self, output_dir, masks_dir, fps=30, overlay_opacity=0.4, source_video_path=None):
         """
         Export segmented video with mask overlays and text labels
         Following the pattern from process_annotations.py
+
+        Args:
+            source_video_path: Path to original video file (used when re-segmenting to avoid duplicate labels)
         """
         print("Exporting segmented video...")
 
-        video_output_path = os.path.join(output_dir, "segmented_video.mp4")
-        height, width = self.original_video_height, self.original_video_width
+        video_output_path_final = os.path.join(output_dir, "segmented_video.mp4")
+        video_output_path_temp = video_output_path_final + ".temp.mp4"
+
+        # Determine if we should load from source video or use cached frames
+        use_source_video = source_video_path is not None and os.path.exists(source_video_path)
+
+        if use_source_video:
+            # Open source video to get dimensions and frame count
+            cap = cv2.VideoCapture(source_video_path)
+            if not cap.isOpened():
+                print(f"ERROR: Could not open source video: {source_video_path}")
+                return False
+
+            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+            print(f"  Loading frames from original video: {source_video_path}")
+            print(f"  Video dimensions: {width}x{height}, {total_frames} frames")
+        else:
+            # Get dimensions from video_props or frames
+            if hasattr(self, 'video_props') and self.video_props:
+                height, width = self.video_props['height'], self.video_props['width']
+            elif self.frames and len(self.frames) > 0:
+                height, width = self.frames[0].shape[:2]
+            else:
+                raise ValueError("Cannot determine video dimensions")
+            total_frames = len(self.frames)
+            cap = None
 
         # Use H.264 codec (matching process_annotations.py)
         for codec in ['avc1', 'H264', 'X264', 'mp4v']:
             fourcc = cv2.VideoWriter_fourcc(*codec)
-            out = cv2.VideoWriter(video_output_path, fourcc, fps, (width, height))
+            out = cv2.VideoWriter(video_output_path_temp, fourcc, fps, (width, height))
             if out.isOpened():
                 if codec != 'mp4v':
                     print(f"  Using {codec} codec for video encoding")
@@ -4284,15 +4156,28 @@ class SAM2VideoUI:
 
         if not out.isOpened():
             print("  WARNING: Could not initialize video writer with any codec")
+            if cap:
+                cap.release()
             return False
 
         processed_frames = 0
-        for frame_idx in range(len(self.frames)):
-            # Load frame on demand (handles lazy loading)
-            if hasattr(self, 'video_cap_lazy') and self.video_cap_lazy:
-                frame = self._load_frame_lazy(frame_idx)
+        for frame_idx in range(total_frames):
+            # Load frame from source video or cached frames
+            if use_source_video:
+                # Read from source video
+                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                ret, frame_bgr = cap.read()
+                if not ret:
+                    print(f"WARNING: Could not read frame {frame_idx} from source video, skipping")
+                    continue
+                # Convert BGR to RGB
+                frame = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
             else:
-                frame = self.frames[frame_idx]
+                # Load from cached frames (handles lazy loading)
+                if hasattr(self, 'video_cap_lazy') and self.video_cap_lazy:
+                    frame = self._load_frame_lazy(frame_idx)
+                else:
+                    frame = self.frames[frame_idx]
 
             if frame is None:
                 print(f"WARNING: Could not load frame {frame_idx}, skipping")
@@ -4366,10 +4251,21 @@ class SAM2VideoUI:
             processed_frames += 1
 
             if processed_frames % 100 == 0:
-                print(f"   Processed {processed_frames}/{len(self.frames)} frames...")
+                print(f"   Processed {processed_frames}/{total_frames} frames...")
 
         out.release()
-        print(f"OK: Exported segmented video to {video_output_path}")
+        if cap:
+            cap.release()
+
+        # Compress with FFmpeg
+        print("Compressing video with FFmpeg...")
+        success = self._compress_video_with_ffmpeg(video_output_path_temp, video_output_path_final, crf=23)
+
+        if success:
+            print(f"OK: Exported and compressed segmented video to {video_output_path_final}")
+        else:
+            print(f"OK: Exported segmented video to {video_output_path_final} (compression skipped)")
+
         return True
 
     def export_masks(self):
@@ -4530,7 +4426,7 @@ class SAM2VideoUI:
                               f"- {exported_count} mask images (PNG)\n"
                               f"- 1 metadata file (JSON)\n"
                               f"- 1 object mapping (CSV)\n\n"
-                              f"Location: {folder_path}")
+                              f"Location: {export_dir}")
                 
         except Exception as e:
             self.progress_bar.pack_forget()
@@ -5513,7 +5409,7 @@ class SAM2VideoUI:
 
     def _load_mask(self, frame_idx, obj_id):
         """
-        Load mask from disk with pattern matching fallback
+        Load mask from disk with LRU caching
 
         Args:
             frame_idx: Frame index
@@ -5522,6 +5418,11 @@ class SAM2VideoUI:
         Returns:
             mask: Binary mask array (H, W) or None if not found
         """
+        # Check cache first
+        cache_key = (frame_idx, obj_id)
+        if cache_key in self.mask_cache:
+            return self.mask_cache[cache_key]
+
         if not hasattr(self, 'mask_export_dir') or self.mask_export_dir is None:
             print(f"WARNING: No mask export directory found for frame {frame_idx}, obj {obj_id}")
             return None
@@ -5532,7 +5433,9 @@ class SAM2VideoUI:
         mask_path = os.path.join(self.mask_export_dir, mask_filename)
 
         if os.path.exists(mask_path):
-            return cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+            mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+            self._cache_mask(cache_key, mask)
+            return mask
 
         # Try 2: Legacy pattern (for backward compatibility)
         mask_filename_legacy = f"frame_{frame_idx:05d}_obj_{obj_id}.png"
@@ -5540,7 +5443,9 @@ class SAM2VideoUI:
 
         if os.path.exists(mask_path_legacy):
             print(f"WARNING: Using legacy mask pattern for frame {frame_idx}, obj {obj_id}")
-            return cv2.imread(mask_path_legacy, cv2.IMREAD_GRAYSCALE)
+            mask = cv2.imread(mask_path_legacy, cv2.IMREAD_GRAYSCALE)
+            self._cache_mask(cache_key, mask)
+            return mask
 
         # Try 3: Pattern matching by frame and ID (name mismatch fallback)
         for filename in os.listdir(self.mask_export_dir):
@@ -5550,10 +5455,81 @@ class SAM2VideoUI:
                 print(f"WARNING: Mask name mismatch for obj {obj_id}. "
                       f"Expected '{obj_name}', found '{found_name}'. Using found mask.")
                 mask_path_fallback = os.path.join(self.mask_export_dir, filename)
-                return cv2.imread(mask_path_fallback, cv2.IMREAD_GRAYSCALE)
+                mask = cv2.imread(mask_path_fallback, cv2.IMREAD_GRAYSCALE)
+                self._cache_mask(cache_key, mask)
+                return mask
 
         print(f"WARNING: Mask file not found for frame {frame_idx}, obj {obj_id}")
         return None
+
+    def _cache_mask(self, cache_key, mask):
+        """Store mask in cache with LRU eviction"""
+        if mask is not None:
+            self.mask_cache[cache_key] = mask
+            # LRU eviction if cache exceeds size limit
+            if len(self.mask_cache) > self.mask_cache_size:
+                oldest_key = next(iter(self.mask_cache))
+                del self.mask_cache[oldest_key]
+
+    def _compress_video_with_ffmpeg(self, input_path, output_path, crf=23, preset='medium'):
+        """
+        Re-encode video with FFmpeg using CRF compression.
+
+        Args:
+            input_path: Temp uncompressed video
+            output_path: Final compressed video
+            crf: Quality (0-51, lower=better, 23=medium)
+            preset: Encoding speed (medium recommended)
+
+        Returns:
+            bool: True if successful
+        """
+        import subprocess
+        import shutil
+
+        ffmpeg_path = shutil.which('ffmpeg')
+        if not ffmpeg_path:
+            print("WARNING: ffmpeg not found, skipping compression")
+            shutil.move(input_path, output_path)
+            return False
+
+        try:
+            print(f"Compressing with FFmpeg (CRF={crf})...")
+
+            cmd = [
+                ffmpeg_path,
+                '-i', input_path,
+                '-c:v', 'libx264',
+                '-crf', str(crf),
+                '-preset', preset,
+                '-movflags', '+faststart',
+                '-y',
+                output_path
+            ]
+
+            result = subprocess.run(cmd, stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, text=True)
+
+            if result.returncode != 0:
+                print(f"FFmpeg error: {result.stderr}")
+                shutil.move(input_path, output_path)
+                return False
+
+            # Report compression stats
+            original_size = os.path.getsize(input_path)
+            compressed_size = os.path.getsize(output_path)
+            reduction = (1 - compressed_size / original_size) * 100
+
+            print(f"Compressed: {original_size/1e6:.1f}MB → {compressed_size/1e6:.1f}MB ({reduction:.1f}% reduction)")
+
+            os.remove(input_path)  # Delete temp
+            return True
+
+        except Exception as e:
+            print(f"WARNING: FFmpeg failed: {e}")
+            if os.path.exists(input_path):
+                shutil.move(input_path, output_path)
+            return False
 
     def _get_config_file_path(self):
         """Get path to config file for storing persistent settings"""
