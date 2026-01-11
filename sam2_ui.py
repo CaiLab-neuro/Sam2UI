@@ -1141,6 +1141,7 @@ class SAM2VideoUI:
 
     def _get_original_video_for_resegmentation(self):
         """Get original video path for re-segmentation when working with loaded results"""
+        print("Debug: self.original_video_path_for_resegment=", self.original_video_path_for_resegment)
         # Automatically use stored path from metadata if available and valid
         if self.original_video_path_for_resegment and os.path.exists(self.original_video_path_for_resegment):
             print(f"Using original video from metadata: {self.original_video_path_for_resegment}")
@@ -1495,9 +1496,13 @@ class SAM2VideoUI:
             self.frames = []
             self.masks = {}
             self.click_points = []
-            self.segmented_video_displayed = False  # Reset flag when loading new original video
-            self.has_prerendered_masks = False  # Reset prerendered masks flag
-            self.original_video_path_for_resegment = None  # Clear any previously stored original video path
+
+            # Only reset these flags and clear original video path when loading a fresh video
+            # When loading a segmented video (via import_masks), these are already set correctly before calling load_video_frames()
+            if not self.segmented_video_displayed:
+                self.segmented_video_displayed = False  # Reset flag when loading new original video
+                self.has_prerendered_masks = False  # Reset prerendered masks flag
+                self.original_video_path_for_resegment = None  # Clear any previously stored original video path
 
             # Reset Flash Mask button state when loading new video
             self.has_segmentation = False
@@ -3529,8 +3534,8 @@ class SAM2VideoUI:
 
                     cap.release()
 
-                self.status_label.config(text="Initializing SAM2 inference...")
-                self.progress_var.set(35)
+                self.status_label.config(text="Initializing SAM inference...")
+                self.progress_var.set(30)
                 self.root.update()
                 
                 # Always reset inference state to clear dimension cache
@@ -3625,8 +3630,8 @@ class SAM2VideoUI:
                     
                     
                 
-                self.status_label.config(text="Adding prompts to SAM2...")
-                self.progress_var.set(40)
+                self.status_label.config(text="Adding prompts to SAM...")
+                self.progress_var.set(35)
                 self.root.update()
 
                 # Initialize metadata list instead of pre-allocating masks (memory optimization)
@@ -3727,7 +3732,7 @@ class SAM2VideoUI:
                 # Store the processing range for later use
                 self.processing_range = frames_to_process
                 
-                self.progress_var.set(45)
+                self.progress_var.set(40)
                 self.root.update()
 
                 processed_frames = 0
@@ -3797,8 +3802,8 @@ class SAM2VideoUI:
                         self._monitor_memory(out_frame_idx, len(frames_to_process))
 
                         processed_frames += 1
-                        progress = (processed_frames / max(1, len(frames_to_process))) * 50
-                        self.progress_var.set(min(progress, 50))
+                        progress = 40 + (processed_frames / max(1, len(frames_to_process))) * 30
+                        self.progress_var.set(min(progress, 70))
                         
                         if processed_frames % 10 == 0:
                             self.status_label.config(text=f"Processing frame {processed_frames}/{len(frames_to_process)}")
@@ -3880,9 +3885,9 @@ class SAM2VideoUI:
                         self._monitor_memory(out_frame_idx, len(frames_to_process))
 
                         backward_processed += 1
-                        # Update progress (backward propagation gets remaining progress from 50% to 100%)
+                        # Update progress (backward propagation gets remaining progress from 70% to 100%)
                         if frames_to_backward > 0:
-                            backward_progress = 50 + (backward_processed / frames_to_backward) * 50
+                            backward_progress = 70 + (backward_processed / frames_to_backward) * 30
                             self.progress_var.set(min(backward_progress, 100))
 
                         if backward_processed % 10 == 0:
