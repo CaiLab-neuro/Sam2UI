@@ -212,6 +212,23 @@ class SAM2Processor:
             device = "cuda" if torch.cuda.is_available() else "cpu"
             print(f"  Device: {device}")
 
+            # Common optimizations for both SAM2 and SAM3
+            if device == "cuda":
+                # Enable TF32 for Ampere GPUs (RTX 30xx+, A100) for better performance
+                if torch.cuda.get_device_properties(0).major >= 8:
+                    torch.backends.cuda.matmul.allow_tf32 = True
+                    torch.backends.cudnn.allow_tf32 = True
+                    print("  TensorFloat32 (TF32) enabled for Ampere GPU")
+
+                if self.use_bfloat16:
+                    # CRITICAL: Enable GLOBAL autocast before any SAM2/SAM3 operations
+                    # This stays active for entire program to handle bfloat16 memory features
+                    torch.autocast(device_type="cuda", dtype=torch.bfloat16).__enter__()
+                    print("  BFloat16 mode: GLOBAL autocast enabled")
+                    print("  Model weights remain in float32 (checkpoint dtype)")
+                else:
+                    print("  Float32 mode: native precision (no autocast)")
+
             # Load model based on type
             if self.use_sam3:
                 # SAM3 loading
@@ -219,7 +236,7 @@ class SAM2Processor:
                     raise ImportError("SAM3 not available. Run setup.py to install.")
 
                 from sam3.model_builder import build_sam3_video_model
-                print("  Building SAM3 model (may download from HuggingFace)...")
+                print("  Building SAM3 model ...")
 
                 # Build SAM3 model and extract tracker with SAM2-compatible API
                 # (Matches sam2_ui.py implementation)
@@ -231,23 +248,7 @@ class SAM2Processor:
                 self.video_predictor.backbone = sam3_model.detector.backbone
 
             else:
-                # SAM2 loading (existing logic)
-                if device == "cuda":
-                    # Enable TF32 for Ampere GPUs (RTX 30xx+, A100) for better performance
-                    if torch.cuda.get_device_properties(0).major >= 8:
-                        torch.backends.cuda.matmul.allow_tf32 = True
-                        torch.backends.cudnn.allow_tf32 = True
-                        print("  TensorFloat32 (TF32) enabled for Ampere GPU")
-
-                    if self.use_bfloat16:
-                        # CRITICAL: Enable GLOBAL autocast before any SAM2 operations
-                        # This stays active for entire program to handle bfloat16 memory features
-                        torch.autocast(device_type="cuda", dtype=torch.bfloat16).__enter__()
-                        print("  BFloat16 mode: GLOBAL autocast enabled")
-                        print("  Model weights remain in float32 (checkpoint dtype)")
-                    else:
-                        print("  Float32 mode: native precision (no autocast)")
-
+                # SAM2 loading
                 self.video_predictor = build_sam2_video_predictor(
                     config_file=self.config_file,
                     ckpt_path=self.checkpoint_file,  # Optional parameter
@@ -400,7 +401,111 @@ class SAM2Processor:
                 frame_annotations[frame_idx] = []
             frame_annotations[frame_idx].append(annotation)
         return frame_annotations
-    
+
+    def _cleanup_inference_state(self, inference_state, current_frame_idx, frames_to_keep=20, reverse=False, verbose=False):
+        """
+        Clean up old frames from inference state to prevent memory growth.
+
+        Handles both SAM2 and SAM3 inference state structures:
+        - SAM3: Cleans multiple caches (non_cond_frame_outputs, cond_frame_outputs, cached_frame_outputs, tracker states)
+        - SAM2: Cleans per-object output dicts
+
+        Args:
+            inference_state: SAM2/SAM3 inference state object
+            current_frame_idx: Current frame being processed
+            frames_to_keep: Number of recent frames to keep (default 20)
+            reverse: If True, propagating backward (delete frames ahead), else forward (delete frames behind)
+            verbose: If True, print debug info every frame
+        """
+        total_deleted = 0
+
+        # Direction-aware cleanup logic:
+        # - Forward (reverse=False): Delete frames BEHIND current (f < current - keep)
+        # - Backward (reverse=True): Delete frames AHEAD of current (f > current + keep)
+        if reverse:
+            should_delete = lambda f: f > current_frame_idx + frames_to_keep
+        else:
+            should_delete = lambda f: f < current_frame_idx - frames_to_keep
+
+        # Try SAM3 structure first (direct attribute access)
+        if hasattr(inference_state, 'non_cond_frame_outputs'):
+            # Clean non-conditioning frame outputs (tracker state)
+            non_cond = inference_state.non_cond_frame_outputs
+            old_frames = [f for f in non_cond.keys() if should_delete(f)]
+            for old_frame in old_frames:
+                del non_cond[old_frame]
+            total_deleted += len(old_frames)
+
+            # Clean conditioning frame outputs (tracker state)
+            if hasattr(inference_state, 'cond_frame_outputs'):
+                cond = inference_state.cond_frame_outputs
+                old_frames = [f for f in cond.keys() if should_delete(f)]
+                for old_frame in old_frames:
+                    del cond[old_frame]
+                total_deleted += len(old_frames)
+
+            # Clean cached_frame_outputs (Sam3VideoInference level)
+            # This is a dict attribute, not a method
+            if hasattr(inference_state, '__dict__') and 'cached_frame_outputs' in inference_state.__dict__:
+                cached = inference_state.__dict__['cached_frame_outputs']
+                if isinstance(cached, dict):
+                    old_frames = [f for f in cached.keys() if isinstance(f, int) and should_delete(f)]
+                    for old_frame in old_frames:
+                        del cached[old_frame]
+                    total_deleted += len(old_frames)
+
+            # Clean tracker inference states (per-object tracker states)
+            if hasattr(inference_state, '__dict__') and 'tracker_inference_states' in inference_state.__dict__:
+                tracker_states = inference_state.__dict__['tracker_inference_states']
+                if isinstance(tracker_states, list):
+                    for tracker_state in tracker_states:
+                        if hasattr(tracker_state, 'output_dict'):
+                            output_dict = tracker_state.output_dict
+                            for cache_name in ['non_cond_frame_outputs', 'cond_frame_outputs']:
+                                if cache_name in output_dict:
+                                    cache = output_dict[cache_name]
+                                    old_frames = [f for f in cache.keys() if should_delete(f)]
+                                    for old_frame in old_frames:
+                                        del cache[old_frame]
+                                    total_deleted += len(old_frames)
+
+            
+
+        # Fall back to SAM2/SAM3 dict structure (SAM3 uses this for tracker inference_state)
+        elif isinstance(inference_state, dict) and "output_dict_per_obj" in inference_state:
+            # CRITICAL: Clean the MAIN output_dict first (SAM3 stores frame outputs here)
+            # This is where sam3_tracking_predictor.py:859 stores outputs: output_dict[storage_key][frame_idx] = current_out
+            # But ONLY clean non_cond_frame_outputs, NOT cond_frame_outputs!
+            if "output_dict" in inference_state:
+                output_dict = inference_state["output_dict"]
+
+                # Only clean non-conditional frames (intermediate propagation frames - safe to delete)
+                if "non_cond_frame_outputs" in output_dict:
+                    cache = output_dict["non_cond_frame_outputs"]
+                    old_frames = [f for f in cache.keys() if should_delete(f)]
+                    for old_frame in old_frames:
+                        del cache[old_frame]
+                    total_deleted += len(old_frames)
+
+                # DO NOT clean cond_frame_outputs - SAM3 needs these for entire propagation!
+                # These are frames with user prompts that SAM3 references during tracking.
+                # Deleting these causes: AssertionError at sam3_tracker_base.py:591
+
+            # Then clean per-object dicts (these are slices/views of the main dict)
+            for obj_idx in range(len(inference_state.get("obj_ids", []))):
+                obj_output_dict = inference_state["output_dict_per_obj"][obj_idx]
+                non_cond = obj_output_dict.get("non_cond_frame_outputs", {})
+                old_frames = [f for f in non_cond.keys() if should_delete(f)]
+                for old_frame in old_frames:
+                    del non_cond[old_frame]
+                total_deleted += len(old_frames)
+
+            
+
+        # Periodic GPU memory cleanup
+        if current_frame_idx % 50 == 0 and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     def process_segmentation(self, video_path, annotations_data, output_dir, frame_dir=None):
         """Process segmentation using SAM2"""
         return self.process_segmentation_full(video_path, annotations_data, output_dir, frame_dir=frame_dir)
@@ -647,8 +752,22 @@ class SAM2Processor:
 
                     masks_metadata[out_frame_idx] = frame_masks
 
-                    # Delete output tensors after each frame
-                    del out_mask_logits
+                    # CRITICAL: Delete ALL tensor variables to prevent memory accumulation
+                    # SAM3 returns 5 values, SAM2 returns 3 - delete all applicable tensors
+                    del out_mask_logits  # High-res masks (always present)
+
+                    if self.use_sam3:
+                        # SAM3-specific tensors that must be deleted
+                        del out_low_res_masks  # Low-res masks (can accumulate ~2-3MB per frame)
+                        del out_obj_scores     # Confidence scores
+                        del out_obj_ids        # Object ID tensor/list
+
+                    del result  # Delete the unpacked tuple itself
+
+                    # CRITICAL: Clean up old frames EVERY frame to prevent memory growth
+                    # This matches the UI behavior (sam2_ui.py:3799)
+                    # IMPORTANT: Pass reverse=False for forward propagation (delete frames behind, not ahead)
+                    self._cleanup_inference_state(inference_state, out_frame_idx, frames_to_keep=20, reverse=False, verbose=True)
 
                     if (out_frame_idx + 1) % 50 == 0:
                         # Monitor GPU and RAM usage
@@ -661,17 +780,15 @@ class SAM2Processor:
                               f"GPU: {gpu_allocated:.2f}GB (peak: {gpu_peak:.2f}GB) | "
                               f"RAM: {ram_used:.2f}GB")
 
-                        # CRITICAL: Periodic cleanup of old frames
-                        frames_to_keep = 20
-                        for obj_idx in range(len(inference_state["obj_ids"])):
-                            obj_output_dict = inference_state["output_dict_per_obj"][obj_idx]
-                            non_cond = obj_output_dict.get("non_cond_frame_outputs", {})
-                            old_frames = [f for f in non_cond.keys() if f < out_frame_idx - frames_to_keep]
-                            for old_frame in old_frames:
-                                del non_cond[old_frame]
+                        # Verify tensors are deleted (should show NameError if properly deleted)
+                        if self.use_sam3:
+                            try:
+                                _ = out_low_res_masks
+                                print(f"  WARNING: out_low_res_masks still in scope!")
+                            except NameError:
+                                pass  # Expected - variable was deleted
 
                         torch.cuda.reset_peak_memory_stats()
-                        torch.cuda.empty_cache()
 
             # Propagate annotations - BACKWARD direction (last frame → 0)
             # IMPORTANT: Always propagate backward to ensure full video coverage from both directions
@@ -690,7 +807,7 @@ class SAM2Processor:
                         propagate_iterator = self.video_predictor.propagate_in_video(
                             inference_state,
                             start_frame_idx=num_frames - 1,  # Start from end
-                            max_frame_num_to_track=0,
+                            max_frame_num_to_track=num_frames,
                             reverse=True,
                             propagate_preflight=True
                         )
@@ -735,10 +852,23 @@ class SAM2Processor:
                             del mask
 
                         masks_metadata[out_frame_idx] = frame_masks
-                        del out_mask_logits
+
+                        # CRITICAL: Delete ALL tensor variables to prevent memory accumulation
+                        # SAM3 returns 5 values, SAM2 returns 3 - delete all applicable tensors
+                        del out_mask_logits  # High-res masks (always present)
+
                         if self.use_sam3:
-                            del out_low_res_masks
-                            del out_obj_scores
+                            # SAM3-specific tensors that must be deleted
+                            del out_low_res_masks  # Low-res masks (can accumulate ~2-3MB per frame)
+                            del out_obj_scores     # Confidence scores
+                            del out_obj_ids        # Object ID tensor/list
+
+                        del result  # Delete the unpacked tuple itself
+
+                        # CRITICAL: Clean up old frames EVERY frame to prevent memory growth
+                        # This matches the UI behavior (sam2_ui.py:3799)
+                        # IMPORTANT: Pass reverse=True for backward propagation (delete frames ahead, not behind)
+                        self._cleanup_inference_state(inference_state, out_frame_idx, frames_to_keep=20, reverse=True, verbose=True)
 
                         if (out_frame_idx + 1) % 50 == 0:
                             gpu_allocated = torch.cuda.memory_allocated() / (1024**3)
@@ -750,28 +880,34 @@ class SAM2Processor:
                                   f"GPU: {gpu_allocated:.2f}GB (peak: {gpu_peak:.2f}GB) | "
                                   f"RAM: {ram_used:.2f}GB")
 
-                            # Periodic cleanup
-                            frames_to_keep = 20
-                            for obj_idx in range(len(inference_state["obj_ids"])):
-                                obj_output_dict = inference_state["output_dict_per_obj"][obj_idx]
-                                non_cond = obj_output_dict.get("non_cond_frame_outputs", {})
-                                old_frames = [f for f in non_cond.keys() if f < out_frame_idx - frames_to_keep]
-                                for old_frame in old_frames:
-                                    del non_cond[old_frame]
+                            # Verify tensors are deleted (should show NameError if properly deleted)
+                            if self.use_sam3:
+                                try:
+                                    _ = out_low_res_masks
+                                    print(f"  WARNING: out_low_res_masks still in scope!")
+                                except NameError:
+                                    pass  # Expected - variable was deleted
 
                             torch.cuda.reset_peak_memory_stats()
-                            torch.cuda.empty_cache()
 
-            # Phase 2: Clear SAM2's internal frame outputs (safe after propagation)
-            print("\nCleaning up SAM2 inference state...")
-            for obj_idx in range(len(objects_with_annotations)):
-                obj_output_dict = inference_state["output_dict_per_obj"][obj_idx]
-                # Clear non-conditioning frames (keep conditioning for potential refinement)
-                non_cond = obj_output_dict.get("non_cond_frame_outputs", {})
-                non_cond.clear()
+            # Phase 2: Clear inference state frame outputs (safe after propagation)
+            model_type = "SAM3" if self.use_sam3 else "SAM2"
+            print(f"\nCleaning up {model_type} inference state...")
+
+            # Handle SAM3 structure (direct attribute access)
+            if hasattr(inference_state, 'non_cond_frame_outputs'):
+                inference_state.non_cond_frame_outputs.clear()
+
+            # Handle SAM2 structure (per-object dict access)
+            elif isinstance(inference_state, dict) and "output_dict_per_obj" in inference_state:
+                for obj_idx in range(len(objects_with_annotations)):
+                    obj_output_dict = inference_state["output_dict_per_obj"][obj_idx]
+                    # Clear non-conditioning frames (keep conditioning for potential refinement)
+                    non_cond = obj_output_dict.get("non_cond_frame_outputs", {})
+                    non_cond.clear()
 
             torch.cuda.empty_cache()
-            print("OK: Cleaned SAM2 memory")
+            print(f"OK: Cleaned {model_type} memory")
 
             print(f"\nOK: Generated masks for {len(masks_metadata)} frames")
             return masks_metadata, object_names, object_colors, num_frames
@@ -1055,9 +1191,9 @@ Examples:
     parser.add_argument("--fps", type=float, default=30.0, help="Output video FPS (default: 30)")
     parser.add_argument("--opacity", type=float, default=0.4, help="Mask overlay opacity (default: 0.4)")
     parser.add_argument("--offload-to-cpu", action="store_true",
-                       help="Offload video frames and model state to CPU to reduce GPU memory usage (recommended for long video)")
+                       help="Offload video frames and model state to CPU to reduce GPU memory usage (slightly increases CPU memory usage and at a cost of a slightly slower speed)")
     parser.add_argument("--async-loading", action="store_true",
-                       help="Use async frame loading (experimental, may reduce memory usage)")
+                       help="Use async frame loading (not much benefit. Just kept this feature as it is available)")
     parser.add_argument("--smooth-masks", action="store_true",
                        help="Apply morphological smoothing to reduce pixelation in exported masks (preserves binary masks)")
     parser.add_argument("--use-bfloat16", action="store_true",
@@ -1148,9 +1284,9 @@ Examples:
         print(f"Memory optimization: CPU offloading enabled")
     print()
 
-    # Enable lazy loading BEFORE creating SAM2 model (SAM3 has its own frame loading)
-    if args.model != "sam3":
-        enable_lazy_loading(cache_size=args.frame_cache_size)
+    # Enable lazy loading BEFORE creating SAM2/SAM3 model
+    # This prevents loading all frames into memory at once (huge memory savings for long videos)
+    enable_lazy_loading(cache_size=args.frame_cache_size, enable_sam3=True)
 
     # Initialize processor
     try:

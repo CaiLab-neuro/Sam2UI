@@ -143,16 +143,17 @@ class LazyVideoFrameLoader:
         return self.compute_device if not self.offload_video_to_cpu else torch.device('cpu')
 
 
-def enable_lazy_loading(cache_size=20):
+def enable_lazy_loading(cache_size=20, enable_sam3=True):
     """
-    Monkey-patch SAM2 to use lazy loading.
-    Call this BEFORE creating SAM2VideoPredictor.
+    Monkey-patch SAM2 and SAM3 to use lazy loading.
+    Call this BEFORE creating SAM2VideoPredictor or SAM3 model.
 
     Args:
         cache_size: Number of frames to cache (default 20)
                    - Minimum: 10 (6 for lookback + buffer)
                    - Recommended: 20 (~2GB)
                    - Maximum: 50 (~5GB)
+        enable_sam3: Also patch SAM3 if available (default True)
 
     Example:
         enable_lazy_loading(cache_size=20)
@@ -218,9 +219,32 @@ def enable_lazy_loading(cache_size=20):
     # Monkey-patch SAM2
     sam2_misc.load_video_frames_from_jpg_images = lazy_load_video_frames_from_jpg_images
 
-    print("=" * 60)
-    print("SAM LAZY LOADING ENABLED")
-    print("=" * 60)
+    # Also patch SAM3 if available
+    if enable_sam3:
+        try:
+            import sam3.model.utils.sam2_utils as sam3_utils
+
+            # Save original function for potential restoration
+            if not hasattr(sam3_utils, '_original_load_video_frames_from_jpg_images'):
+                sam3_utils._original_load_video_frames_from_jpg_images = \
+                    sam3_utils.load_video_frames_from_jpg_images
+
+            # Monkey-patch SAM3 (note: SAM3 uses different default mean/std)
+            sam3_utils.load_video_frames_from_jpg_images = lazy_load_video_frames_from_jpg_images
+
+            print("=" * 60)
+            print("SAM2 & SAM3 LAZY LOADING ENABLED")
+            print("=" * 60)
+        except ImportError:
+            # SAM3 not available, only patch SAM2
+            print("=" * 60)
+            print("SAM2 LAZY LOADING ENABLED (SAM3 not available)")
+            print("=" * 60)
+    else:
+        print("=" * 60)
+        print("SAM2 LAZY LOADING ENABLED")
+        print("=" * 60)
+
     print(f"Frame cache size: {cache_size}")
     print(f"Expected memory usage: ~{cache_size * 0.1:.1f}GB (vs ~178GB eager)")
     print()
