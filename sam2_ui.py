@@ -1185,8 +1185,29 @@ class SAM2VideoUI:
             messagebox.showinfo("Info", "Please select an object first")
             return
 
-        # Try to load mask if not in memory (e.g., when loaded from results)
-        if self.current_frame_idx not in self.masks or current_obj_id not in self.masks.get(self.current_frame_idx, {}):
+        # Check if in prerendered masks mode (flash not supported)
+        if self.has_prerendered_masks:
+            messagebox.showinfo("Flash Not Available",
+                "Flash feature is not available when viewing pre-segmented videos.\n\n"
+                "To use flash:\n"
+                "1. Load the original video\n"
+                "2. Load annotations or run segmentation\n"
+                "3. Flash will then work normally")
+            return
+
+        # Check if masks are visible
+        if not self.show_masks_var.get():
+            messagebox.showinfo("Show Masks Required",
+                "Please enable the 'Show Masks' checkbox to use flash.")
+            return
+
+        # Try to load mask if not in memory or if it's a placeholder None value
+        # After propagation, self.masks contains placeholder None values that need to be loaded from disk
+        mask_exists = (self.current_frame_idx in self.masks and
+                      current_obj_id in self.masks.get(self.current_frame_idx, {}) and
+                      self.masks[self.current_frame_idx].get(current_obj_id) is not None)
+
+        if not mask_exists:
             # Try loading from disk
             mask = self._load_mask(self.current_frame_idx, current_obj_id)
             if mask is None:
@@ -1456,6 +1477,13 @@ class SAM2VideoUI:
             
         try:
             self.video_path = file_path
+
+            # CRITICAL FIX: Reset prerendered flags when loading new original video
+            # This ensures flash works after previously viewing a segmented video
+            self.segmented_video_displayed = False
+            self.has_prerendered_masks = False
+            self.original_video_path_for_resegment = None
+
             self.load_video_frames()
         except Exception as e:
             messagebox.showerror("Error", f"Failed to load video: {str(e)}")
