@@ -116,7 +116,7 @@ def _auto_select_default_model():
     for model_name in preference_order:
         config_path, checkpoint_path = MODEL_CONFIGS.get(model_name, (None, None))
         if config_path and os.path.exists(checkpoint_path):
-            print(f"  Selected: {model_name}")
+            print(f"Model to use if sam3 is not chosen: {model_name}")
             return model_name
 
     # Fallback to any available SAM2.1 model
@@ -131,22 +131,24 @@ def _auto_select_default_model():
     return "sam2.1-base+"
 
 class SAM2Processor:
-    def __init__(self, config_file=None, checkpoint_file=None, model_name="sam2.1-base+", offload_to_cpu=False, async_loading=False, smooth_masks=False, use_bfloat16=False, use_sam3=False):
+    def __init__(self, config_file=None, checkpoint_file=None, model_name="sam2.1-base+", offload_to_cpu=False, async_loading=False, smooth_masks=False, use_bfloat16=False):
         """
         Initialize SAM2 Processor
 
         Args:
             config_file: Path to model config YAML (overrides model_name)
             checkpoint_file: Path to checkpoint file (overrides model_name)
-            model_name: Preset model name (e.g., 'sam2-base+', 'sam2.1-large')
+            model_name: Preset model name (e.g., 'sam2-base+', 'sam2.1-large', 'sam3')
             offload_to_cpu: Use SAM2's CPU offloading for memory optimization
             async_loading: Use async frame loading (experimental, may reduce memory)
             smooth_masks: Apply morphological smoothing to reduce pixelation in masks
             use_bfloat16: Use BFloat16 precision for faster inference (requires compatible GPU)
-            use_sam3: Use SAM3 model instead of SAM2 (requires SAM3 installation)
         """
+        # Store model name for detection
+        self.model_name = model_name
+
         # Check if SAM3 was requested but is not available
-        if use_sam3 and not SAM3_AVAILABLE:
+        if model_name == "sam3" and not SAM3_AVAILABLE:
             print("=" * 60)
             print("WARNING: SAM3 requested but not available")
             print("=" * 60)
@@ -155,35 +157,29 @@ class SAM2Processor:
             print("  2. Missing dependencies (huggingface-hub, decord, einops)")
             print("  3. Python < 3.12 or PyTorch < 2.7")
             print()
-            print("Falling back to SAM2...")
+            print("Falling back to SAM2.1 base+...")
             print("=" * 60)
             print()
+            # Fallback to SAM2.1 base+
+            self.model_name = "sam2.1-base+"
 
-        self.use_sam3 = use_sam3 and SAM3_AVAILABLE
-
-        # Special handling for SAM3
-        if self.use_sam3:
-            if model_name != "sam3" and not (config_file and checkpoint_file):
-                model_name = "sam3"  # Force SAM3 model
-            self.config_file, self.checkpoint_file = MODEL_CONFIGS.get("sam3", (None, None))
+        # Determine config and checkpoint paths
+        if config_file and checkpoint_file:
+            # Use custom paths
+            self.config_file = config_file
+            self.checkpoint_file = checkpoint_file
+        elif model_name in MODEL_CONFIGS:
+            # Use preset model
+            self.config_file, self.checkpoint_file = MODEL_CONFIGS[model_name]
         else:
-            # Determine config and checkpoint paths
-            if config_file and checkpoint_file:
-                # Use custom paths
-                self.config_file = config_file
-                self.checkpoint_file = checkpoint_file
-            elif model_name in MODEL_CONFIGS:
-                # Use preset model
-                self.config_file, self.checkpoint_file = MODEL_CONFIGS[model_name]
-            else:
-                raise ValueError(f"Unknown model name: {model_name}. Available: {list(MODEL_CONFIGS.keys())}")
+            raise ValueError(f"Unknown model name: {model_name}. Available: {list(MODEL_CONFIGS.keys())}")
 
         # Validate paths exist (skip config validation for SAM3)
-        if not self.use_sam3 and not os.path.exists(self.config_file):
+        if self.model_name != "sam3" and self.config_file and not os.path.exists(self.config_file):
             raise FileNotFoundError(f"Config file not found: {self.config_file}")
 
         # Checkpoint is optional for some use cases, but warn if missing
-        if not os.path.exists(self.checkpoint_file):
+        if self.checkpoint_file and not os.path.exists(self.checkpoint_file):
             print(f"WARNING: Checkpoint file not found: {self.checkpoint_file}")
             print("Model will be initialized without pre-trained weights.")
             self.checkpoint_file = None
@@ -197,6 +193,11 @@ class SAM2Processor:
         self.smooth_masks = smooth_masks
         self.use_bfloat16 = use_bfloat16
         self.no_backward_propagation = False  # Will be set from command line args
+
+    @property
+    def use_sam3(self):
+        """Returns True if using SAM3 model"""
+        return self.model_name == "sam3"
 
     def load_model(self):
         """Load SAM2 or SAM3 model with correct API usage"""
@@ -688,8 +689,8 @@ class SAM2Processor:
                         # SAM3 requires explicit frame range for backward propagation
                         propagate_iterator = self.video_predictor.propagate_in_video(
                             inference_state,
-                            start_frame_idx=0,  # Start from end
-                            max_frame_num_to_track=num_frames,
+                            start_frame_idx=num_frames - 1,  # Start from end
+                            max_frame_num_to_track=0,
                             reverse=True,
                             propagate_preflight=True
                         )
@@ -1054,7 +1055,7 @@ Examples:
     parser.add_argument("--fps", type=float, default=30.0, help="Output video FPS (default: 30)")
     parser.add_argument("--opacity", type=float, default=0.4, help="Mask overlay opacity (default: 0.4)")
     parser.add_argument("--offload-to-cpu", action="store_true",
-                       help="Offload video frames and model state to CPU to reduce GPU memory usage")
+                       help="Offload video frames and model state to CPU to reduce GPU memory usage (recommended for long video)")
     parser.add_argument("--async-loading", action="store_true",
                        help="Use async frame loading (experimental, may reduce memory usage)")
     parser.add_argument("--smooth-masks", action="store_true",
@@ -1065,8 +1066,6 @@ Examples:
                        help="Persistent directory for video frames (default: auto-generated in /tmp). If specified, frames will be reused from previous runs and not deleted after processing.")
     parser.add_argument("--frame-cache-size", type=int, default=20,
                        help="Number of frames to keep in memory cache (default: 20, ~2GB). Minimum: 10, Recommended: 20-50.")
-    parser.add_argument("--use-sam3", action="store_true",
-                       help="Use SAM3 model instead of SAM2 (requires SAM3 installation, Python 3.12+, PyTorch 2.7+, CUDA 12.6+)")
     parser.add_argument("--no-backward", action="store_true", dest="no_backward",
                        help="Disable backward propagation (not recommended, may result in lower quality segmentation for frames before first annotation)")
 
@@ -1150,7 +1149,7 @@ Examples:
     print()
 
     # Enable lazy loading BEFORE creating SAM2 model (SAM3 has its own frame loading)
-    if not args.use_sam3:
+    if args.model != "sam3":
         enable_lazy_loading(cache_size=args.frame_cache_size)
 
     # Initialize processor
@@ -1158,12 +1157,11 @@ Examples:
         if args.config:
             processor = SAM2Processor(config_file=args.config, checkpoint_file=args.checkpoint,
                                      offload_to_cpu=args.offload_to_cpu, async_loading=args.async_loading,
-                                     smooth_masks=args.smooth_masks, use_bfloat16=args.use_bfloat16,
-                                     use_sam3=args.use_sam3)
+                                     smooth_masks=args.smooth_masks, use_bfloat16=args.use_bfloat16)
         else:
             processor = SAM2Processor(model_name=args.model, offload_to_cpu=args.offload_to_cpu,
                                      async_loading=args.async_loading, smooth_masks=args.smooth_masks,
-                                     use_bfloat16=args.use_bfloat16, use_sam3=args.use_sam3)
+                                     use_bfloat16=args.use_bfloat16)
 
         # Set no_backward flag
         processor.no_backward_propagation = args.no_backward
