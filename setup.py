@@ -444,7 +444,11 @@ def install_sam3():
 
         # Install additional dependencies needed for SAM3
         print("Installing additional SAM3 dependencies...")
-        additional_deps = ["einops"]  # Required for model loading
+        additional_deps = [
+            "einops",            # Required for model loading
+            "huggingface-hub",   # Required for checkpoint download
+            "decord"             # Required for video loading
+        ]
         for dep in additional_deps:
             try:
                 subprocess.run([

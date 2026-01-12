@@ -48,6 +48,21 @@ except ImportError as e:
     print("Please run setup.py first to install dependencies.")
     sys.exit(1)
 
+# Check SAM3 availability
+def _check_sam3_available():
+    """Check if SAM3 is installed and usable"""
+    try:
+        script_dir = Path(__file__).parent
+        sam3_path = script_dir / "sam_models" / "sam3"
+        if not sam3_path.exists():
+            return False
+        from sam3.model_builder import build_sam3_video_predictor
+        return True
+    except ImportError:
+        return False
+
+SAM3_AVAILABLE = _check_sam3_available()
+
 # Model configuration mappings
 # NOTE: Config paths are relative to the sam2 package (Hydra search path: pkg://sam2)
 # Checkpoint paths are absolute/relative to the script directory
@@ -63,10 +78,60 @@ MODEL_CONFIGS = {
     "sam2-small": ("configs/sam2/sam2_hiera_s.yaml", "sam_models/sam2/checkpoints/sam2_hiera_small.pt"),
     "sam2-base+": ("configs/sam2/sam2_hiera_b+.yaml", "sam_models/sam2/checkpoints/sam2_hiera_base_plus.pt"),
     "sam2-large": ("configs/sam2/sam2_hiera_l.yaml", "sam_models/sam2/checkpoints/sam2_hiera_large.pt"),
+
+    # SAM3 model
+    "sam3": (None, "sam_models/sam3/checkpoints/sam3.pt"),  # Config loaded automatically
 }
 
+def _auto_select_default_model():
+    """Auto-select best SAM2.1 model based on GPU memory (mimics UI behavior)"""
+    preference_order = [
+        "sam2.1-large",       # 898MB - Best quality
+        "sam2.1-base+",       # 324MB - High quality
+        "sam2.1-small",       # 184MB - Good balance
+        "sam2.1-tiny",        # 156MB - Fastest
+    ]
+
+    try:
+        import torch
+        if torch.cuda.is_available():
+            gpu_mem_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+
+            # Adjust preference based on GPU memory
+            if gpu_mem_gb >= 8:
+                pass  # Keep original order (prefer large)
+            elif gpu_mem_gb >= 4:
+                preference_order = [p for p in preference_order if 'large' not in p]
+            else:
+                preference_order = [p for p in preference_order if 'large' not in p and 'base' not in p]
+
+            print(f"Auto-selecting model based on GPU memory ({gpu_mem_gb:.1f}GB)...")
+        else:
+            preference_order = ["sam2.1-small", "sam2.1-tiny", "sam2.1-base+"]
+            print("Auto-selecting model for CPU mode...")
+    except:
+        preference_order = ["sam2.1-base+", "sam2.1-small"]
+
+    # Find first available model
+    for model_name in preference_order:
+        config_path, checkpoint_path = MODEL_CONFIGS.get(model_name, (None, None))
+        if config_path and os.path.exists(checkpoint_path):
+            print(f"  Selected: {model_name}")
+            return model_name
+
+    # Fallback to any available SAM2.1 model
+    for model_name in MODEL_CONFIGS:
+        if model_name.startswith("sam2.1"):
+            config_path, checkpoint_path = MODEL_CONFIGS[model_name]
+            if os.path.exists(checkpoint_path):
+                print(f"  Selected: {model_name} (fallback)")
+                return model_name
+
+    print("  Selected: sam2.1-base+ (default, checkpoint may be missing)")
+    return "sam2.1-base+"
+
 class SAM2Processor:
-    def __init__(self, config_file=None, checkpoint_file=None, model_name="sam2.1-base+", offload_to_cpu=False, async_loading=False, smooth_masks=False, use_bfloat16=False):
+    def __init__(self, config_file=None, checkpoint_file=None, model_name="sam2.1-base+", offload_to_cpu=False, async_loading=False, smooth_masks=False, use_bfloat16=False, use_sam3=False):
         """
         Initialize SAM2 Processor
 
@@ -78,20 +143,43 @@ class SAM2Processor:
             async_loading: Use async frame loading (experimental, may reduce memory)
             smooth_masks: Apply morphological smoothing to reduce pixelation in masks
             use_bfloat16: Use BFloat16 precision for faster inference (requires compatible GPU)
+            use_sam3: Use SAM3 model instead of SAM2 (requires SAM3 installation)
         """
-        # Determine config and checkpoint paths
-        if config_file and checkpoint_file:
-            # Use custom paths
-            self.config_file = config_file
-            self.checkpoint_file = checkpoint_file
-        elif model_name in MODEL_CONFIGS:
-            # Use preset model
-            self.config_file, self.checkpoint_file = MODEL_CONFIGS[model_name]
-        else:
-            raise ValueError(f"Unknown model name: {model_name}. Available: {list(MODEL_CONFIGS.keys())}")
+        # Check if SAM3 was requested but is not available
+        if use_sam3 and not SAM3_AVAILABLE:
+            print("=" * 60)
+            print("WARNING: SAM3 requested but not available")
+            print("=" * 60)
+            print("Possible causes:")
+            print("  1. SAM3 not installed (run setup.py and choose SAM3)")
+            print("  2. Missing dependencies (huggingface-hub, decord, einops)")
+            print("  3. Python < 3.12 or PyTorch < 2.7")
+            print()
+            print("Falling back to SAM2...")
+            print("=" * 60)
+            print()
 
-        # Validate paths exist
-        if not os.path.exists(self.config_file):
+        self.use_sam3 = use_sam3 and SAM3_AVAILABLE
+
+        # Special handling for SAM3
+        if self.use_sam3:
+            if model_name != "sam3" and not (config_file and checkpoint_file):
+                model_name = "sam3"  # Force SAM3 model
+            self.config_file, self.checkpoint_file = MODEL_CONFIGS.get("sam3", (None, None))
+        else:
+            # Determine config and checkpoint paths
+            if config_file and checkpoint_file:
+                # Use custom paths
+                self.config_file = config_file
+                self.checkpoint_file = checkpoint_file
+            elif model_name in MODEL_CONFIGS:
+                # Use preset model
+                self.config_file, self.checkpoint_file = MODEL_CONFIGS[model_name]
+            else:
+                raise ValueError(f"Unknown model name: {model_name}. Available: {list(MODEL_CONFIGS.keys())}")
+
+        # Validate paths exist (skip config validation for SAM3)
+        if not self.use_sam3 and not os.path.exists(self.config_file):
             raise FileNotFoundError(f"Config file not found: {self.config_file}")
 
         # Checkpoint is optional for some use cases, but warn if missing
@@ -108,47 +196,68 @@ class SAM2Processor:
         self.async_loading = async_loading
         self.smooth_masks = smooth_masks
         self.use_bfloat16 = use_bfloat16
-        
+        self.no_backward_propagation = False  # Will be set from command line args
+
     def load_model(self):
-        """Load SAM2 model with correct API usage"""
-        print(f"Loading SAM2 model...")
-        print(f"  Config: {self.config_file}")
+        """Load SAM2 or SAM3 model with correct API usage"""
+        model_type = "SAM3" if self.use_sam3 else "SAM2"
+        print(f"Loading {model_type} model...")
+
+        if not self.use_sam3:
+            print(f"  Config: {self.config_file}")
         print(f"  Checkpoint: {self.checkpoint_file or 'None (random init)'}")
 
         try:
-            # FIXED: Pass config_file as first argument, ckpt_path as optional second
             device = "cuda" if torch.cuda.is_available() else "cpu"
             print(f"  Device: {device}")
 
-            
+            # Load model based on type
+            if self.use_sam3:
+                # SAM3 loading
+                if not SAM3_AVAILABLE:
+                    raise ImportError("SAM3 not available. Run setup.py to install.")
 
-            # DO NOT convert model dtype - keep native float32 from checkpoint
-            # For bfloat16: Enable GLOBAL autocast (SAM2 benchmark pattern line 20)
-            if device == "cuda":
-                # Enable TF32 for Ampere GPUs (RTX 30xx+, A100) for better performance
-                if torch.cuda.get_device_properties(0).major >= 8:
-                    torch.backends.cuda.matmul.allow_tf32 = True
-                    torch.backends.cudnn.allow_tf32 = True
-                    print("  TensorFloat32 (TF32) enabled for Ampere GPU")
+                from sam3.model_builder import build_sam3_video_model
+                print("  Building SAM3 model (may download from HuggingFace)...")
 
-                if self.use_bfloat16:
-                    # CRITICAL: Enable GLOBAL autocast before any SAM2 operations
-                    # This stays active for entire program to handle bfloat16 memory features
-                    torch.autocast(device_type="cuda", dtype=torch.bfloat16).__enter__()
-                    print("  BFloat16 mode: GLOBAL autocast enabled")
-                    print("  Model weights remain in float32 (checkpoint dtype)")
-                else:
-                    print("  Float32 mode: native precision (no autocast)")
+                # Build SAM3 model and extract tracker with SAM2-compatible API
+                # (Matches sam2_ui.py implementation)
+                sam3_model = build_sam3_video_model(device=device)
 
-            self.video_predictor = build_sam2_video_predictor(
-                config_file=self.config_file,
-                ckpt_path=self.checkpoint_file,  # Optional parameter
-                device=device
-            )
-            print("OK: Model loaded successfully")
+                # Extract the tracker component (has init_state, add_new_points, etc.)
+                self.video_predictor = sam3_model.tracker
+                # Attach backbone for feature extraction
+                self.video_predictor.backbone = sam3_model.detector.backbone
+
+            else:
+                # SAM2 loading (existing logic)
+                if device == "cuda":
+                    # Enable TF32 for Ampere GPUs (RTX 30xx+, A100) for better performance
+                    if torch.cuda.get_device_properties(0).major >= 8:
+                        torch.backends.cuda.matmul.allow_tf32 = True
+                        torch.backends.cudnn.allow_tf32 = True
+                        print("  TensorFloat32 (TF32) enabled for Ampere GPU")
+
+                    if self.use_bfloat16:
+                        # CRITICAL: Enable GLOBAL autocast before any SAM2 operations
+                        # This stays active for entire program to handle bfloat16 memory features
+                        torch.autocast(device_type="cuda", dtype=torch.bfloat16).__enter__()
+                        print("  BFloat16 mode: GLOBAL autocast enabled")
+                        print("  Model weights remain in float32 (checkpoint dtype)")
+                    else:
+                        print("  Float32 mode: native precision (no autocast)")
+
+                self.video_predictor = build_sam2_video_predictor(
+                    config_file=self.config_file,
+                    ckpt_path=self.checkpoint_file,  # Optional parameter
+                    device=device
+                )
+
+            print(f"OK: {model_type} model loaded successfully")
             return True
+
         except Exception as e:
-            print(f"ERROR: Failed to load model: {e}")
+            print(f"ERROR: Failed to load {model_type} model: {e}")
             import traceback
             traceback.print_exc()
             return False
@@ -176,12 +285,13 @@ class SAM2Processor:
     def _compress_video_with_ffmpeg(self, input_path, output_path, crf=23, preset='medium'):
         """
         Re-encode video with FFmpeg using CRF compression.
+        Handles FFmpeg builds that don't support -preset option.
 
         Args:
             input_path: Temp uncompressed video
             output_path: Final compressed video
             crf: Quality (0-51, lower=better, 23=medium)
-            preset: Encoding speed (medium recommended)
+            preset: Encoding speed (medium recommended, may not be supported by all FFmpeg builds)
 
         Returns:
             bool: True if successful
@@ -198,7 +308,8 @@ class SAM2Processor:
         try:
             print(f"Compressing with FFmpeg (CRF={crf})...")
 
-            cmd = [
+            # Build command with preset
+            cmd_with_preset = [
                 ffmpeg_path,
                 '-i', input_path,
                 '-c:v', 'libx264',
@@ -209,13 +320,38 @@ class SAM2Processor:
                 output_path
             ]
 
-            result = subprocess.run(cmd, stdout=subprocess.PIPE,
+            # Try with preset first
+            result = subprocess.run(cmd_with_preset, stdout=subprocess.PIPE,
                                   stderr=subprocess.PIPE, text=True)
 
             if result.returncode != 0:
-                print(f"FFmpeg error: {result.stderr}")
-                shutil.move(input_path, output_path)
-                return False
+                # Check if error is due to preset option not being recognized
+                stderr_lower = result.stderr.lower()
+                if 'preset' in stderr_lower and ('unrecognized' in stderr_lower or 'option not found' in stderr_lower):
+                    print(f"  FFmpeg doesn't support -preset option (conda build), retrying without it...")
+
+                    # Retry without preset
+                    cmd_no_preset = [
+                        ffmpeg_path,
+                        '-i', input_path,
+                        '-c:v', 'libx264',
+                        '-crf', str(crf),
+                        '-movflags', '+faststart',
+                        '-y',
+                        output_path
+                    ]
+
+                    result = subprocess.run(cmd_no_preset, stdout=subprocess.PIPE,
+                                          stderr=subprocess.PIPE, text=True)
+                    if result.returncode != 0:
+                        print(f"FFmpeg error: {result.stderr}")
+                        shutil.move(input_path, output_path)
+                        return False
+                else:
+                    # Different error
+                    print(f"FFmpeg error: {result.stderr}")
+                    shutil.move(input_path, output_path)
+                    return False
 
             # Report compression stats
             original_size = os.path.getsize(input_path)
@@ -322,8 +458,22 @@ class SAM2Processor:
             else:
                 print(f"  Skipping frame extraction (using existing frames)")
 
+            # Get frame dimensions for coordinate conversion (needed for SAM3)
+            # SAM3 requires relative [0-1] coordinates, so we need to know frame dimensions
+            if self.use_sam3:
+                # Get dimensions from first frame
+                first_frame_path = sorted(temp_dir.glob("*.jpg"))[0]
+                first_frame = cv2.imread(str(first_frame_path))
+                if first_frame is None:
+                    raise ValueError(f"Cannot read first frame: {first_frame_path}")
+                frame_height, frame_width = first_frame.shape[:2]
+                print(f"  Frame dimensions for SAM3 coordinate conversion: {frame_width}x{frame_height}")
+                del first_frame  # Free memory
+            else:
+                frame_width = frame_height = None  # Not needed for SAM2
+
             # Initialize SAM2 inference state with JPEG directory
-            print("Initializing SAM2 inference state...")
+            print("Initializing SAM inference state...")
 
             # Build init_state parameters
             init_params = {'video_path': str(temp_dir)}
@@ -394,41 +544,80 @@ class SAM2Processor:
                     if not points:
                         continue
 
-                    points_np = np.array(points, dtype=np.float32)
+                    # Convert points for SAM3 if needed
+                    if self.use_sam3:
+                        # SAM3 requires relative [0-1] coordinates
+                        rel_points = [[x / frame_width, y / frame_height] for x, y in points]
+                        points_np = np.array(rel_points, dtype=np.float32)
+                        print(f"    SAM3 coordinate conversion: Pixel {points[0]} → Relative [{rel_points[0][0]:.4f}, {rel_points[0][1]:.4f}]")
+                    else:
+                        # SAM2 uses pixel coordinates
+                        points_np = np.array(points, dtype=np.float32)
+
                     labels_np = np.array(labels, dtype=np.int32)
 
                     print(f"  Frame {frame_idx}: {len(points)} points")
 
                     try:
-                        _, out_obj_ids, out_mask_logits = self.video_predictor.add_new_points(
-                            inference_state=inference_state,
-                            frame_idx=frame_idx,
-                            obj_id=obj_id,
-                            points=points_np,
-                            labels=labels_np,
-                        )
+                        # SAM3 returns 4 values, SAM2 returns 3
+                        if self.use_sam3:
+                            _, out_obj_ids, low_res_masks, video_res_masks = self.video_predictor.add_new_points(
+                                inference_state=inference_state,
+                                frame_idx=frame_idx,
+                                obj_id=obj_id,
+                                points=points_np,
+                                labels=labels_np,
+                            )
+                        else:
+                            _, out_obj_ids, out_mask_logits = self.video_predictor.add_new_points(
+                                inference_state=inference_state,
+                                frame_idx=frame_idx,
+                                obj_id=obj_id,
+                                points=points_np,
+                                labels=labels_np,
+                            )
                     except Exception as e:
                         print(f"    WARNING: Error adding points: {e}")
                         continue
 
-            # Determine earliest annotation frame for bidirectional propagation
-            earliest_frame = min(frame_annotations.keys()) if frame_annotations else 0
-
+            
             # Create output directories for streaming export
             masks_dir = Path(output_dir) / "masks"
             masks_dir.mkdir(parents=True, exist_ok=True)
 
-            # Propagate annotations - FORWARD direction first
-            print(f"\nPropagating annotations FORWARD from frame {earliest_frame}...")
+            # Propagate annotations - FORWARD direction (frame 0 → end)
+            # IMPORTANT: Always propagate from frame 0 to ensure full video coverage
+            print(f"\nPropagating annotations FORWARD (frames 0 to {num_frames-1})...")
 
             masks_metadata = {}  # Only metadata, not actual mask arrays
 
             # CRITICAL: Nested autocast context to handle bfloat16 tensors from CPU offloading
-            # Matches SAM2 benchmark.py pattern (line 72) for proper dtype handling
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                for out_frame_idx, out_obj_ids, out_mask_logits in self.video_predictor.propagate_in_video(
-                    inference_state, reverse=False
-                ):
+                # Construct propagation call based on model type
+                if self.use_sam3:
+                    # SAM3 requires explicit frame range
+                    propagate_iterator = self.video_predictor.propagate_in_video(
+                        inference_state,
+                        start_frame_idx=0,  # Start from beginning for full coverage
+                        max_frame_num_to_track=num_frames,
+                        reverse=False,
+                        propagate_preflight=True  # Consolidate points before propagation
+                    )
+                else:
+                    # SAM2: Use default propagation (starts from annotation frames and goes forward)
+                    # Note: SAM2 doesn't support explicit start_frame_idx, so we rely on reverse=False
+                    # covering from annotations forward to end
+                    propagate_iterator = self.video_predictor.propagate_in_video(
+                        inference_state, reverse=False
+                    )
+
+                for result in propagate_iterator:
+                    # Unpack based on model type (SAM3 returns 5 values, SAM2 returns 3)
+                    if self.use_sam3:
+                        out_frame_idx, out_obj_ids, out_low_res_masks, out_mask_logits, out_obj_scores = result
+                    else:
+                        out_frame_idx, out_obj_ids, out_mask_logits = result
+
                     frame_masks = {}
 
                     for i, obj_id in enumerate(out_obj_ids):
@@ -444,9 +633,10 @@ class SAM2Processor:
                         cv2.imwrite(str(mask_path), (mask * 255).astype(np.uint8))
 
                         # Store metadata only (no mask array!)
+                        score = out_obj_scores[i] if self.use_sam3 else 1.0
                         frame_masks[obj_id] = {
                             'filename': mask_filename,
-                            'score': 1.0,
+                            'score': float(score),
                             'name': obj_name,
                             'color': obj_color
                         }
@@ -460,11 +650,9 @@ class SAM2Processor:
                     del out_mask_logits
 
                     if (out_frame_idx + 1) % 50 == 0:
-                        # Monitor GPU and RAM usage to track memory growth
+                        # Monitor GPU and RAM usage
                         gpu_allocated = torch.cuda.memory_allocated() / (1024**3)
-                        gpu_reserved = torch.cuda.memory_reserved() / (1024**3)
                         gpu_peak = torch.cuda.max_memory_allocated() / (1024**3)
-
                         process = psutil.Process()
                         ram_used = process.memory_info().rss / (1024**3)
 
@@ -472,35 +660,54 @@ class SAM2Processor:
                               f"GPU: {gpu_allocated:.2f}GB (peak: {gpu_peak:.2f}GB) | "
                               f"RAM: {ram_used:.2f}GB")
 
-                        # CRITICAL: Periodic cleanup of old frames to prevent memory growth
-                        # Keep only last 20 frames (SAM2 needs max 6-16 for memory attention)
+                        # CRITICAL: Periodic cleanup of old frames
                         frames_to_keep = 20
                         for obj_idx in range(len(inference_state["obj_ids"])):
                             obj_output_dict = inference_state["output_dict_per_obj"][obj_idx]
                             non_cond = obj_output_dict.get("non_cond_frame_outputs", {})
-
-                            # Find frames older than the retention window
                             old_frames = [f for f in non_cond.keys() if f < out_frame_idx - frames_to_keep]
-
-                            # Delete old frame outputs
                             for old_frame in old_frames:
                                 del non_cond[old_frame]
 
-                        # Reset peak stats for next interval
                         torch.cuda.reset_peak_memory_stats()
-                        # Clear GPU memory fragmentation
                         torch.cuda.empty_cache()
 
-            # Propagate annotations - BACKWARD direction (if needed)
-            if earliest_frame > 0:
-                print(f"\nPropagating annotations BACKWARD from frame {earliest_frame}...")
+            # Propagate annotations - BACKWARD direction (last frame → 0)
+            # IMPORTANT: Always propagate backward to ensure full video coverage from both directions
+            # This provides better quality by having bidirectional temporal context
 
-                # CRITICAL: Nested autocast context to handle bfloat16 tensors from CPU offloading
-                # Matches SAM2 benchmark.py pattern (line 72) for proper dtype handling
+            if self.no_backward_propagation:
+                print("\n  Skipping backward propagation (disabled by --no-backward flag)")
+                print("  WARNING: This may result in lower quality segmentation as only forward propagation is used")
+            else:
+                print(f"\nPropagating annotations BACKWARD (frames {num_frames-1} to 0)...")
+
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    for out_frame_idx, out_obj_ids, out_mask_logits in self.video_predictor.propagate_in_video(
-                        inference_state, reverse=True
-                    ):
+                    # Construct propagation call based on model type
+                    if self.use_sam3:
+                        # SAM3 requires explicit frame range for backward propagation
+                        propagate_iterator = self.video_predictor.propagate_in_video(
+                            inference_state,
+                            start_frame_idx=0,  # Start from end
+                            max_frame_num_to_track=num_frames,
+                            reverse=True,
+                            propagate_preflight=True
+                        )
+                    else:
+                        # SAM2: Use default backward propagation
+                        propagate_iterator = self.video_predictor.propagate_in_video(
+                            inference_state, reverse=True
+                        )
+
+                    for result in propagate_iterator:
+                        # Unpack based on model type
+                        # SAM3 returns 5 values for BOTH forward and backward
+                        # SAM2 returns 3 values
+                        if self.use_sam3:
+                            out_frame_idx, out_obj_ids, out_low_res_masks, out_mask_logits, out_obj_scores = result
+                        else:
+                            out_frame_idx, out_obj_ids, out_mask_logits = result
+
                         frame_masks = {}
 
                         for i, obj_id in enumerate(out_obj_ids):
@@ -510,33 +717,31 @@ class SAM2Processor:
                             obj_name = object_names.get(str(obj_id), f"Object_{obj_id}")
                             obj_color = object_colors.get(str(obj_id), [255, 0, 0])
 
-                            # Export mask to disk immediately (streaming export)
+                            # Export mask to disk immediately
                             mask_filename = f"mask_f{out_frame_idx:06d}_{obj_name}_id{obj_id}.png"
                             mask_path = masks_dir / mask_filename
                             cv2.imwrite(str(mask_path), (mask * 255).astype(np.uint8))
 
-                            # Store metadata only (no mask array!)
+                            # Store metadata with confidence score for SAM3
+                            score = out_obj_scores[i].item() if self.use_sam3 else 1.0
                             frame_masks[obj_id] = {
                                 'filename': mask_filename,
-                                'score': 1.0,
+                                'score': float(score),
                                 'name': obj_name,
                                 'color': obj_color
                             }
 
-                            # Explicitly delete mask array
                             del mask
 
                         masks_metadata[out_frame_idx] = frame_masks
-
-                        # Delete output tensors after each frame
                         del out_mask_logits
+                        if self.use_sam3:
+                            del out_low_res_masks
+                            del out_obj_scores
 
                         if (out_frame_idx + 1) % 50 == 0:
-                            # Monitor GPU and RAM usage to track memory growth
                             gpu_allocated = torch.cuda.memory_allocated() / (1024**3)
-                            gpu_reserved = torch.cuda.memory_reserved() / (1024**3)
                             gpu_peak = torch.cuda.max_memory_allocated() / (1024**3)
-
                             process = psutil.Process()
                             ram_used = process.memory_info().rss / (1024**3)
 
@@ -544,26 +749,17 @@ class SAM2Processor:
                                   f"GPU: {gpu_allocated:.2f}GB (peak: {gpu_peak:.2f}GB) | "
                                   f"RAM: {ram_used:.2f}GB")
 
-                            # CRITICAL: Periodic cleanup of old frames to prevent memory growth
-                            # Keep only last 20 frames (SAM2 needs max 6-16 for memory attention)
+                            # Periodic cleanup
                             frames_to_keep = 20
                             for obj_idx in range(len(inference_state["obj_ids"])):
                                 obj_output_dict = inference_state["output_dict_per_obj"][obj_idx]
                                 non_cond = obj_output_dict.get("non_cond_frame_outputs", {})
-
-                                # Find frames older than the retention window
                                 old_frames = [f for f in non_cond.keys() if f < out_frame_idx - frames_to_keep]
-
-                                # Delete old frame outputs
                                 for old_frame in old_frames:
                                     del non_cond[old_frame]
 
-                            # Reset peak stats for next interval
                             torch.cuda.reset_peak_memory_stats()
-                            # Clear GPU memory fragmentation
                             torch.cuda.empty_cache()
-            else:
-                print("  Skipping backward propagation (earliest annotation at frame 0)")
 
             # Phase 2: Clear SAM2's internal frame outputs (safe after propagation)
             print("\nCleaning up SAM2 inference state...")
@@ -849,9 +1045,9 @@ Examples:
 
     # Model selection (mutually exclusive)
     model_group = parser.add_mutually_exclusive_group()
-    model_group.add_argument("--model", default="sam2-base+",
+    model_group.add_argument("--model", default=None,
                            choices=list(MODEL_CONFIGS.keys()),
-                           help="Preset model name (default: sam2-base+)")
+                           help="Preset model name (default: auto-select based on GPU memory)")
     model_group.add_argument("--config", help="Custom config YAML path (requires --checkpoint)")
 
     parser.add_argument("--checkpoint", help="Custom checkpoint path (requires --config)")
@@ -869,6 +1065,10 @@ Examples:
                        help="Persistent directory for video frames (default: auto-generated in /tmp). If specified, frames will be reused from previous runs and not deleted after processing.")
     parser.add_argument("--frame-cache-size", type=int, default=20,
                        help="Number of frames to keep in memory cache (default: 20, ~2GB). Minimum: 10, Recommended: 20-50.")
+    parser.add_argument("--use-sam3", action="store_true",
+                       help="Use SAM3 model instead of SAM2 (requires SAM3 installation, Python 3.12+, PyTorch 2.7+, CUDA 12.6+)")
+    parser.add_argument("--no-backward", action="store_true", dest="no_backward",
+                       help="Disable backward propagation (not recommended, may result in lower quality segmentation for frames before first annotation)")
 
     args = parser.parse_args()
 
@@ -877,6 +1077,10 @@ Examples:
         parser.error("--config requires --checkpoint")
     if args.checkpoint and not args.config:
         parser.error("--checkpoint requires --config")
+
+    # Auto-select model if not specified
+    if args.model is None and not args.config:
+        args.model = _auto_select_default_model()
 
     # Validate input files
     if not os.path.exists(args.annotation_file):
@@ -945,19 +1149,25 @@ Examples:
         print(f"Memory optimization: CPU offloading enabled")
     print()
 
-    # Enable lazy loading BEFORE creating SAM2 model
-    enable_lazy_loading(cache_size=args.frame_cache_size)
+    # Enable lazy loading BEFORE creating SAM2 model (SAM3 has its own frame loading)
+    if not args.use_sam3:
+        enable_lazy_loading(cache_size=args.frame_cache_size)
 
     # Initialize processor
     try:
         if args.config:
             processor = SAM2Processor(config_file=args.config, checkpoint_file=args.checkpoint,
                                      offload_to_cpu=args.offload_to_cpu, async_loading=args.async_loading,
-                                     smooth_masks=args.smooth_masks, use_bfloat16=args.use_bfloat16)
+                                     smooth_masks=args.smooth_masks, use_bfloat16=args.use_bfloat16,
+                                     use_sam3=args.use_sam3)
         else:
             processor = SAM2Processor(model_name=args.model, offload_to_cpu=args.offload_to_cpu,
                                      async_loading=args.async_loading, smooth_masks=args.smooth_masks,
-                                     use_bfloat16=args.use_bfloat16)
+                                     use_bfloat16=args.use_bfloat16, use_sam3=args.use_sam3)
+
+        # Set no_backward flag
+        processor.no_backward_propagation = args.no_backward
+
     except (ValueError, FileNotFoundError) as e:
         print(f"ERROR: {e}")
         return 1
