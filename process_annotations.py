@@ -1004,20 +1004,24 @@ class SAM2Processor:
         if not frames:
             return False
 
-        video_output_path_final = Path(output_dir) / "segmented_video.mp4"
-        video_output_path_temp = Path(output_dir) / "segmented_video.temp.mp4" if compress else video_output_path_final
+        video_output_path_final = Path(output_dir) / "segmented_video.avi"
+        video_output_path_temp = Path(output_dir) / "segmented_video.temp.avi" if compress else video_output_path_final
         
         height, width = frames[0].shape[:2]
 
+        fourcc = cv2.VideoWriter_fourcc(*"MJPG")
+        out = cv2.VideoWriter(str(video_output_path_temp.with_suffix(".avi")),
+            fourcc, fps, (width, height))
+
         # Use H.264 codec for much better compression and quality
         # Try different codec identifiers based on system availability
-        for codec in ['avc1', 'H264', 'X264', 'mp4v']:
-            fourcc = cv2.VideoWriter_fourcc(*codec)
-            out = cv2.VideoWriter(str(video_output_path_temp), fourcc, fps, (width, height))
-            if out.isOpened():
-                if codec != 'mp4v':
-                    print(f"  Using {codec} codec for video encoding")
-                break
+        # for codec in ['avc1', 'H264', 'X264', 'mp4v']:
+        #     fourcc = cv2.VideoWriter_fourcc(*codec)
+        #     out = cv2.VideoWriter(str(video_output_path_temp), fourcc, fps, (width, height))
+        #     if out.isOpened():
+        #         if codec != 'mp4v':
+        #             print(f"  Using {codec} codec for video encoding")
+        #         break
 
         if not out.isOpened():
             print("  WARNING: Could not initialize video writer with any codec")
@@ -1136,7 +1140,7 @@ class SAM2Processor:
             },
             "file_paths": {
                 "original_video_path": str(Path(video_path).resolve()) if video_path else None,
-                "segmented_video_filename": "segmented_video.mp4",
+                "segmented_video_filename": "segmented_video.avi",
                 "metadata_filename": "processing_metadata.json"
             },
             "original_annotations": annotations_data
@@ -1232,14 +1236,14 @@ Examples:
 
     # Check if output already exists
     masks_dir = output_dir / "masks"
-    video_file = output_dir / "segmented_video.mp4"
+    video_file = output_dir / "segmented_video.avi"
     metadata_file = output_dir / "processing_metadata.json"
 
     existing_items = []
     if masks_dir.exists() and list(masks_dir.glob("*.png")):
         existing_items.append(f"masks/ ({len(list(masks_dir.glob('*.png')))} files)")
     if video_file.exists():
-        existing_items.append("segmented_video.mp4")
+        existing_items.append("segmented_video.avi")
     if metadata_file.exists():
         existing_items.append("processing_metadata.json")
 
@@ -1351,7 +1355,7 @@ Examples:
         print()
         print("Generated files:")
         print(f"  - Masks: {output_dir}/masks/")
-        print(f"  - Video: {output_dir}/segmented_video.mp4")
+        print(f"  - Video: {output_dir}/segmented_video.avi")
         print(f"  - Metadata: {output_dir}/processing_metadata.json")
         print()
 

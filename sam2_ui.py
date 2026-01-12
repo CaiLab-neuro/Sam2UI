@@ -125,7 +125,7 @@ class SAM2VideoUI:
         self.using_sam3 = False
         
         # Lazy loading option for large videos
-        self.lazy_load_var = tk.BooleanVar(value=False)  # Load frames on demand
+        self.lazy_load_var = tk.BooleanVar(value=True)  # Load frames on demand
         self.video_cap_lazy = None  # Keep video capture open for lazy loading
 
         # Button references for highlighting selected options
@@ -1014,7 +1014,7 @@ class SAM2VideoUI:
 
             # Get file paths from metadata (with backward compatibility)
             file_paths = metadata.get("file_paths", {})
-            segmented_video_filename = file_paths.get("segmented_video_filename", "segmented_video.mp4")
+            segmented_video_filename = file_paths.get("segmented_video_filename", "segmented_video.avi")
 
             # Store original video path for re-segmentation
             self.original_video_path_for_resegment = file_paths.get("original_video_path")
@@ -4027,7 +4027,7 @@ class SAM2VideoUI:
                                     # Use original_video_path_for_resegment if available (when re-segmenting loaded results),
                                     # otherwise use video_path (when segmenting freshly loaded video)
                                     "original_video_path": str(Path(self.original_video_path_for_resegment).resolve()) if self.original_video_path_for_resegment else (str(Path(self.video_path).resolve()) if self.video_path else None),
-                                    "segmented_video_filename": "segmented_video.mp4",
+                                    "segmented_video_filename": "segmented_video.avi",
                                     "metadata_filename": "processing_metadata.json"
                                 },
                                 "original_annotations": annotations_data
@@ -4035,7 +4035,7 @@ class SAM2VideoUI:
 
                         print(f"[SUCCESS] Results saved to: {output_base_dir}")
                         print(f"   - Masks: {masks_output_dir}/ ({total_masks} files)")
-                        print(f"   - Video: {output_base_dir}/segmented_video.mp4")
+                        print(f"   - Video: {output_base_dir}/segmented_video.avi")
                         print(f"   - Metadata: {metadata_path}")
 
                         # Reload the segmented video into UI for playback
@@ -4043,7 +4043,7 @@ class SAM2VideoUI:
                         self.root.update()
 
                         try:
-                            segmented_video_path = os.path.join(output_base_dir, "segmented_video.mp4")
+                            segmented_video_path = os.path.join(output_base_dir, "segmented_video.avi")
                             if os.path.exists(segmented_video_path):
                                 # Clear old frames
                                 self.frames = []
@@ -4148,8 +4148,8 @@ class SAM2VideoUI:
         """
         print("Exporting segmented video...")
 
-        video_output_path_final = os.path.join(output_dir, "segmented_video.mp4")
-        video_output_path_temp = video_output_path_final + ".temp.mp4"
+        video_output_path_final = os.path.join(output_dir, "segmented_video.avi")
+        video_output_path_temp = video_output_path_final + ".temp.avi"
 
         # Determine if we should load from source video or use cached frames
         use_source_video = source_video_path is not None and os.path.exists(source_video_path)
@@ -4179,13 +4179,17 @@ class SAM2VideoUI:
             cap = None
 
         # Use H.264 codec (matching process_annotations.py)
-        for codec in ['avc1', 'H264', 'X264', 'mp4v']:
-            fourcc = cv2.VideoWriter_fourcc(*codec)
-            out = cv2.VideoWriter(video_output_path_temp, fourcc, fps, (width, height))
-            if out.isOpened():
-                if codec != 'mp4v':
-                    print(f"  Using {codec} codec for video encoding")
-                break
+        # for codec in ['avc1', 'H264', 'X264', 'mp4v']:
+        #     fourcc = cv2.VideoWriter_fourcc(*codec)
+        #     out = cv2.VideoWriter(video_output_path_temp, fourcc, fps, (width, height))
+        #     if out.isOpened():
+        #         if codec != 'mp4v':
+        #             print(f"  Using {codec} codec for video encoding")
+        #         break
+        fourcc = cv2.VideoWriter_fourcc(*"MJPG")
+        out = cv2.VideoWriter(str(video_output_path_temp.with_suffix(".avi")),
+            fourcc, fps, (width, height))
+
 
         if not out.isOpened():
             print("  WARNING: Could not initialize video writer with any codec")
