@@ -4138,8 +4138,8 @@ class SAM2VideoUI:
         """
         print("Exporting segmented video...")
 
-        video_output_path_final = os.path.join(output_dir, "segmented_video.avi")
-        video_output_path_temp = video_output_path_final + ".temp.avi"
+        video_output_path_final = Path(output_dir) / "segmented_video.avi"
+        video_output_path_temp = Path(output_dir) / "segmented_video.temp.avi"
 
         # Determine if we should load from source video or use cached frames
         use_source_video = source_video_path is not None and os.path.exists(source_video_path)
@@ -5524,21 +5524,23 @@ class SAM2VideoUI:
                 oldest_key = next(iter(self.mask_cache))
                 del self.mask_cache[oldest_key]
 
-    def _compress_video_with_ffmpeg(self, input_path, output_path, crf=23, preset='medium'):
+    def _compress_video_with_ffmpeg(
+        self,
+        input_path,
+        output_path,
+        crf=23,
+        preset='medium',
+        gop=10
+    ):
         """
-        Re-encode video with FFmpeg using CRF compression.
+        Re-encode video with FFmpeg using scrubbing-friendly compression.
 
-        Args:
-            input_path: Temp uncompressed video
-            output_path: Final compressed video
-            crf: Quality (0-51, lower=better, 23=medium)
-            preset: Encoding speed (medium recommended)
-
-        Returns:
-            bool: True if successful
+        Prefers short-GOP x264; falls back to MJPEG if unavailable.
         """
+
         import subprocess
         import shutil
+        import os
 
         ffmpeg_path = shutil.which('ffmpeg')
         if not ffmpeg_path:
@@ -5546,36 +5548,77 @@ class SAM2VideoUI:
             shutil.move(input_path, output_path)
             return False
 
-        try:
-            print(f"Compressing with FFmpeg (CRF={crf})...")
+        def has_libx264():
+            try:
+                r = subprocess.run(
+                    [ffmpeg_path, '-encoders'],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True
+                )
+                return 'libx264' in r.stdout
+            except Exception:
+                return False
 
-            cmd = [
-                ffmpeg_path,
-                '-i', input_path,
-                '-c:v', 'libx264',
-                '-crf', str(crf),
-                '-preset', preset,
-                '-movflags', '+faststart',
-                '-y',
-                output_path
-            ]
+        try:
+            if has_libx264():
+                print(f"Compressing with x264 (CRF={crf}, GOP={gop})")
+
+                cmd = [
+                    ffmpeg_path,
+                    '-loglevel', 'error',
+                    '-i', input_path,
+
+                    # Video encoding
+                    '-c:v', 'libx264',
+                    '-preset', preset,
+                    '-crf', str(crf),
+
+                    # Scrubbing-friendly settings
+                    '-g', str(gop),
+                    '-keyint_min', str(gop),
+                    '-bf', '0',
+                    '-x264-params', 'scenecut=0',
+
+                    # Compatibility
+                    '-pix_fmt', 'yuv420p',
+                    '-movflags', '+faststart',
+
+                    '-y',
+                    output_path
+                ]
+            else:
+                print("libx264 unavailable; falling back to MJPEG")
+
+                cmd = [
+                    ffmpeg_path,
+                    '-loglevel', 'error',
+                    '-i', input_path,
+                    '-c:v', 'mjpeg',
+                    '-q:v', '3',   # 2–5 is reasonable
+                    '-pix_fmt', 'yuv420p',
+                    '-y',
+                    output_path
+                ]
 
             result = subprocess.run(cmd, stdout=subprocess.PIPE,
-                                  stderr=subprocess.PIPE, text=True)
+                                    stderr=subprocess.PIPE, text=True)
 
             if result.returncode != 0:
-                print(f"FFmpeg error: {result.stderr}")
+                print(f"FFmpeg error:\n{result.stderr}")
                 shutil.move(input_path, output_path)
                 return False
 
-            # Report compression stats
             original_size = os.path.getsize(input_path)
             compressed_size = os.path.getsize(output_path)
             reduction = (1 - compressed_size / original_size) * 100
 
-            print(f"Compressed: {original_size/1e6:.1f}MB → {compressed_size/1e6:.1f}MB ({reduction:.1f}% reduction)")
+            print(
+                f"Compressed: {original_size/1e6:.1f}MB → "
+                f"{compressed_size/1e6:.1f}MB ({reduction:.1f}% reduction)"
+            )
 
-            os.remove(input_path)  # Delete temp
+            os.remove(input_path)
             return True
 
         except Exception as e:
@@ -5583,6 +5626,7 @@ class SAM2VideoUI:
             if os.path.exists(input_path):
                 shutil.move(input_path, output_path)
             return False
+
 
     def _get_config_file_path(self):
         """Get path to config file for storing persistent settings"""
