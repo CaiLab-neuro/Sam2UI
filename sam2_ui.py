@@ -3720,7 +3720,11 @@ class SAM2VideoUI:
 
                 # Initialize incremental quality metrics calculator
                 if self.frames:
-                    frame_height, frame_width = self.frames[0].shape[:2]
+                    if hasattr(self, 'video_cap_lazy') and self.video_cap_lazy:
+                        frame = self._load_frame_lazy(0)
+                    else:
+                        frame = self.frames[0]
+                    frame_height, frame_width = frame.shape[:2]
                     quality_calculator = IncrementalQualityMetricsCalculator(
                         frame_dimensions=(frame_height, frame_width),
                         num_frames=len(frames_to_process)
