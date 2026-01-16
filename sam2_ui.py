@@ -17,6 +17,17 @@ import time
 import threading
 import re
 
+# Import utility functions
+from utils import (
+    generate_mask_filename,
+    load_mask as load_mask_from_disk,
+    export_mask_to_disk as export_mask_to_disk_util,
+    calculate_quality_metrics,
+    save_quality_metrics,
+    load_quality_metrics,
+    IncrementalQualityMetricsCalculator,
+)
+
 # Add SAM2 path to Python path - dynamically detect project root
 def get_project_root():
     """Dynamically detect the project root directory (where sam2_ui.py lives)"""
@@ -1805,15 +1816,10 @@ class SAM2VideoUI:
         """
         Calculate inter-frame changes and background ratios.
         Called after segmentation completes.
+        Uses the calculate_quality_metrics utility from utils.py.
         """
         if not self.masks:
             return
-
-        print("Calculating segmentation quality metrics...")
-
-        num_frames = len(self.frames)
-        self.inter_frame_changes = []
-        self.background_ratios = []
 
         # Get frame dimensions
         dims = self._get_frame_dimensions()
@@ -1821,50 +1827,15 @@ class SAM2VideoUI:
             print("Cannot calculate metrics: frame dimensions unknown")
             return
 
-        height, width = dims
-        total_pixels = height * width
+        num_frames = len(self.frames)
 
-        prev_combined_mask = None
-
-        for frame_idx in range(num_frames):
-            # Create combined mask for this frame (all objects)
-            combined_mask = np.zeros((height, width), dtype=np.uint8)
-
-            if frame_idx in self.masks:
-                for obj_id in self.masks[frame_idx]:
-                    mask = self._load_mask(frame_idx, obj_id)
-                    if mask is not None:
-                        # Resize if needed
-                        if mask.shape != (height, width):
-                            from PIL import Image as PILImage
-                            mask_pil = PILImage.fromarray(mask)
-                            mask_pil = mask_pil.resize((width, height), PILImage.NEAREST)
-                            mask = np.array(mask_pil)
-
-                        # Mark object pixels (any non-zero value)
-                        combined_mask[mask > 0] = obj_id
-
-            # Calculate background ratio
-            object_pixels = np.count_nonzero(combined_mask)
-            bg_ratio = 1.0 - (object_pixels / total_pixels)
-            self.background_ratios.append(bg_ratio)
-
-            # Calculate inter-frame change
-            if prev_combined_mask is None:
-                # First frame: no previous frame to compare
-                self.inter_frame_changes.append(0.0)
-            else:
-                # Count pixels that changed category
-                changed_pixels = np.count_nonzero(combined_mask != prev_combined_mask)
-                change_ratio = changed_pixels / total_pixels
-                self.inter_frame_changes.append(change_ratio)
-
-            prev_combined_mask = combined_mask.copy()
-
-        print(f"Calculated metrics for {num_frames} frames")
-        if len(self.inter_frame_changes) > 1:
-            print(f"  Mean inter-frame change: {np.mean(self.inter_frame_changes[1:]):.3f}")
-        print(f"  Mean background ratio: {np.mean(self.background_ratios):.3f}")
+        # Use the utility function from utils.py
+        self.inter_frame_changes, self.background_ratios = calculate_quality_metrics(
+            masks=self.masks,
+            load_mask_func=self._load_mask,
+            frame_dimensions=dims,
+            num_frames=num_frames
+        )
 
         # Update visualization
         self._update_quality_visualizations()
@@ -2086,51 +2057,28 @@ class SAM2VideoUI:
             )
 
     def _save_quality_metrics(self, output_dir):
-        """Save quality metrics to quality_metrics.npz in output directory"""
-        if not self.inter_frame_changes or not self.background_ratios:
-            print("No quality metrics to save")
-            return False
-
-        try:
-            import numpy as np
-            metrics_path = os.path.join(output_dir, "quality_metrics.npz")
-
-            np.savez_compressed(
-                metrics_path,
-                inter_frame_changes=np.array(self.inter_frame_changes),
-                background_ratios=np.array(self.background_ratios),
-                frame_count=len(self.inter_frame_changes)
-            )
-
-            print(f"Saved quality metrics to {metrics_path}")
-            return True
-        except Exception as e:
-            print(f"WARNING: Failed to save quality metrics: {e}")
-            return False
+        """Save quality metrics to quality_metrics.npz in output directory.
+        Uses the save_quality_metrics utility from utils.py."""
+        return save_quality_metrics(
+            output_dir=output_dir,
+            inter_frame_changes=self.inter_frame_changes,
+            background_ratios=self.background_ratios
+        )
 
     def _load_quality_metrics(self, output_dir):
-        """Load quality metrics from quality_metrics.npz if available"""
-        metrics_path = os.path.join(output_dir, "quality_metrics.npz")
+        """Load quality metrics from quality_metrics.npz if available.
+        Uses the load_quality_metrics utility from utils.py."""
+        inter_frame_changes, background_ratios = load_quality_metrics(output_dir)
 
-        if not os.path.exists(metrics_path):
-            print("No quality metrics file found (OK for older results)")
-            return False
-
-        try:
-            import numpy as np
-            data = np.load(metrics_path)
-
-            self.inter_frame_changes = data['inter_frame_changes'].tolist()
-            self.background_ratios = data['background_ratios'].tolist()
-
-            print(f"Loaded quality metrics: {len(self.inter_frame_changes)} values")
-            self._update_quality_visualizations()  # Refresh color bars
-            return True
-        except Exception as e:
-            print(f"WARNING: Failed to load quality metrics: {e}")
+        if inter_frame_changes is None or background_ratios is None:
             self.inter_frame_changes = []
             self.background_ratios = []
             return False
+
+        self.inter_frame_changes = inter_frame_changes
+        self.background_ratios = background_ratios
+        self._update_quality_visualizations()  # Refresh color bars
+        return True
 
     def _on_viz_canvas_click(self, event):
         """
@@ -3770,6 +3718,16 @@ class SAM2VideoUI:
                 # Check if using SAM3 (different API signature)
                 is_sam3 = hasattr(self.sam2_model, '__class__') and 'Sam3' in self.sam2_model.__class__.__name__
 
+                # Initialize incremental quality metrics calculator
+                if self.frames:
+                    frame_height, frame_width = self.frames[0].shape[:2]
+                    quality_calculator = IncrementalQualityMetricsCalculator(
+                        frame_dimensions=(frame_height, frame_width),
+                        num_frames=len(frames_to_process)
+                    )
+                else:
+                    quality_calculator = None
+
                 try:
                     # SAM3 requires additional arguments for propagate_in_video
                     if is_sam3:
@@ -3795,6 +3753,9 @@ class SAM2VideoUI:
                             continue
                         original_frame_num = frames_to_process[out_frame_idx]
 
+                        # Collect masks for quality metrics calculation
+                        frame_masks_for_quality = {}
+
                         # Process each object mask
                         for i, out_obj_id in enumerate(out_obj_ids):
                             # Only keep masks for objects that were annotated anywhere
@@ -3819,9 +3780,17 @@ class SAM2VideoUI:
                                 mask_uint8 = (mask * 255).astype(np.uint8)
                                 self._export_mask_to_disk(original_frame_num, out_obj_id, mask_uint8, export_dir, mask_metadata)
 
+                                # Store mask for quality metrics calculation
+                                frame_masks_for_quality[out_obj_id] = mask_uint8
+
                                 # Explicitly delete tensors
                                 del mask_logits
                                 del mask
+
+                        # Update quality metrics incrementally during forward pass
+                        if quality_calculator is not None:
+                            quality_calculator.update_forward(original_frame_num, frame_masks_for_quality)
+                        del frame_masks_for_quality
 
                         # Clean up old frames from cache to prevent memory growth
                         self._cleanup_frame_cache(out_frame_idx, self.inference_state)
@@ -3880,6 +3849,9 @@ class SAM2VideoUI:
                             continue
                         original_frame_num = frames_to_process[out_frame_idx]
 
+                        # Collect masks for quality metrics calculation
+                        frame_masks_for_quality = {}
+
                         # Process each object mask
                         for i, out_obj_id in enumerate(out_obj_ids):
                             if any(out_obj_id in obj_dict for obj_dict in points_by_frame_and_object.values()):
@@ -3902,9 +3874,17 @@ class SAM2VideoUI:
                                 mask_uint8 = (mask * 255).astype(np.uint8)
                                 self._export_mask_to_disk(original_frame_num, out_obj_id, mask_uint8, export_dir, mask_metadata)
 
+                                # Store mask for quality metrics calculation
+                                frame_masks_for_quality[out_obj_id] = mask_uint8
+
                                 # Explicitly delete tensors
                                 del mask_logits
                                 del mask
+
+                        # Update quality metrics incrementally during backward pass
+                        if quality_calculator is not None:
+                            quality_calculator.update_backward(original_frame_num, frame_masks_for_quality)
+                        del frame_masks_for_quality
 
                         # Clean up old frames from cache to prevent memory growth
                         self._cleanup_frame_cache(out_frame_idx, self.inference_state)
@@ -4083,8 +4063,14 @@ class SAM2VideoUI:
                             traceback.print_exc()
                             # Continue anyway - segmentation succeeded even if reload failed
 
-                        # Calculate segmentation quality metrics
-                        self._calculate_segmentation_quality_metrics()
+                        # Get quality metrics from incremental calculator (already calculated during propagation)
+                        if quality_calculator is not None:
+                            self.inter_frame_changes, self.background_ratios = quality_calculator.get_results()
+                            quality_calculator.print_summary()
+                            self._update_quality_visualizations()
+                        else:
+                            # Fallback to disk-based calculation if calculator wasn't initialized
+                            self._calculate_segmentation_quality_metrics()
 
                         # Save quality metrics to disk
                         self._save_quality_metrics(output_base_dir)
@@ -4380,8 +4366,8 @@ class SAM2VideoUI:
                     if mask is None:
                         continue
                     obj_name = self.object_names.get(obj_id, f"Object_{obj_id}")
-                    # Use consolidated filename format: mask_f{frame_idx:06d}_{obj_name}_id{obj_id}.png
-                    mask_filename = f"mask_f{frame_idx:06d}_{obj_name}_id{obj_id}.png"
+                    # Use consolidated filename format from utils.py
+                    mask_filename = generate_mask_filename(frame_idx, obj_id, obj_name)
                     mask_path = os.path.join(export_dir, mask_filename)
                     
                     progress = (idx / total_frames) * 90
@@ -4494,8 +4480,9 @@ class SAM2VideoUI:
                     if mask is None:
                         continue
                     obj_name = object_names.get(obj_id, f"Object_{obj_id}")
-                    # Use consolidated filename format: mask_f{frame_idx:06d}_{obj_name}_id{obj_id}.png
-                    mask_path = os.path.join(folder_path, f"mask_f{frame_idx:06d}_{obj_name}_id{obj_id}.png")
+                    # Use consolidated filename format from utils.py
+                    mask_filename = generate_mask_filename(frame_idx, obj_id, obj_name)
+                    mask_path = os.path.join(folder_path, mask_filename)
                     cv2.imwrite(mask_path, mask)
                     exported_count += 1
             
@@ -5171,6 +5158,32 @@ class SAM2VideoUI:
             self.progress_bar.pack_forget()
             self.status_label.config(text="Export failed")
             messagebox.showerror("Export Error", f"Failed to export video: {str(e)}")
+
+    class _DisableCUDADuringInit:
+        """
+        Context manager to temporarily make torch.cuda.is_available() return False.
+
+        This is needed because SAM2 has hardcoded CUDA allocations during model init:
+        - position_encoding.py: warmup_cache allocates on cuda:0
+        - transformer.py: freqs_cis is moved to "cuda" (defaults to cuda:0)
+
+        By making CUDA appear unavailable during init, these allocations are skipped,
+        and the subsequent .to(device) call properly places everything on the correct device.
+        """
+        def __init__(self):
+            self._original_is_available = None
+
+        def __enter__(self):
+            if torch is not None:
+                self._original_is_available = torch.cuda.is_available
+                torch.cuda.is_available = lambda: False
+            return self
+
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            if torch is not None and self._original_is_available is not None:
+                torch.cuda.is_available = self._original_is_available
+            return False
+
     def load_sam2_model(self):
         """Load SAM2 or SAM3 model with correct video predictor initialization"""
         try:
@@ -5224,7 +5237,16 @@ class SAM2VideoUI:
                 self.status_label.config(text="Building SAM3 model (may download from HuggingFace)...")
                 self.root.update()
 
-                sam3_model = build_sam3_video_model(device=device)
+                # Use context manager to prevent hardcoded CUDA allocations
+                # SAM3 also inherits similar patterns from SAM2
+                should_disable_cuda_init = (device == "cpu" or
+                                            (device.startswith("cuda:") and device != "cuda:0"))
+
+                if should_disable_cuda_init:
+                    with SAM2VideoUI._DisableCUDADuringInit():
+                        sam3_model = build_sam3_video_model(device=device)
+                else:
+                    sam3_model = build_sam3_video_model(device=device)
 
                 # Extract the predictor using SAM2-compatible interface
                 self.sam2_model = sam3_model.tracker
@@ -5271,11 +5293,29 @@ class SAM2VideoUI:
                 self.using_sam3 = False
 
                 # Build the VIDEO predictor for SAM2
-                self.sam2_model = build_sam2_video_predictor(
-                    config_file=model_cfg,
-                    ckpt_path=sam2_checkpoint,
-                    device=device
-                )
+                # Use context manager to prevent hardcoded CUDA allocations when:
+                # - CPU is selected (device == "cpu")
+                # - A specific GPU is selected (device == "cuda:N" where N >= 0)
+                # SAM2 has hardcoded "cuda" allocations that default to cuda:0,
+                # which causes OOM errors on CPU or device mismatches on other GPUs.
+                # By temporarily making CUDA unavailable, we skip these allocations
+                # and let .to(device) properly place everything on the correct device.
+                should_disable_cuda_init = (device == "cpu" or
+                                            (device.startswith("cuda:") and device != "cuda:0"))
+
+                if should_disable_cuda_init:
+                    with SAM2VideoUI._DisableCUDADuringInit():
+                        self.sam2_model = build_sam2_video_predictor(
+                            config_file=model_cfg,
+                            ckpt_path=sam2_checkpoint,
+                            device=device
+                        )
+                else:
+                    self.sam2_model = build_sam2_video_predictor(
+                        config_file=model_cfg,
+                        ckpt_path=sam2_checkpoint,
+                        device=device
+                    )
 
             # Setup autocast context for BFloat16 (following SAM2 notebook pattern)
             if device != "cpu" and torch.cuda.is_available():
@@ -5374,7 +5414,8 @@ class SAM2VideoUI:
 
     def _export_mask_to_disk(self, frame_idx, obj_id, mask, output_dir, metadata_list):
         """
-        Export mask to disk immediately and store only metadata
+        Export mask to disk immediately and store only metadata.
+        Uses the export_mask_to_disk utility from utils.py.
 
         Args:
             frame_idx: Frame index
@@ -5383,30 +5424,19 @@ class SAM2VideoUI:
             output_dir: Directory to save masks
             metadata_list: List to append metadata to
         """
-        # Ensure output directory exists (output_dir is already the masks directory)
-        os.makedirs(output_dir, exist_ok=True)
-
         # Get object metadata first (needed for filename)
         obj_name = self.object_names.get(obj_id, f"Object_{obj_id}")
         obj_color = self.object_colors.get(obj_id, (255, 0, 0))
 
-        # Generate filename using new consolidated pattern
-        mask_filename = f"mask_f{frame_idx:06d}_{obj_name}_id{obj_id}.png"
-        mask_path = os.path.join(output_dir, mask_filename)
-
-        # Save mask to disk
-        cv2.imwrite(mask_path, mask)
-
-        # Store only metadata (filename, name, color) - NOT the full mask array
-        metadata = {
-            'frame_idx': frame_idx,
-            'obj_id': obj_id,
-            'mask_file': mask_filename,
-            'mask_path': mask_path,
-            'object_name': obj_name,
-            'color': obj_color,
-            'mask_shape': mask.shape
-        }
+        # Use the utility function from utils.py
+        metadata = export_mask_to_disk_util(
+            mask=mask,
+            output_dir=output_dir,
+            frame_idx=frame_idx,
+            obj_id=obj_id,
+            obj_name=obj_name,
+            obj_color=obj_color
+        )
         metadata_list.append(metadata)
 
         # Explicitly delete mask array to free memory immediately
@@ -5446,7 +5476,8 @@ class SAM2VideoUI:
 
     def _load_mask(self, frame_idx, obj_id):
         """
-        Load mask from disk with LRU caching
+        Load mask from disk with LRU caching.
+        Uses the load_mask utility from utils.py for the actual disk I/O.
 
         Args:
             frame_idx: Frame index
@@ -5464,40 +5495,21 @@ class SAM2VideoUI:
             print(f"WARNING: No mask export directory found for frame {frame_idx}, obj {obj_id}")
             return None
 
-        # Try 1: Exact name match with new pattern
+        # Get object name for filename lookup
         obj_name = self.object_names.get(obj_id, f"Object_{obj_id}")
-        mask_filename = f"mask_f{frame_idx:06d}_{obj_name}_id{obj_id}.png"
-        mask_path = os.path.join(self.mask_export_dir, mask_filename)
 
-        if os.path.exists(mask_path):
-            mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+        # Use the utility function from utils.py
+        mask = load_mask_from_disk(
+            mask_dir=self.mask_export_dir,
+            frame_idx=frame_idx,
+            obj_id=obj_id,
+            obj_name=obj_name
+        )
+
+        if mask is not None:
             self._cache_mask(cache_key, mask)
-            return mask
 
-        # Try 2: Legacy pattern (for backward compatibility)
-        mask_filename_legacy = f"frame_{frame_idx:05d}_obj_{obj_id}.png"
-        mask_path_legacy = os.path.join(self.mask_export_dir, mask_filename_legacy)
-
-        if os.path.exists(mask_path_legacy):
-            print(f"WARNING: Using legacy mask pattern for frame {frame_idx}, obj {obj_id}")
-            mask = cv2.imread(mask_path_legacy, cv2.IMREAD_GRAYSCALE)
-            self._cache_mask(cache_key, mask)
-            return mask
-
-        # Try 3: Pattern matching by frame and ID (name mismatch fallback)
-        for filename in os.listdir(self.mask_export_dir):
-            match = re.match(rf'mask_f{frame_idx:06d}_(.+)_id{obj_id}\.png', filename)
-            if match:
-                found_name = match.group(1)
-                print(f"WARNING: Mask name mismatch for obj {obj_id}. "
-                      f"Expected '{obj_name}', found '{found_name}'. Using found mask.")
-                mask_path_fallback = os.path.join(self.mask_export_dir, filename)
-                mask = cv2.imread(mask_path_fallback, cv2.IMREAD_GRAYSCALE)
-                self._cache_mask(cache_key, mask)
-                return mask
-
-        print(f"WARNING: Mask file not found for frame {frame_idx}, obj {obj_id}")
-        return None
+        return mask
 
     def _cache_mask(self, cache_key, mask):
         """Store mask in cache with LRU eviction"""

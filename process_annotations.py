@@ -41,6 +41,9 @@ import psutil
 # Import lazy loader BEFORE importing SAM2
 from sam2_lazy_loader import enable_lazy_loading
 
+# Import quality metrics utilities
+from utils import IncrementalQualityMetricsCalculator, save_quality_metrics
+
 try:
     from sam2.build_sam import build_sam2_video_predictor
 except ImportError as e:
@@ -564,19 +567,14 @@ class SAM2Processor:
             else:
                 print(f"  Skipping frame extraction (using existing frames)")
 
-            # Get frame dimensions for coordinate conversion (needed for SAM3)
-            # SAM3 requires relative [0-1] coordinates, so we need to know frame dimensions
-            if self.use_sam3:
-                # Get dimensions from first frame
-                first_frame_path = sorted(temp_dir.glob("*.jpg"))[0]
-                first_frame = cv2.imread(str(first_frame_path))
-                if first_frame is None:
-                    raise ValueError(f"Cannot read first frame: {first_frame_path}")
-                frame_height, frame_width = first_frame.shape[:2]
-                print(f"  Frame dimensions for SAM3 coordinate conversion: {frame_width}x{frame_height}")
-                del first_frame  # Free memory
-            else:
-                frame_width = frame_height = None  # Not needed for SAM2
+            # Get frame dimensions (needed for SAM3 coordinate conversion and quality metrics)
+            first_frame_path = sorted(temp_dir.glob("*.jpg"))[0]
+            first_frame = cv2.imread(str(first_frame_path))
+            if first_frame is None:
+                raise ValueError(f"Cannot read first frame: {first_frame_path}")
+            frame_height, frame_width = first_frame.shape[:2]
+            print(f"  Frame dimensions: {frame_width}x{frame_height}")
+            del first_frame  # Free memory
 
             # Initialize SAM2 inference state with JPEG directory
             print("Initializing SAM inference state...")
@@ -610,6 +608,13 @@ class SAM2Processor:
             num_frames = inference_state["num_frames"]
 
             print(f"  Initialized state for {num_frames} frames (autocast: {autocast_mode})")
+
+            # Initialize quality metrics calculator for incremental calculation during propagation
+            quality_calculator = IncrementalQualityMetricsCalculator(
+                frame_dimensions=(frame_height, frame_width),
+                num_frames=num_frames
+            )
+            print(f"  Quality metrics calculator initialized for {num_frames} frames")
 
             # Process each annotated frame
             object_names = annotations_data.get("object_names", {})
@@ -725,6 +730,7 @@ class SAM2Processor:
                         out_frame_idx, out_obj_ids, out_mask_logits = result
 
                     frame_masks = {}
+                    frame_masks_for_quality = {}  # For quality metrics calculation
 
                     for i, obj_id in enumerate(out_obj_ids):
                         mask = (out_mask_logits[i] > 0.0).cpu().numpy().squeeze()
@@ -747,10 +753,17 @@ class SAM2Processor:
                             'color': obj_color
                         }
 
+                        # Store mask for quality metrics (as uint8 for efficiency)
+                        frame_masks_for_quality[obj_id] = (mask * 255).astype(np.uint8)
+
                         # Explicitly delete mask array
                         del mask
 
                     masks_metadata[out_frame_idx] = frame_masks
+
+                    # Update quality metrics incrementally during forward pass
+                    quality_calculator.update_forward(out_frame_idx, frame_masks_for_quality)
+                    del frame_masks_for_quality  # Free memory after calculation
 
                     # CRITICAL: Delete ALL tensor variables to prevent memory accumulation
                     # SAM3 returns 5 values, SAM2 returns 3 - delete all applicable tensors
@@ -827,6 +840,7 @@ class SAM2Processor:
                             out_frame_idx, out_obj_ids, out_mask_logits = result
 
                         frame_masks = {}
+                        frame_masks_for_quality = {}  # For quality metrics calculation
 
                         for i, obj_id in enumerate(out_obj_ids):
                             mask = (out_mask_logits[i] > 0.0).cpu().numpy().squeeze()
@@ -849,9 +863,16 @@ class SAM2Processor:
                                 'color': obj_color
                             }
 
+                            # Store mask for quality metrics (as uint8 for efficiency)
+                            frame_masks_for_quality[obj_id] = (mask * 255).astype(np.uint8)
+
                             del mask
 
                         masks_metadata[out_frame_idx] = frame_masks
+
+                        # Update quality metrics incrementally during backward pass
+                        quality_calculator.update_backward(out_frame_idx, frame_masks_for_quality)
+                        del frame_masks_for_quality  # Free memory after calculation
 
                         # CRITICAL: Delete ALL tensor variables to prevent memory accumulation
                         # SAM3 returns 5 values, SAM2 returns 3 - delete all applicable tensors
@@ -908,6 +929,11 @@ class SAM2Processor:
 
             torch.cuda.empty_cache()
             print(f"OK: Cleaned {model_type} memory")
+
+            # Save quality metrics calculated during propagation
+            inter_frame_changes, background_ratios = quality_calculator.get_results()
+            quality_calculator.print_summary()
+            save_quality_metrics(str(output_dir), inter_frame_changes, background_ratios)
 
             print(f"\nOK: Generated masks for {len(masks_metadata)} frames")
             return masks_metadata, object_names, object_colors, num_frames
