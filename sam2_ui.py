@@ -26,6 +26,10 @@ from utils import (
     save_quality_metrics,
     load_quality_metrics,
     IncrementalQualityMetricsCalculator,
+    DisableCUDADuringInit,
+    should_disable_cuda_for_device,
+    patch_sam3_for_device,
+    compress_video_with_ffmpeg,
 )
 
 # Add SAM2 path to Python path - dynamically detect project root
@@ -666,7 +670,7 @@ class SAM2VideoUI:
         change_label = ttk.Label(viz_frame, text="Inter-frame Changes:")
         change_label.pack(anchor=tk.W)
 
-        self.change_viz_canvas = tk.Canvas(viz_frame, height=30, bg='gray80')
+        self.change_viz_canvas = tk.Canvas(viz_frame, height=15, bg='gray80')
         self.change_viz_canvas.pack(fill=tk.X, pady=(2, 5))
         self.change_viz_canvas.bind("<Button-1>", self._on_viz_canvas_click)
 
@@ -674,7 +678,7 @@ class SAM2VideoUI:
         bg_label = ttk.Label(viz_frame, text="Background Ratio:")
         bg_label.pack(anchor=tk.W)
 
-        self.bg_viz_canvas = tk.Canvas(viz_frame, height=30, bg='gray80')
+        self.bg_viz_canvas = tk.Canvas(viz_frame, height=15, bg='gray80')
         self.bg_viz_canvas.pack(fill=tk.X, pady=(2, 0))
         self.bg_viz_canvas.bind("<Button-1>", self._on_viz_canvas_click)
 
@@ -1853,7 +1857,7 @@ class SAM2VideoUI:
 
         # Get canvas dimensions
         canvas_width = self.change_viz_canvas.winfo_width()
-        canvas_height = 30
+        canvas_height = 15
 
         if canvas_width <= 1:  # Canvas not yet rendered
             self.root.update()
@@ -1931,7 +1935,7 @@ class SAM2VideoUI:
 
         # Get canvas dimensions
         canvas_width = self.change_viz_canvas.winfo_width()
-        canvas_height = 30
+        canvas_height = 15
 
         if canvas_width <= 1:
             return
@@ -1993,7 +1997,7 @@ class SAM2VideoUI:
 
         # Get canvas dimensions
         canvas_width = self.change_viz_canvas.winfo_width()
-        canvas_height = 30
+        canvas_height = 15
 
         if canvas_width <= 1:  # Canvas not yet rendered
             self.root.update()
@@ -2132,8 +2136,8 @@ class SAM2VideoUI:
         if not self.frames:
             return
         
-        # Handle lazy loading
-        if self.lazy_load_var.get() and hasattr(self, 'video_props'):
+        # Handle lazy loading (skip when viewing segmented video)
+        if self.lazy_load_var.get() and hasattr(self, 'video_props') and not getattr(self, 'segmented_video_displayed', False):
             # Load frame on demand
             frame = self._load_frame_lazy(self.current_frame_idx)
             if frame is None:
@@ -3547,10 +3551,15 @@ class SAM2VideoUI:
                     )
                     print("Memory optimizations enabled: CPU offloading")
                 finally:
-                    # Restore original default CUDA device
+                    # Restore original default CUDA device (if possible)
                     if original_device is not None:
-                        torch.cuda.set_device(original_device)
-                        print(f"Restored default CUDA device to {original_device}")
+                        try:
+                            torch.cuda.set_device(original_device)
+                            print(f"Restored default CUDA device to {original_device}")
+                        except Exception as e:
+                            # If we can't restore (e.g., original device is out of memory),
+                            # just continue with the current device
+                            print(f"Note: Could not restore default CUDA device to {original_device}: {e}")
 
                 # Calculate coordinate scaling if re-segmenting
                 coord_scale_x = 1.0
@@ -3627,7 +3636,7 @@ class SAM2VideoUI:
                 if dims is None:
                     raise ValueError("Cannot determine frame dimensions")
                 frame_height, frame_width = dims
-                print(f"Frame dimensions for coordinate conversion: {frame_width}x{frame_height}")
+                print(f"Frame dimensions: {frame_width}x{frame_height}")
 
                 # Process each annotation frame and its objects
                 for ann_frame in annotation_frames:
@@ -4286,7 +4295,7 @@ class SAM2VideoUI:
 
         # Compress with FFmpeg
         print("Compressing video with FFmpeg...")
-        success = self._compress_video_with_ffmpeg(video_output_path_temp, video_output_path_final, crf=23)
+        success = compress_video_with_ffmpeg(video_output_path_temp, video_output_path_final, crf=23)
 
         if success:
             print(f"OK: Exported and compressed segmented video to {video_output_path_final}")
@@ -5163,31 +5172,6 @@ class SAM2VideoUI:
             self.status_label.config(text="Export failed")
             messagebox.showerror("Export Error", f"Failed to export video: {str(e)}")
 
-    class _DisableCUDADuringInit:
-        """
-        Context manager to temporarily make torch.cuda.is_available() return False.
-
-        This is needed because SAM2 has hardcoded CUDA allocations during model init:
-        - position_encoding.py: warmup_cache allocates on cuda:0
-        - transformer.py: freqs_cis is moved to "cuda" (defaults to cuda:0)
-
-        By making CUDA appear unavailable during init, these allocations are skipped,
-        and the subsequent .to(device) call properly places everything on the correct device.
-        """
-        def __init__(self):
-            self._original_is_available = None
-
-        def __enter__(self):
-            if torch is not None:
-                self._original_is_available = torch.cuda.is_available
-                torch.cuda.is_available = lambda: False
-            return self
-
-        def __exit__(self, exc_type, exc_val, exc_tb):
-            if torch is not None and self._original_is_available is not None:
-                torch.cuda.is_available = self._original_is_available
-            return False
-
     def load_sam2_model(self):
         """Load SAM2 or SAM3 model with correct video predictor initialization"""
         try:
@@ -5237,17 +5221,17 @@ class SAM2VideoUI:
                         "3. Download checkpoints from https://huggingface.co/facebook/sam3"
                     )
 
+                # Patch SAM3 hardcoded .cuda() calls for device flexibility
+                patch_sam3_for_device()
+
                 # Build SAM3 model with SAM2-compatible API
                 self.status_label.config(text="Building SAM3 model (may download from HuggingFace)...")
                 self.root.update()
 
                 # Use context manager to prevent hardcoded CUDA allocations
                 # SAM3 also inherits similar patterns from SAM2
-                should_disable_cuda_init = (device == "cpu" or
-                                            (device.startswith("cuda:") and device != "cuda:0"))
-
-                if should_disable_cuda_init:
-                    with SAM2VideoUI._DisableCUDADuringInit():
+                if should_disable_cuda_for_device(device):
+                    with DisableCUDADuringInit():
                         sam3_model = build_sam3_video_model(device=device)
                 else:
                     sam3_model = build_sam3_video_model(device=device)
@@ -5304,11 +5288,8 @@ class SAM2VideoUI:
                 # which causes OOM errors on CPU or device mismatches on other GPUs.
                 # By temporarily making CUDA unavailable, we skip these allocations
                 # and let .to(device) properly place everything on the correct device.
-                should_disable_cuda_init = (device == "cpu" or
-                                            (device.startswith("cuda:") and device != "cuda:0"))
-
-                if should_disable_cuda_init:
-                    with SAM2VideoUI._DisableCUDADuringInit():
+                if should_disable_cuda_for_device(device):
+                    with DisableCUDADuringInit():
                         self.sam2_model = build_sam2_video_predictor(
                             config_file=model_cfg,
                             ckpt_path=sam2_checkpoint,
@@ -5523,110 +5504,6 @@ class SAM2VideoUI:
             if len(self.mask_cache) > self.mask_cache_size:
                 oldest_key = next(iter(self.mask_cache))
                 del self.mask_cache[oldest_key]
-
-    def _compress_video_with_ffmpeg(
-        self,
-        input_path,
-        output_path,
-        crf=23,
-        preset='medium',
-        gop=10
-    ):
-        """
-        Re-encode video with FFmpeg using scrubbing-friendly compression.
-
-        Prefers short-GOP x264; falls back to MJPEG if unavailable.
-        """
-
-        import subprocess
-        import shutil
-        import os
-
-        ffmpeg_path = shutil.which('ffmpeg')
-        if not ffmpeg_path:
-            print("WARNING: ffmpeg not found, skipping compression")
-            shutil.move(input_path, output_path)
-            return False
-
-        def has_libx264():
-            try:
-                r = subprocess.run(
-                    [ffmpeg_path, '-encoders'],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True
-                )
-                return 'libx264' in r.stdout
-            except Exception:
-                return False
-
-        try:
-            if has_libx264():
-                print(f"Compressing with x264 (CRF={crf}, GOP={gop})")
-
-                cmd = [
-                    ffmpeg_path,
-                    '-loglevel', 'error',
-                    '-i', input_path,
-
-                    # Video encoding
-                    '-c:v', 'libx264',
-                    '-preset', preset,
-                    '-crf', str(crf),
-
-                    # Scrubbing-friendly settings
-                    '-g', str(gop),
-                    '-keyint_min', str(gop),
-                    '-bf', '0',
-                    '-x264-params', 'scenecut=0',
-
-                    # Compatibility
-                    '-pix_fmt', 'yuv420p',
-                    '-movflags', '+faststart',
-
-                    '-y',
-                    output_path
-                ]
-            else:
-                print("libx264 unavailable; falling back to MJPEG")
-
-                cmd = [
-                    ffmpeg_path,
-                    '-loglevel', 'error',
-                    '-i', input_path,
-                    '-c:v', 'mjpeg',
-                    '-q:v', '3',   # 2–5 is reasonable
-                    '-pix_fmt', 'yuv420p',
-                    '-y',
-                    output_path
-                ]
-
-            result = subprocess.run(cmd, stdout=subprocess.PIPE,
-                                    stderr=subprocess.PIPE, text=True)
-
-            if result.returncode != 0:
-                print(f"FFmpeg error:\n{result.stderr}")
-                shutil.move(input_path, output_path)
-                return False
-
-            original_size = os.path.getsize(input_path)
-            compressed_size = os.path.getsize(output_path)
-            reduction = (1 - compressed_size / original_size) * 100
-
-            print(
-                f"Compressed: {original_size/1e6:.1f}MB → "
-                f"{compressed_size/1e6:.1f}MB ({reduction:.1f}% reduction)"
-            )
-
-            os.remove(input_path)
-            return True
-
-        except Exception as e:
-            print(f"WARNING: FFmpeg failed: {e}")
-            if os.path.exists(input_path):
-                shutil.move(input_path, output_path)
-            return False
-
 
     def _get_config_file_path(self):
         """Get path to config file for storing persistent settings"""

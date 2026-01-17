@@ -11,6 +11,402 @@ import numpy as np
 import cv2
 from typing import Dict, List, Tuple, Callable, Optional, Any
 
+# Try to import torch for CUDA utilities
+try:
+    import torch
+except ImportError:
+    torch = None
+
+
+# =============================================================================
+# CUDA Utilities
+# =============================================================================
+
+class DisableCUDADuringInit:
+    """
+    Context manager to temporarily make torch.cuda.is_available() return False.
+
+    This is needed because SAM2 has hardcoded CUDA allocations during model init:
+    - position_encoding.py: warmup_cache allocates on cuda:0
+    - transformer.py: freqs_cis is moved to "cuda" (defaults to cuda:0)
+
+    By making CUDA appear unavailable during init, these allocations are skipped,
+    and the subsequent .to(device) call properly places everything on the correct device.
+
+    Usage:
+        # When using CPU or a specific GPU other than cuda:0
+        with DisableCUDADuringInit():
+            model = build_sam2_video_predictor(config, checkpoint, device="cpu")
+
+        # Or with the helper function:
+        if should_disable_cuda_for_device(device):
+            with DisableCUDADuringInit():
+                model = build_sam2_video_predictor(...)
+    """
+    def __init__(self):
+        self._original_is_available = None
+
+    def __enter__(self):
+        if torch is not None:
+            self._original_is_available = torch.cuda.is_available
+            torch.cuda.is_available = lambda: False
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if torch is not None and self._original_is_available is not None:
+            torch.cuda.is_available = self._original_is_available
+        return False
+
+
+def should_disable_cuda_for_device(device: str) -> bool:
+    """
+    Determine if CUDA should be temporarily disabled during model initialization.
+
+    SAM2 has hardcoded "cuda" allocations that default to cuda:0, which causes
+    OOM errors on CPU or device mismatches on other GPUs. This function returns
+    True if the device selection requires disabling CUDA during init.
+
+    Args:
+        device: Device string (e.g., "cpu", "cuda", "cuda:0", "cuda:1")
+
+    Returns:
+        True if CUDA should be disabled during model init, False otherwise
+    """
+    return device == "cpu" or (device.startswith("cuda:") and device != "cuda:0")
+
+
+def patch_sam3_for_device():
+    """
+    Monkey-patch SAM3 to fix hardcoded .cuda() calls in runtime code.
+
+    SAM3 has several hardcoded .cuda() calls that cause crashes when using
+    devices other than cuda:0 (e.g., cuda:1, cuda:2). This function patches
+    the affected methods to use the correct device from the inference state.
+
+    Call this ONCE after importing SAM3 but BEFORE running any inference.
+
+    Patches:
+        1. Sam3TrackerPredictor._get_image_feature: Line 1024
+           - Original: image = inference_state["images"][frame_idx].cuda()
+           - Patched: image = inference_state["images"][frame_idx].to(inference_state["device"])
+
+        2. Sam3TrackerBase._prepare_memory_conditioned_features: Lines 657, 664
+           - Original: feats = prev["maskmem_features"].cuda(non_blocking=True)
+           - Patched: feats = prev["maskmem_features"].to(device, non_blocking=True)
+           - Original: maskmem_enc = prev["maskmem_pos_enc"][-1].cuda()
+           - Patched: maskmem_enc = prev["maskmem_pos_enc"][-1].to(device)
+    """
+    # Patch 1: Sam3TrackerPredictor._get_image_feature
+    _patch_sam3_tracker_predictor()
+
+    # Patch 2: Sam3TrackerBase._prepare_memory_conditioned_features
+    _patch_sam3_tracker_base()
+
+
+def _patch_sam3_tracker_predictor():
+    """Patch Sam3TrackerPredictor._get_image_feature to fix hardcoded .cuda() call."""
+    try:
+        from sam3.model.sam3_tracking_predictor import Sam3TrackerPredictor
+    except ImportError:
+        return  # SAM3 not installed
+
+    # Check if already patched
+    if hasattr(Sam3TrackerPredictor, '_original_get_image_feature'):
+        return
+
+    # Store original method
+    Sam3TrackerPredictor._original_get_image_feature = Sam3TrackerPredictor._get_image_feature
+
+    def _patched_get_image_feature(self, inference_state, frame_idx, batch_size):
+        """Compute the image features on a given frame (patched for device flexibility)."""
+        # Look up in the cache
+        image, backbone_out = inference_state["cached_features"].get(
+            frame_idx, (None, None)
+        )
+        if backbone_out is None:
+            if self.backbone is None:
+                raise RuntimeError(
+                    f"Image features for frame {frame_idx} are not cached. "
+                    "Please run inference on this frame first."
+                )
+            else:
+                # Cache miss -- we will run inference on a single image
+                # PATCHED: Use the correct device from inference_state instead of hardcoded .cuda()
+                image = inference_state["images"][frame_idx].to(inference_state["device"]).float().unsqueeze(0)
+                backbone_out = self.forward_image(image)
+                # Cache the most recent frame's feature (for repeated interactions with
+                # a frame; we can use an LRU cache for more frames in the future).
+                inference_state["cached_features"] = {frame_idx: (image, backbone_out)}
+        if "tracker_backbone_out" in backbone_out:
+            backbone_out = backbone_out["tracker_backbone_out"]  # get backbone output
+
+        # expand the features to have the same dimension as the number of objects
+        expanded_image = image.expand(batch_size, -1, -1, -1)
+        expanded_backbone_out = {
+            "backbone_fpn": backbone_out["backbone_fpn"].copy(),
+            "vision_pos_enc": backbone_out["vision_pos_enc"].copy(),
+        }
+        for i, feat in enumerate(expanded_backbone_out["backbone_fpn"]):
+            feat = feat.expand(batch_size, -1, -1, -1)
+            expanded_backbone_out["backbone_fpn"][i] = feat
+        for i, pos in enumerate(expanded_backbone_out["vision_pos_enc"]):
+            pos = pos.expand(batch_size, -1, -1, -1)
+            expanded_backbone_out["vision_pos_enc"][i] = pos
+
+        features = self._prepare_backbone_features(expanded_backbone_out)
+        features = (expanded_image,) + features
+        return features
+
+    Sam3TrackerPredictor._get_image_feature = _patched_get_image_feature
+    print("  [patch_sam3_for_device] Patched Sam3TrackerPredictor._get_image_feature")
+
+
+def _patch_sam3_tracker_base():
+    """Patch Sam3TrackerBase._prepare_memory_conditioned_features to fix hardcoded .cuda() calls."""
+    try:
+        from sam3.model.sam3_tracker_base import Sam3TrackerBase
+        from sam3.utils.misc import select_closest_cond_frames
+    except ImportError:
+        return  # SAM3 not installed
+
+    # Check if already patched
+    if hasattr(Sam3TrackerBase, '_original_prepare_memory_conditioned_features'):
+        return
+
+    # Store original method
+    Sam3TrackerBase._original_prepare_memory_conditioned_features = \
+        Sam3TrackerBase._prepare_memory_conditioned_features
+
+    def _patched_prepare_memory_conditioned_features(
+        self,
+        frame_idx,
+        is_init_cond_frame,
+        current_vision_feats,
+        current_vision_pos_embeds,
+        feat_sizes,
+        output_dict,
+        num_frames,
+        track_in_reverse=False,
+        use_prev_mem_frame=True,
+    ):
+        """Fuse the current frame's visual feature map with previous memory (patched for device flexibility)."""
+        B = current_vision_feats[-1].size(1)  # batch size on this frame
+        C = self.hidden_dim
+        H, W = feat_sizes[-1]  # top-level (lowest-resolution) feature size
+        device = current_vision_feats[-1].device
+
+        # The case of `self.num_maskmem == 0` below is primarily used for reproducing SAM on images.
+        # In this case, we skip the fusion with any memory.
+        if self.num_maskmem == 0:  # Disable memory and skip fusion
+            pix_feat = current_vision_feats[-1].permute(1, 2, 0).view(B, C, H, W)
+            return pix_feat
+
+        num_obj_ptr_tokens = 0
+        tpos_sign_mul = -1 if track_in_reverse else 1
+
+        # Step 1: condition the visual features of the current frame on previous memories
+        if not is_init_cond_frame and use_prev_mem_frame:
+            # Retrieve the memories encoded with the maskmem backbone
+            to_cat_prompt, to_cat_prompt_mask, to_cat_prompt_pos_embed = [], [], []
+
+            # Add conditioning frames's output first (all cond frames have t_pos=0 for
+            # when getting temporal positional embedding below)
+            assert len(output_dict["cond_frame_outputs"]) > 0
+
+            # Select a maximum number of temporally closest cond frames for cross attention
+            cond_outputs = output_dict["cond_frame_outputs"]
+            selected_cond_outputs, unselected_cond_outputs = select_closest_cond_frames(
+                frame_idx,
+                cond_outputs,
+                self.max_cond_frames_in_attn,
+                keep_first_cond_frame=self.keep_first_cond_frame,
+            )
+            t_pos_and_prevs = [
+                ((frame_idx - t) * tpos_sign_mul, out, True)
+                for t, out in selected_cond_outputs.items()
+            ]
+
+            # Add last (self.num_maskmem - 1) frames before current frame for non-conditioning memory
+            r = 1 if self.training else self.memory_temporal_stride_for_eval
+
+            if self.use_memory_selection:
+                valid_indices = self.frame_filter(
+                    output_dict, track_in_reverse, frame_idx, num_frames, r
+                )
+
+            for t_pos in range(1, self.num_maskmem):
+                t_rel = self.num_maskmem - t_pos  # how many frames before current frame
+                if self.use_memory_selection:
+                    if t_rel > len(valid_indices):
+                        continue
+                    prev_frame_idx = valid_indices[-t_rel]
+                else:
+                    if t_rel == 1:
+                        # for t_rel == 1, we take the last frame (regardless of r)
+                        if not track_in_reverse:
+                            prev_frame_idx = frame_idx - t_rel
+                        else:
+                            prev_frame_idx = frame_idx + t_rel
+                    else:
+                        # for t_rel >= 2, we take the memory frame from every r-th frames
+                        if not track_in_reverse:
+                            prev_frame_idx = ((frame_idx - 2) // r) * r
+                            prev_frame_idx = prev_frame_idx - (t_rel - 2) * r
+                        else:
+                            prev_frame_idx = -(-(frame_idx + 2) // r) * r
+                            prev_frame_idx = prev_frame_idx + (t_rel - 2) * r
+
+                out = output_dict["non_cond_frame_outputs"].get(prev_frame_idx, None)
+                if out is None:
+                    out = unselected_cond_outputs.get(prev_frame_idx, None)
+                t_pos_and_prevs.append((t_pos, out, False))
+
+            for t_pos, prev, is_selected_cond_frame in t_pos_and_prevs:
+                if prev is None:
+                    continue  # skip padding frames
+
+                # "maskmem_features" might have been offloaded to CPU in demo use cases,
+                # so we load it back to GPU (it's a no-op if it's already on GPU).
+                # PATCHED: Use .to(device) instead of hardcoded .cuda()
+                feats = prev["maskmem_features"].to(device, non_blocking=True)
+                seq_len = feats.shape[-2] * feats.shape[-1]
+                to_cat_prompt.append(feats.flatten(2).permute(2, 0, 1))
+                to_cat_prompt_mask.append(
+                    torch.zeros(B, seq_len, device=device, dtype=bool)
+                )
+
+                # Spatial positional encoding (it might have been offloaded to CPU in eval)
+                # PATCHED: Use .to(device) instead of hardcoded .cuda()
+                maskmem_enc = prev["maskmem_pos_enc"][-1].to(device)
+                maskmem_enc = maskmem_enc.flatten(2).permute(2, 0, 1)
+
+                if (
+                    is_selected_cond_frame
+                    and getattr(self, "cond_frame_spatial_embedding", None) is not None
+                ):
+                    # add a spatial embedding for the conditioning frame
+                    maskmem_enc = maskmem_enc + self.cond_frame_spatial_embedding
+
+                # Temporal positional encoding
+                t = t_pos if not is_selected_cond_frame else 0
+                maskmem_enc = (
+                    maskmem_enc + self.maskmem_tpos_enc[self.num_maskmem - t - 1]
+                )
+                to_cat_prompt_pos_embed.append(maskmem_enc)
+
+            # Construct the list of past object pointers
+            # Optionally, select only a subset of spatial memory frames during training
+            if (
+                self.training
+                and self.prob_to_dropout_spatial_mem > 0
+                and self.rng.random() < self.prob_to_dropout_spatial_mem
+            ):
+                num_spatial_mem_keep = self.rng.integers(len(to_cat_prompt) + 1)
+                keep = self.rng.choice(
+                    range(len(to_cat_prompt)), num_spatial_mem_keep, replace=False
+                ).tolist()
+                to_cat_prompt = [to_cat_prompt[i] for i in keep]
+                to_cat_prompt_mask = [to_cat_prompt_mask[i] for i in keep]
+                to_cat_prompt_pos_embed = [to_cat_prompt_pos_embed[i] for i in keep]
+
+            max_obj_ptrs_in_encoder = min(num_frames, self.max_obj_ptrs_in_encoder)
+
+            # First add those object pointers from selected conditioning frames
+            if not self.training:
+                ptr_cond_outputs = {
+                    t: out
+                    for t, out in selected_cond_outputs.items()
+                    if (t >= frame_idx if track_in_reverse else t <= frame_idx)
+                }
+            else:
+                ptr_cond_outputs = selected_cond_outputs
+            pos_and_ptrs = [
+                (
+                    (frame_idx - t) * tpos_sign_mul,
+                    out["obj_ptr"],
+                    True,  # is_selected_cond_frame
+                )
+                for t, out in ptr_cond_outputs.items()
+            ]
+
+            # Add up to (max_obj_ptrs_in_encoder - 1) non-conditioning frames before current frame
+            for t_diff in range(1, max_obj_ptrs_in_encoder):
+                if not self.use_memory_selection:
+                    t = frame_idx + t_diff if track_in_reverse else frame_idx - t_diff
+                    if t < 0 or (num_frames is not None and t >= num_frames):
+                        break
+                else:
+                    if -t_diff <= -len(valid_indices):
+                        break
+                    t = valid_indices[-t_diff]
+
+                out = output_dict["non_cond_frame_outputs"].get(
+                    t, unselected_cond_outputs.get(t, None)
+                )
+                if out is not None:
+                    pos_and_ptrs.append((t_diff, out["obj_ptr"], False))
+
+            # If we have at least one object pointer, add them to the across attention
+            if len(pos_and_ptrs) > 0:
+                pos_list, ptrs_list, is_selected_cond_frame_list = zip(*pos_and_ptrs)
+                # stack object pointers along dim=0 into [ptr_seq_len, B, C] shape
+                obj_ptrs = torch.stack(ptrs_list, dim=0)
+                if getattr(self, "cond_frame_obj_ptr_embedding", None) is not None:
+                    obj_ptrs = (
+                        obj_ptrs
+                        + self.cond_frame_obj_ptr_embedding
+                        * torch.tensor(is_selected_cond_frame_list, device=device)[
+                            ..., None, None
+                        ].float()
+                    )
+                # a temporal positional embedding based on how far each object pointer is from
+                # the current frame (sine embedding normalized by the max pointer num).
+                obj_pos = self._get_tpos_enc(
+                    pos_list,
+                    max_abs_pos=max_obj_ptrs_in_encoder,
+                    device=device,
+                )
+                # expand to batch size
+                obj_pos = obj_pos.unsqueeze(1).expand(-1, B, -1)
+
+                if self.mem_dim < C:
+                    # split a pointer into (C // self.mem_dim) tokens for self.mem_dim < C
+                    obj_ptrs = obj_ptrs.reshape(-1, B, C // self.mem_dim, self.mem_dim)
+                    obj_ptrs = obj_ptrs.permute(0, 2, 1, 3).flatten(0, 1)
+                    obj_pos = obj_pos.repeat_interleave(C // self.mem_dim, dim=0)
+                to_cat_prompt.append(obj_ptrs)
+                to_cat_prompt_mask.append(None)  # "to_cat_prompt_mask" is not used
+                to_cat_prompt_pos_embed.append(obj_pos)
+                num_obj_ptr_tokens = obj_ptrs.shape[0]
+            else:
+                num_obj_ptr_tokens = 0
+        else:
+            # directly add no-mem embedding (instead of using the transformer encoder)
+            pix_feat_with_mem = current_vision_feats[-1] + self.no_mem_embed
+            pix_feat_with_mem = pix_feat_with_mem.permute(1, 2, 0).view(B, C, H, W)
+            return pix_feat_with_mem
+
+        # Step 2: Concatenate the memories and forward through the transformer encoder
+        prompt = torch.cat(to_cat_prompt, dim=0)
+        prompt_mask = None  # For now, we always masks are zeros anyways
+        prompt_pos_embed = torch.cat(to_cat_prompt_pos_embed, dim=0)
+        encoder_out = self.transformer.encoder(
+            src=current_vision_feats,
+            src_key_padding_mask=[None],
+            src_pos=current_vision_pos_embeds,
+            prompt=prompt,
+            prompt_pos=prompt_pos_embed,
+            prompt_key_padding_mask=prompt_mask,
+            feat_sizes=feat_sizes,
+            num_obj_ptr_tokens=num_obj_ptr_tokens,
+        )
+        # reshape the output (HW)BC => BCHW
+        pix_feat_with_mem = encoder_out["memory"].permute(1, 2, 0).view(B, C, H, W)
+        return pix_feat_with_mem
+
+    Sam3TrackerBase._prepare_memory_conditioned_features = _patched_prepare_memory_conditioned_features
+    print("  [patch_sam3_for_device] Patched Sam3TrackerBase._prepare_memory_conditioned_features")
+
 
 # =============================================================================
 # Mask Filename Utilities
@@ -535,6 +931,121 @@ def save_quality_metrics(
         return True
     except Exception as e:
         print(f"WARNING: Failed to save quality metrics: {e}")
+        return False
+
+
+# =============================================================================
+# Video Compression Functions
+# =============================================================================
+
+def compress_video_with_ffmpeg(
+    input_path: str,
+    output_path: str,
+    crf: int = 23,
+    preset: str = 'medium',
+    gop: int = 10
+) -> bool:
+    """
+    Re-encode video with FFmpeg using scrubbing-friendly compression.
+
+    Prefers short-GOP x264; falls back to MJPEG if unavailable.
+
+    Args:
+        input_path: Path to the input (uncompressed) video
+        output_path: Path for the output (compressed) video
+        crf: Quality setting (0-51, lower=better, 23=default)
+        preset: Encoding speed preset (medium recommended)
+        gop: GOP (Group of Pictures) size for keyframe interval
+
+    Returns:
+        bool: True if compression succeeded, False otherwise
+    """
+    import subprocess
+    import shutil
+
+    ffmpeg_path = shutil.which('ffmpeg')
+    if not ffmpeg_path:
+        print("WARNING: ffmpeg not found, skipping compression")
+        shutil.move(input_path, output_path)
+        return False
+
+    def has_libx264():
+        try:
+            r = subprocess.run(
+                [ffmpeg_path, '-encoders'],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
+            return 'libx264' in r.stdout
+        except Exception:
+            return False
+
+    try:
+        if has_libx264():
+            print(f"Compressing with x264 (CRF={crf}, GOP={gop})")
+
+            cmd = [
+                ffmpeg_path,
+                '-loglevel', 'error',
+                '-i', input_path,
+
+                # Video encoding
+                '-c:v', 'libx264',
+                '-preset', preset,
+                '-crf', str(crf),
+
+                # Scrubbing-friendly settings
+                '-g', str(gop),
+                '-keyint_min', str(gop),
+                '-bf', '0',
+                '-x264-params', 'scenecut=0',
+
+                # Compatibility
+                '-pix_fmt', 'yuv420p',
+                '-movflags', '+faststart',
+
+                '-y',
+                output_path
+            ]
+        else:
+            print("libx264 unavailable; falling back to MJPEG")
+
+            cmd = [
+                ffmpeg_path,
+                '-loglevel', 'error',
+                '-i', input_path,
+                '-c:v', 'mjpeg',
+                '-q:v', '5',   # 2–5 is reasonable
+                '-pix_fmt', 'yuvj420p',
+                '-y',
+                output_path
+            ]
+
+        result = subprocess.run(cmd, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True)
+
+        if result.returncode != 0:
+            print(f"FFmpeg error:\n{result.stderr}")
+            shutil.move(input_path, output_path)
+            return False
+
+        original_size = os.path.getsize(input_path)
+        compressed_size = os.path.getsize(output_path)
+        reduction = (1 - compressed_size / original_size) * 100
+
+        print(
+            f"Compressed: {original_size/1e6:.1f}MB → "
+            f"{compressed_size/1e6:.1f}MB ({reduction:.1f}% reduction)"
+        )
+
+        os.remove(input_path)
+        return True
+
+    except Exception as e:
+        print(f"WARNING: FFmpeg failed: {e}")
+        if os.path.exists(input_path):
+            shutil.move(input_path, output_path)
         return False
 
 

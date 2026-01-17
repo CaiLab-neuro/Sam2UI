@@ -41,8 +41,15 @@ import psutil
 # Import lazy loader BEFORE importing SAM2
 from sam2_lazy_loader import enable_lazy_loading
 
-# Import quality metrics utilities
-from utils import IncrementalQualityMetricsCalculator, save_quality_metrics
+# Import quality metrics utilities and CUDA helpers
+from utils import (
+    IncrementalQualityMetricsCalculator,
+    save_quality_metrics,
+    DisableCUDADuringInit,
+    should_disable_cuda_for_device,
+    patch_sam3_for_device,
+    compress_video_with_ffmpeg,
+)
 
 try:
     from sam2.build_sam import build_sam2_video_predictor
@@ -134,7 +141,7 @@ def _auto_select_default_model():
     return "sam2.1-base+"
 
 class SAM2Processor:
-    def __init__(self, config_file=None, checkpoint_file=None, model_name="sam2.1-base+", offload_to_cpu=False, async_loading=False, smooth_masks=False, use_bfloat16=False):
+    def __init__(self, config_file=None, checkpoint_file=None, model_name="sam2.1-base+", offload_to_cpu=False, async_loading=False, smooth_masks=False, use_bfloat16=False, device=None):
         """
         Initialize SAM2 Processor
 
@@ -146,6 +153,7 @@ class SAM2Processor:
             async_loading: Use async frame loading (experimental, may reduce memory)
             smooth_masks: Apply morphological smoothing to reduce pixelation in masks
             use_bfloat16: Use BFloat16 precision for faster inference (requires compatible GPU)
+            device: Device to use (e.g., 'cpu', 'cuda', 'cuda:0', 'cuda:1'). If None, auto-detect.
         """
         # Store model name for detection
         self.model_name = model_name
@@ -196,6 +204,7 @@ class SAM2Processor:
         self.smooth_masks = smooth_masks
         self.use_bfloat16 = use_bfloat16
         self.no_backward_propagation = False  # Will be set from command line args
+        self.requested_device = device  # User-requested device (None = auto-detect)
 
     @property
     def use_sam3(self):
@@ -212,13 +221,30 @@ class SAM2Processor:
         print(f"  Checkpoint: {self.checkpoint_file or 'None (random init)'}")
 
         try:
-            device = "cuda" if torch.cuda.is_available() else "cpu"
+            # Determine device: use requested device or auto-detect
+            if self.requested_device:
+                device = self.requested_device
+                # Validate device selection
+                if device.startswith("cuda"):
+                    if not torch.cuda.is_available():
+                        print(f"  WARNING: CUDA requested but not available, falling back to CPU")
+                        device = "cpu"
+                    elif device.startswith("cuda:"):
+                        gpu_id = int(device.split(":")[1])
+                        if gpu_id >= torch.cuda.device_count():
+                            print(f"  WARNING: GPU {gpu_id} not available (only {torch.cuda.device_count()} GPU(s) found), falling back to CPU")
+                            device = "cpu"
+            else:
+                device = "cuda" if torch.cuda.is_available() else "cpu"
             print(f"  Device: {device}")
 
             # Common optimizations for both SAM2 and SAM3
-            if device == "cuda":
+            if device != "cpu" and torch.cuda.is_available():
+                # Determine GPU ID for TF32 check
+                gpu_id = 0 if device == "cuda" else int(device.split(":")[1])
+
                 # Enable TF32 for Ampere GPUs (RTX 30xx+, A100) for better performance
-                if torch.cuda.get_device_properties(0).major >= 8:
+                if torch.cuda.get_device_properties(gpu_id).major >= 8:
                     torch.backends.cuda.matmul.allow_tf32 = True
                     torch.backends.cudnn.allow_tf32 = True
                     print("  TensorFloat32 (TF32) enabled for Ampere GPU")
@@ -233,17 +259,27 @@ class SAM2Processor:
                     print("  Float32 mode: native precision (no autocast)")
 
             # Load model based on type
+            # Use context manager to prevent hardcoded CUDA allocations when using
+            # CPU or a specific GPU other than cuda:0
             if self.use_sam3:
                 # SAM3 loading
                 if not SAM3_AVAILABLE:
                     raise ImportError("SAM3 not available. Run setup.py to install.")
 
                 from sam3.model_builder import build_sam3_video_model
+
+                # Patch SAM3 hardcoded .cuda() calls for device flexibility
+                patch_sam3_for_device()
+
                 print("  Building SAM3 model ...")
 
                 # Build SAM3 model and extract tracker with SAM2-compatible API
                 # (Matches sam2_ui.py implementation)
-                sam3_model = build_sam3_video_model(device=device)
+                if should_disable_cuda_for_device(device):
+                    with DisableCUDADuringInit():
+                        sam3_model = build_sam3_video_model(device=device)
+                else:
+                    sam3_model = build_sam3_video_model(device=device)
 
                 # Extract the tracker component (has init_state, add_new_points, etc.)
                 self.video_predictor = sam3_model.tracker
@@ -252,11 +288,19 @@ class SAM2Processor:
 
             else:
                 # SAM2 loading
-                self.video_predictor = build_sam2_video_predictor(
-                    config_file=self.config_file,
-                    ckpt_path=self.checkpoint_file,  # Optional parameter
-                    device=device
-                )
+                if should_disable_cuda_for_device(device):
+                    with DisableCUDADuringInit():
+                        self.video_predictor = build_sam2_video_predictor(
+                            config_file=self.config_file,
+                            ckpt_path=self.checkpoint_file,  # Optional parameter
+                            device=device
+                        )
+                else:
+                    self.video_predictor = build_sam2_video_predictor(
+                        config_file=self.config_file,
+                        ckpt_path=self.checkpoint_file,  # Optional parameter
+                        device=device
+                    )
 
             print(f"OK: {model_type} model loaded successfully")
             return True
@@ -288,91 +332,8 @@ class SAM2Processor:
             return None
 
     def _compress_video_with_ffmpeg(self, input_path, output_path, crf=23, preset='medium'):
-        """
-        Re-encode video with FFmpeg using CRF compression.
-        Handles FFmpeg builds that don't support -preset option.
-
-        Args:
-            input_path: Temp uncompressed video
-            output_path: Final compressed video
-            crf: Quality (0-51, lower=better, 23=medium)
-            preset: Encoding speed (medium recommended, may not be supported by all FFmpeg builds)
-
-        Returns:
-            bool: True if successful
-        """
-        import subprocess
-        import shutil
-
-        ffmpeg_path = shutil.which('ffmpeg')
-        if not ffmpeg_path:
-            print("WARNING: ffmpeg not found, skipping compression")
-            shutil.move(input_path, output_path)
-            return False
-
-        try:
-            print(f"Compressing with FFmpeg (CRF={crf})...")
-
-            # Build command with preset
-            cmd_with_preset = [
-                ffmpeg_path,
-                '-i', input_path,
-                '-c:v', 'libx264',
-                '-crf', str(crf),
-                '-preset', preset,
-                '-movflags', '+faststart',
-                '-y',
-                output_path
-            ]
-
-            # Try with preset first
-            result = subprocess.run(cmd_with_preset, stdout=subprocess.PIPE,
-                                  stderr=subprocess.PIPE, text=True)
-
-            if result.returncode != 0:
-                # Check if error is due to preset option not being recognized
-                stderr_lower = result.stderr.lower()
-                if 'preset' in stderr_lower and ('unrecognized' in stderr_lower or 'option not found' in stderr_lower):
-                    print(f"  FFmpeg doesn't support -preset option (conda build), retrying without it...")
-
-                    # Retry without preset
-                    cmd_no_preset = [
-                        ffmpeg_path,
-                        '-i', input_path,
-                        '-c:v', 'libx264',
-                        '-crf', str(crf),
-                        '-movflags', '+faststart',
-                        '-y',
-                        output_path
-                    ]
-
-                    result = subprocess.run(cmd_no_preset, stdout=subprocess.PIPE,
-                                          stderr=subprocess.PIPE, text=True)
-                    if result.returncode != 0:
-                        print(f"FFmpeg error: {result.stderr}")
-                        shutil.move(input_path, output_path)
-                        return False
-                else:
-                    # Different error
-                    print(f"FFmpeg error: {result.stderr}")
-                    shutil.move(input_path, output_path)
-                    return False
-
-            # Report compression stats
-            original_size = os.path.getsize(input_path)
-            compressed_size = os.path.getsize(output_path)
-            reduction = (1 - compressed_size / original_size) * 100
-
-            print(f"Compressed: {original_size/1e6:.1f}MB → {compressed_size/1e6:.1f}MB ({reduction:.1f}% reduction)")
-
-            os.remove(input_path)  # Delete temp
-            return True
-
-        except Exception as e:
-            print(f"WARNING: FFmpeg failed: {e}")
-            if os.path.exists(input_path):
-                shutil.move(input_path, output_path)
-            return False
+        """Wrapper for utils.compress_video_with_ffmpeg."""
+        return compress_video_with_ffmpeg(input_path, output_path, crf=crf, preset=preset)
 
     def get_video_info(self, video_path):
         """Get video frame count and properties without loading all frames"""
@@ -1199,6 +1160,12 @@ Examples:
   # Use CPU offloading for memory optimization
   python process_annotations.py annotations.json video.mp4 --offload-to-cpu
 
+  # Use a specific GPU (e.g., cuda:1)
+  python process_annotations.py annotations.json video.mp4 --device cuda:1
+
+  # Use CPU explicitly
+  python process_annotations.py annotations.json video.mp4 --device cpu
+
   # Use custom config and checkpoint
   python process_annotations.py annotations.json video.mp4 \\
     --config configs/sam2/sam2_hiera_l.yaml \\
@@ -1234,6 +1201,8 @@ Examples:
                        help="Number of frames to keep in memory cache (default: 20, ~2GB). Minimum: 10, Recommended: 20-50.")
     parser.add_argument("--no-backward", action="store_true", dest="no_backward",
                        help="Disable backward propagation (not recommended, may result in lower quality segmentation for frames before first annotation)")
+    parser.add_argument("--device", type=str, default=None,
+                       help="Device to use for inference (e.g., 'cpu', 'cuda', 'cuda:0', 'cuda:1'). Default: auto-detect (CUDA if available, else CPU)")
 
     args = parser.parse_args()
 
@@ -1323,11 +1292,12 @@ Examples:
         if args.config:
             processor = SAM2Processor(config_file=args.config, checkpoint_file=args.checkpoint,
                                      offload_to_cpu=args.offload_to_cpu, async_loading=args.async_loading,
-                                     smooth_masks=args.smooth_masks, use_bfloat16=args.use_bfloat16)
+                                     smooth_masks=args.smooth_masks, use_bfloat16=args.use_bfloat16,
+                                     device=args.device)
         else:
             processor = SAM2Processor(model_name=args.model, offload_to_cpu=args.offload_to_cpu,
                                      async_loading=args.async_loading, smooth_masks=args.smooth_masks,
-                                     use_bfloat16=args.use_bfloat16)
+                                     use_bfloat16=args.use_bfloat16, device=args.device)
 
         # Set no_backward flag
         processor.no_backward_propagation = args.no_backward
