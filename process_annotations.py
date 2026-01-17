@@ -47,7 +47,7 @@ from utils import (
     save_quality_metrics,
     DisableCUDADuringInit,
     should_disable_cuda_for_device,
-    patch_sam3_for_device,
+    patch_sam3_modules_for_device,
     compress_video_with_ffmpeg,
 )
 
@@ -60,15 +60,21 @@ except ImportError as e:
 
 # Check SAM3 availability
 def _check_sam3_available():
-    """Check if SAM3 is installed and usable"""
+    """Check if SAM3 is installed and usable.
+
+    NOTE: We intentionally avoid importing sam3.model_builder here because
+    it triggers the full import chain including modules with hardcoded "cuda"
+    allocations. Instead, we use a lightweight check with importlib.util.find_spec.
+    """
     try:
         script_dir = Path(__file__).parent
         sam3_path = script_dir / "sam_models" / "sam3"
         if not sam3_path.exists():
             return False
-        from sam3.model_builder import build_sam3_video_predictor
-        return True
-    except ImportError:
+        import importlib.util
+        spec = importlib.util.find_spec("sam3")
+        return spec is not None
+    except (ImportError, ModuleNotFoundError):
         return False
 
 SAM3_AVAILABLE = _check_sam3_available()
@@ -266,20 +272,17 @@ class SAM2Processor:
                 if not SAM3_AVAILABLE:
                     raise ImportError("SAM3 not available. Run setup.py to install.")
 
-                from sam3.model_builder import build_sam3_video_model
+                # IMPORTANT: Must patch SAM3 modules BEFORE importing build_sam3_video_model
+                # because the import triggers the full module chain with hardcoded "cuda"
+                patch_sam3_modules_for_device(device)
 
-                # Patch SAM3 hardcoded .cuda() calls for device flexibility
-                patch_sam3_for_device()
+                from sam3.model_builder import build_sam3_video_model
 
                 print("  Building SAM3 model ...")
 
                 # Build SAM3 model and extract tracker with SAM2-compatible API
                 # (Matches sam2_ui.py implementation)
-                if should_disable_cuda_for_device(device):
-                    with DisableCUDADuringInit():
-                        sam3_model = build_sam3_video_model(device=device)
-                else:
-                    sam3_model = build_sam3_video_model(device=device)
+                sam3_model = build_sam3_video_model(device=device)
 
                 # Extract the tracker component (has init_state, add_new_points, etc.)
                 self.video_predictor = sam3_model.tracker
@@ -470,11 +473,11 @@ class SAM2Processor:
         if current_frame_idx % 50 == 0 and torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    def process_segmentation(self, video_path, annotations_data, output_dir, frame_dir=None):
-        """Process segmentation using SAM2"""
-        return self.process_segmentation_full(video_path, annotations_data, output_dir, frame_dir=frame_dir)
+    # def process_segmentation(self, video_path, annotations_data, output_dir, frame_dir=None):
+    #     """Process segmentation using SAM2"""
+    #     return self.process_segmentation_full(video_path, annotations_data, output_dir, frame_dir=frame_dir)
 
-    def process_segmentation_full(self, video_path, annotations_data, output_dir, frame_dir=None):
+    def process_segmentation(self, video_path, annotations_data, output_dir, frame_dir=None):
         """Process segmentation with streaming mask export to reduce memory usage"""
         print("Starting segmentation process (streaming export mode)...")
 

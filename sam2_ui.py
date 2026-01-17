@@ -63,15 +63,24 @@ except ImportError:
 
 # Check SAM3 availability
 def _check_sam3_available():
-    """Check if SAM3 is installed and usable"""
+    """
+    Check if SAM3 is installed and usable.
+
+    NOTE: We intentionally avoid importing sam3.model_builder here because
+    it triggers the full import chain including modules with hardcoded "cuda"
+    allocations. Instead, we check for the package existence and do a
+    lightweight import check.
+    """
     try:
         sam3_path = os.path.join(SAM2_PATH, "sam_models", "sam3")
         if not os.path.exists(sam3_path):
             return False
-        # Try importing SAM3
-        from sam3.model_builder import build_sam3_video_predictor
-        return True
-    except ImportError:
+        # Lightweight check - just verify the package is importable
+        # Don't import model_builder as it triggers cuda allocations
+        import importlib.util
+        spec = importlib.util.find_spec("sam3")
+        return spec is not None
+    except (ImportError, ModuleNotFoundError):
         return False
 
 SAM3_AVAILABLE = _check_sam3_available()
@@ -604,58 +613,63 @@ class SAM2VideoUI:
         self.frame_label = ttk.Label(slider_frame, text="0/0")
         self.frame_label.pack(side=tk.RIGHT)
 
-        # Slider zoom controls for precise navigation
-        zoom_frame = ttk.Frame(controls_frame)
-        zoom_frame.pack(fill=tk.X, pady=(0, 5))
+        # Shared row for zoom + speed
+        zoom_speed_row = ttk.Frame(controls_frame)
+        zoom_speed_row.pack(fill=tk.X, pady=(0, 5))
+
+        # ---- Slider Zoom ----
+        zoom_frame = ttk.Frame(zoom_speed_row)
+        zoom_frame.pack(side=tk.LEFT, padx=(0, 20))
+
         ttk.Label(zoom_frame, text="Slider Zoom:").pack(side=tk.LEFT)
 
-        # Create and store button references for highlighting
-        self.zoom_buttons[1] = ttk.Button(zoom_frame, text="Full",
-            command=lambda: self.set_slider_zoom(1), width=6)
+        self.zoom_buttons[1] = ttk.Button(
+            zoom_frame, text="Full",
+            command=lambda: self.set_slider_zoom(1), width=6
+        )
         self.zoom_buttons[1].pack(side=tk.LEFT, padx=2)
 
-        self.zoom_buttons[10] = ttk.Button(zoom_frame, text="10x",
-            command=lambda: self.set_slider_zoom(10), width=6)
+        self.zoom_buttons[10] = ttk.Button(
+            zoom_frame, text="10x",
+            command=lambda: self.set_slider_zoom(10), width=6
+        )
         self.zoom_buttons[10].pack(side=tk.LEFT, padx=2)
 
-        self.zoom_buttons[100] = ttk.Button(zoom_frame, text="100x",
-            command=lambda: self.set_slider_zoom(100), width=6)
+        self.zoom_buttons[100] = ttk.Button(
+            zoom_frame, text="100x",
+            command=lambda: self.set_slider_zoom(100), width=6
+        )
         self.zoom_buttons[100].pack(side=tk.LEFT, padx=2)
 
-        self.zoom_buttons[1000] = ttk.Button(zoom_frame, text="1000x",
-            command=lambda: self.set_slider_zoom(1000), width=6)
+        self.zoom_buttons[1000] = ttk.Button(
+            zoom_frame, text="1000x",
+            command=lambda: self.set_slider_zoom(1000), width=6
+        )
         self.zoom_buttons[1000].pack(side=tk.LEFT, padx=2)
 
-        self.zoom_info_label = ttk.Label(zoom_frame, text="(Full range)", foreground='gray')
+        self.zoom_info_label = ttk.Label(
+            zoom_frame, text="(Full range)", foreground='gray'
+        )
         self.zoom_info_label.pack(side=tk.LEFT, padx=(10, 0))
 
-        # Playback speed control
-        speed_frame = ttk.Frame(controls_frame)
-        speed_frame.pack(fill=tk.X, pady=(0, 5))
+
+        # ---- Playback Speed ----
+        speed_frame = ttk.Frame(zoom_speed_row)
+        speed_frame.pack(side=tk.LEFT)
+
         ttk.Label(speed_frame, text="Playback Speed:").pack(side=tk.LEFT)
 
-        # Create and store button references for highlighting
-        self.speed_buttons[0.25] = ttk.Button(speed_frame, text="0.25x",
-            command=lambda: self.set_playback_speed(0.25), width=6)
-        self.speed_buttons[0.25].pack(side=tk.LEFT, padx=2)
+        for speed in (0.25, 0.5, 1.0, 2.0, 4.0):
+            self.speed_buttons[speed] = ttk.Button(
+                speed_frame, text=f"{speed}x",
+                command=lambda s=speed: self.set_playback_speed(s),
+                width=6
+            )
+            self.speed_buttons[speed].pack(side=tk.LEFT, padx=2)
 
-        self.speed_buttons[0.5] = ttk.Button(speed_frame, text="0.5x",
-            command=lambda: self.set_playback_speed(0.5), width=6)
-        self.speed_buttons[0.5].pack(side=tk.LEFT, padx=2)
-
-        self.speed_buttons[1.0] = ttk.Button(speed_frame, text="1x",
-            command=lambda: self.set_playback_speed(1.0), width=6)
-        self.speed_buttons[1.0].pack(side=tk.LEFT, padx=2)
-
-        self.speed_buttons[2.0] = ttk.Button(speed_frame, text="2x",
-            command=lambda: self.set_playback_speed(2.0), width=6)
-        self.speed_buttons[2.0].pack(side=tk.LEFT, padx=2)
-
-        self.speed_buttons[4.0] = ttk.Button(speed_frame, text="4x",
-            command=lambda: self.set_playback_speed(4.0), width=6)
-        self.speed_buttons[4.0].pack(side=tk.LEFT, padx=2)
-
-        self.speed_info_label = ttk.Label(speed_frame, text="(Normal)", foreground='gray')
+        self.speed_info_label = ttk.Label(
+            speed_frame, text="(Normal)", foreground='gray'
+        )
         self.speed_info_label.pack(side=tk.LEFT, padx=(10, 0))
 
         # Initialize button highlighting
@@ -1071,6 +1085,18 @@ class SAM2VideoUI:
                 return
             self.mask_export_dir = masks_dir
 
+            # Populate self.masks with placeholders from metadata
+            # This enables flash functionality and mask lookup
+            mask_metadata = metadata.get('masks', [])
+            for item in mask_metadata:
+                frame_idx = item.get('frame_idx')
+                obj_id = item.get('obj_id')
+                if frame_idx is not None and obj_id is not None:
+                    if frame_idx not in self.masks:
+                        self.masks[frame_idx] = {}
+                    # Store placeholder - actual mask loaded from disk on demand
+                    self.masks[frame_idx][obj_id] = None
+
             # Load annotations from metadata
             self._load_annotations_from_metadata(metadata)
 
@@ -1200,14 +1226,13 @@ class SAM2VideoUI:
             messagebox.showinfo("Info", "Please select an object first")
             return
 
-        # Check if in prerendered masks mode (flash not supported)
-        if self.has_prerendered_masks:
+        # Verify mask_export_dir is set (required for loading masks from disk)
+        if not hasattr(self, 'mask_export_dir') or self.mask_export_dir is None:
             messagebox.showinfo("Flash Not Available",
-                "Flash feature is not available when viewing pre-segmented videos.\n\n"
-                "To use flash:\n"
-                "1. Load the original video\n"
-                "2. Load annotations or run segmentation\n"
-                "3. Flash will then work normally")
+                "No mask data available for flash.\n\n"
+                "Flash requires either:\n"
+                "1. A completed segmentation, or\n"
+                "2. Loaded pre-segmented results with mask files")
             return
 
         # Check if masks are visible
@@ -2161,8 +2186,30 @@ class SAM2VideoUI:
             # OPTIMIZATION: If displaying pre-rendered segmented video, skip mask loading
             # The frames already have masks baked in from the segmented video
             if self.has_prerendered_masks:
-                # Frames already contain mask overlay - nothing to do
-                # display_frame already has masks from segmented video
+                # Frames already contain mask overlay - normally nothing to do
+                # But if flash is in progress, we need to apply white overlay
+                if self.flash_in_progress and self.flash_white_on and self.flash_obj_id is not None:
+                    # Load the mask for the flashing object from disk
+                    mask = self._load_mask(self.current_frame_idx, self.flash_obj_id)
+                    if mask is not None:
+                        if len(mask.shape) == 2:
+                            # Resize mask if needed
+                            if mask.shape != (display_frame.shape[0], display_frame.shape[1]):
+                                from PIL import Image as PILImage
+                                mask_pil = PILImage.fromarray(mask)
+                                mask_pil = mask_pil.resize((display_frame.shape[1], display_frame.shape[0]), PILImage.NEAREST)
+                                mask = np.array(mask_pil)
+
+                            # Convert mask to boolean
+                            mask_bool = mask > 0
+
+                            # Create white overlay
+                            white_overlay = np.zeros_like(display_frame)
+                            white_overlay[mask_bool] = [255, 255, 255]
+
+                            # Blend white overlay on top of existing frame
+                            alpha = self.mask_opacity_var.get() if hasattr(self, 'mask_opacity_var') else 0.4
+                            display_frame = cv2.addWeighted(display_frame, 1-alpha, white_overlay, alpha, 0)
                 pass
             else:
                 # Original video mode: load masks from disk and overlay
@@ -4031,6 +4078,9 @@ class SAM2VideoUI:
                         print(f"   - Video: {output_base_dir}/segmented_video.avi")
                         print(f"   - Metadata: {metadata_path}")
 
+                        # Preserve original video path for re-segmentation before reloading
+                        self.original_video_path_for_resegment = source_video
+
                         # Reload the segmented video into UI for playback
                         self.status_label.config(text="Loading segmented video into UI...")
                         self.root.update()
@@ -5211,6 +5261,11 @@ class SAM2VideoUI:
             # Load model based on type
             if model_type == "SAM3":
                 # SAM3 loading with HuggingFace model and SAM2-compatible API
+                # IMPORTANT: Must patch SAM3 modules BEFORE importing build_sam3_video_model
+                # because the import triggers loading of modules with hardcoded "cuda"
+                from utils import patch_sam3_modules_for_device
+                patch_sam3_modules_for_device(device)
+
                 try:
                     from sam3.model_builder import build_sam3_video_model
                 except ImportError:
@@ -5221,20 +5276,12 @@ class SAM2VideoUI:
                         "3. Download checkpoints from https://huggingface.co/facebook/sam3"
                     )
 
-                # Patch SAM3 hardcoded .cuda() calls for device flexibility
-                patch_sam3_for_device()
-
                 # Build SAM3 model with SAM2-compatible API
+                # The patch_sam3_modules_for_device() handles all device placement
                 self.status_label.config(text="Building SAM3 model (may download from HuggingFace)...")
                 self.root.update()
 
-                # Use context manager to prevent hardcoded CUDA allocations
-                # SAM3 also inherits similar patterns from SAM2
-                if should_disable_cuda_for_device(device):
-                    with DisableCUDADuringInit():
-                        sam3_model = build_sam3_video_model(device=device)
-                else:
-                    sam3_model = build_sam3_video_model(device=device)
+                sam3_model = build_sam3_video_model(device=device)
 
                 # Extract the predictor using SAM2-compatible interface
                 self.sam2_model = sam3_model.tracker

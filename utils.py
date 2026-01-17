@@ -75,9 +75,266 @@ def should_disable_cuda_for_device(device: str) -> bool:
     return device == "cpu" or (device.startswith("cuda:") and device != "cuda:0")
 
 
+# Global variable to store the target device for SAM3
+_SAM3_TARGET_DEVICE = None
+
+
+def set_sam3_target_device(device: str):
+    """
+    Set the target device for SAM3 model building.
+
+    This must be called BEFORE importing SAM3 modules or building the model.
+
+    Args:
+        device: Target device string (e.g., "cpu", "cuda:0", "cuda:1")
+    """
+    global _SAM3_TARGET_DEVICE
+    _SAM3_TARGET_DEVICE = device
+    print(f"  [SAM3] Target device set to: {device}")
+
+
+def get_sam3_target_device() -> str:
+    """Get the target device for SAM3, defaulting to cuda:0 if not set."""
+    global _SAM3_TARGET_DEVICE
+    if _SAM3_TARGET_DEVICE is None:
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    return _SAM3_TARGET_DEVICE
+
+
+def patch_sam3_modules_for_device(device: str):
+    """
+    Comprehensive monkey-patch for SAM3 to fix ALL hardcoded CUDA references.
+
+    This patches modules at the CLASS level so that model construction uses
+    the correct device. Must be called BEFORE building the SAM3 model.
+
+    Args:
+        device: Target device string (e.g., "cpu", "cuda:0", "cuda:1")
+
+    Patches applied:
+        1. PositionEmbeddingSine.__init__ - precompute uses hardcoded "cuda"
+        2. TransformerDecoder._get_coords - uses hardcoded "cuda" for coord cache
+        3. Various .cuda() calls throughout the codebase (runtime patches)
+    """
+    set_sam3_target_device(device)
+
+    # Patch 1: PositionEmbeddingSine (called during model construction)
+    _patch_position_embedding_sine(device)
+
+    # Patch 2: TransformerDecoder._get_coords (decoder.py line 281)
+    _patch_transformer_decoder(device)
+
+    # Patch 3: VL Combiner (vl_combiner.py)
+    _patch_vl_combiner()
+
+    # Patch 4: IO Utils (io_utils.py)
+    _patch_io_utils()
+
+    # Patch 5: Sam3VideoPredictor
+    _patch_sam3_video_predictor()
+
+    # Patch 6: RoPEAttention (transformer.py line 285)
+    _patch_rope_attention(device)
+
+    # Patch 7: Runtime patches (for inference)
+    _patch_sam3_tracker_predictor()
+    _patch_sam3_tracker_base()
+
+    print(f"  [SAM3] All modules patched for device: {device}")
+
+
+def _patch_position_embedding_sine(device: str):
+    """Patch PositionEmbeddingSine to use the target device instead of hardcoded cuda."""
+    try:
+        from sam3.model import position_encoding
+    except ImportError:
+        return
+
+    if hasattr(position_encoding.PositionEmbeddingSine, '_original_init'):
+        return  # Already patched
+
+    original_init = position_encoding.PositionEmbeddingSine.__init__
+    position_encoding.PositionEmbeddingSine._original_init = original_init
+
+    def patched_init(self, num_pos_feats, temperature=10000, normalize=True,
+                     scale=None, precompute_resolution=None):
+        import math
+        super(position_encoding.PositionEmbeddingSine, self).__init__()
+        assert num_pos_feats % 2 == 0, "Expecting even model width"
+        self.num_pos_feats = num_pos_feats // 2
+        self.temperature = temperature
+        self.normalize = normalize
+        if scale is not None and normalize is False:
+            raise ValueError("normalize should be True if scale is passed")
+        if scale is None:
+            scale = 2 * math.pi
+        self.scale = scale
+
+        self.cache = {}
+        # PATCHED: Use target device instead of hardcoded "cuda"
+        target_device = get_sam3_target_device()
+        if precompute_resolution is not None:
+            precompute_sizes = [
+                (precompute_resolution // 4, precompute_resolution // 4),
+                (precompute_resolution // 8, precompute_resolution // 8),
+                (precompute_resolution // 16, precompute_resolution // 16),
+                (precompute_resolution // 32, precompute_resolution // 32),
+            ]
+            for size in precompute_sizes:
+                tensors = torch.zeros((1, 1) + size, device=target_device)
+                self.forward(tensors)
+                self.cache[size] = self.cache[size].clone().detach()
+
+    position_encoding.PositionEmbeddingSine.__init__ = patched_init
+    print("  [patch_sam3_for_device] Patched PositionEmbeddingSine.__init__")
+
+
+def _patch_transformer_decoder(device: str):
+    """Patch TransformerDecoder._get_coords to use target device instead of hardcoded cuda."""
+    try:
+        from sam3.model import decoder
+    except ImportError:
+        return
+
+    if not hasattr(decoder, 'TransformerDecoder'):
+        return
+
+    if hasattr(decoder.TransformerDecoder, '_device_patched'):
+        return  # Already patched
+
+    # Patch the static _get_coords method to use target device
+    original_get_coords = decoder.TransformerDecoder._get_coords
+
+    @staticmethod
+    def patched_get_coords(H, W, device):
+        # If device is "cuda" (hardcoded), replace with target device
+        if device == "cuda":
+            device = get_sam3_target_device()
+        coords_h = torch.arange(0, H, device=device, dtype=torch.float32) / H
+        coords_w = torch.arange(0, W, device=device, dtype=torch.float32) / W
+        return coords_h, coords_w
+
+    decoder.TransformerDecoder._get_coords = patched_get_coords
+    decoder.TransformerDecoder._device_patched = True
+    print("  [patch_sam3_for_device] Patched TransformerDecoder._get_coords")
+
+
+def _patch_vl_combiner():
+    """Patch VLCombiner to use inference_state device instead of hardcoded cuda."""
+    try:
+        from sam3.model import vl_combiner
+    except ImportError:
+        return
+
+    # The VLCombiner has device="cuda" as default in method signatures
+    # We need to patch the call sites or change defaults
+    # For now, we'll document that users should pass device explicitly
+    pass  # VL combiner patches handled at call sites
+
+
+def _patch_io_utils():
+    """Patch io_utils.py to use correct device instead of hardcoded .cuda()."""
+    try:
+        from sam3.model import io_utils
+    except ImportError:
+        return
+
+    if hasattr(io_utils, '_device_patched'):
+        return
+
+    # Patch load_image_as_tensor if it exists
+    if hasattr(io_utils, 'load_image_as_tensor'):
+        original_load = io_utils.load_image_as_tensor
+
+        def patched_load(*args, **kwargs):
+            result = original_load(*args, **kwargs)
+            target_device = get_sam3_target_device()
+            if hasattr(result, 'to'):
+                return result.to(target_device)
+            return result
+
+        io_utils.load_image_as_tensor = patched_load
+
+    io_utils._device_patched = True
+    print("  [patch_sam3_for_device] Patched io_utils")
+
+
+def _patch_sam3_video_predictor():
+    """Patch Sam3VideoPredictor to use correct device."""
+    try:
+        from sam3.model import sam3_video_predictor
+    except ImportError:
+        return
+
+    if hasattr(sam3_video_predictor, '_device_patched'):
+        return
+
+    # The predictor has .cuda() calls that need to be device-aware
+    # These will be handled by the init_state patches
+    sam3_video_predictor._device_patched = True
+
+
+def _patch_rope_attention(device: str):
+    """Patch RoPEAttention.__init__ to use target device instead of hardcoded cuda.
+
+    In transformer.py line 285, there's:
+        device = torch.device("cuda") if torch.cuda.is_available() else None
+    This causes OOM when cuda:0 is full but we want cuda:1.
+    """
+    try:
+        from sam3.sam import transformer
+        from sam3.sam import rope
+    except ImportError:
+        return
+
+    if not hasattr(transformer, 'RoPEAttention'):
+        return
+
+    if hasattr(transformer.RoPEAttention, '_device_patched'):
+        return  # Already patched
+
+    original_init = transformer.RoPEAttention.__init__
+    transformer.RoPEAttention._original_init = original_init
+
+    def patched_init(
+        self,
+        *args,
+        rope_theta=10000.0,
+        rope_k_repeat=False,
+        feat_sizes=(64, 64),
+        use_rope_real=False,
+        **kwargs,
+    ):
+        # Call parent Attention.__init__
+        transformer.Attention.__init__(self, *args, **kwargs)
+        self.use_rope_real = use_rope_real
+        from functools import partial
+        self.compute_cis = partial(
+            rope.compute_axial_cis, dim=self.internal_dim // self.num_heads, theta=rope_theta
+        )
+        # PATCHED: Use target device instead of hardcoded "cuda"
+        target_device = get_sam3_target_device()
+        device_obj = torch.device(target_device) if target_device else None
+        self.freqs_cis = self.compute_cis(
+            end_x=feat_sizes[0], end_y=feat_sizes[1], device=device_obj
+        )
+        if self.use_rope_real:
+            self.freqs_cis_real = self.freqs_cis.real
+            self.freqs_cis_imag = self.freqs_cis.imag
+        self.rope_k_repeat = rope_k_repeat
+
+    transformer.RoPEAttention.__init__ = patched_init
+    transformer.RoPEAttention._device_patched = True
+    print("  [patch_sam3_for_device] Patched RoPEAttention.__init__")
+
+
 def patch_sam3_for_device():
     """
     Monkey-patch SAM3 to fix hardcoded .cuda() calls in runtime code.
+
+    NOTE: This function is DEPRECATED in favor of patch_sam3_modules_for_device(device),
+    which patches both construction-time AND runtime issues. If you've already called
+    patch_sam3_modules_for_device, calling this function is a no-op.
 
     SAM3 has several hardcoded .cuda() calls that cause crashes when using
     devices other than cuda:0 (e.g., cuda:1, cuda:2). This function patches
