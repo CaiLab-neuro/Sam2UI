@@ -282,6 +282,11 @@ class SAM2VideoUI:
         self.bg_viz_image = None        # Cached PhotoImage for background visualization
         self.bg_viz_canvas = None       # Canvas for background ratio visualization
 
+        # Quality visualization zoom tracking
+        self.quality_viz_range_start = 0    # Start frame of rendered range
+        self.quality_viz_range_end = 0      # End frame of rendered range
+        self.quality_viz_zoom_level = 1     # Zoom level when last rendered
+
         # Initialize default colors and names
         self._initialize_objects()
         
@@ -1148,6 +1153,15 @@ class SAM2VideoUI:
                 if not segmented_video_path:
                     return
 
+            # Clean up any existing lazy loading state (like load_video does)
+            if hasattr(self, 'video_cap_lazy') and self.video_cap_lazy:
+                self.video_cap_lazy.release()
+                self.video_cap_lazy = None
+
+            # Clear frame cache to prevent stale data from previous lazy loading session
+            if hasattr(self, 'frame_cache'):
+                self.frame_cache = {}
+
             # Clear existing state
             self.frames = []
             self.masks = {}
@@ -1959,7 +1973,8 @@ class SAM2VideoUI:
 
     def _render_quality_backgrounds(self):
         """
-        Pre-render background colorbars as images (called once when metrics loaded).
+        Pre-render background colorbars as images for the current visible range.
+        In zoom mode, only renders frames in the visible slider window.
         This is much faster than creating hundreds of rectangles on every update.
         """
         if not self.change_viz_canvas or not self.bg_viz_canvas:
@@ -1979,8 +1994,19 @@ class SAM2VideoUI:
         if canvas_width <= 1:
             return False
 
-        num_frames = len(self.inter_frame_changes)
-        if num_frames == 0:
+        total_metric_frames = len(self.inter_frame_changes)
+        if total_metric_frames == 0:
+            return False
+
+        # Get the visible range based on zoom level
+        range_start, range_end, zoom_level = self._get_quality_viz_range()
+
+        # Clamp range to available metrics
+        range_start = max(0, min(range_start, total_metric_frames - 1))
+        range_end = max(0, min(range_end, total_metric_frames - 1))
+
+        visible_frames = range_end - range_start + 1
+        if visible_frames <= 0:
             return False
 
         try:
@@ -1990,12 +2016,14 @@ class SAM2VideoUI:
             change_img = Image.new('RGB', (canvas_width, canvas_height))
             change_draw = ImageDraw.Draw(change_img)
 
-            pixels_per_frame = canvas_width / num_frames
+            pixels_per_frame = canvas_width / visible_frames
 
-            for i, change_ratio in enumerate(self.inter_frame_changes):
+            # Iterate only over the visible range
+            for i, frame_idx in enumerate(range(range_start, range_end + 1)):
                 x0 = int(i * pixels_per_frame)
                 x1 = int((i + 1) * pixels_per_frame)
 
+                change_ratio = self.inter_frame_changes[frame_idx]
                 # Color: white (no change) to red (high change)
                 intensity = int(255 * (1 - change_ratio))
                 color = (255, intensity, intensity)
@@ -2008,10 +2036,11 @@ class SAM2VideoUI:
             bg_img = Image.new('RGB', (canvas_width, canvas_height))
             bg_draw = ImageDraw.Draw(bg_img)
 
-            for i, bg_ratio in enumerate(self.background_ratios):
+            for i, frame_idx in enumerate(range(range_start, range_end + 1)):
                 x0 = int(i * pixels_per_frame)
                 x1 = int((i + 1) * pixels_per_frame)
 
+                bg_ratio = self.background_ratios[frame_idx]
                 # Color: green (low bg) to yellow (high bg)
                 if bg_ratio < 0.5:
                     g = 255
@@ -2025,8 +2054,12 @@ class SAM2VideoUI:
 
             self.bg_viz_image = ImageTk.PhotoImage(bg_img)
 
+            # Store the rendered range
+            self.quality_viz_range_start = range_start
+            self.quality_viz_range_end = range_end
+            self.quality_viz_zoom_level = zoom_level
+
             self.quality_bg_rendered = True
-            print("Quality visualization backgrounds cached successfully")
             return True
 
         except Exception as e:
@@ -2037,12 +2070,21 @@ class SAM2VideoUI:
         """
         Update only the blue frame indicator line (fast operation).
         Should be called on every frame change.
+
+        If the visible range has changed (due to zoom or pan), triggers a full
+        re-render instead. Otherwise, just repositions the blue indicator line.
         """
         if not self.change_viz_canvas or not self.bg_viz_canvas:
             return
 
         if not self.quality_bg_rendered:
             # Backgrounds not cached yet, do full render
+            self._update_quality_visualizations()
+            return
+
+        # Check if the visible range has changed (zoom or pan)
+        if self._quality_range_changed():
+            # Range changed, need full re-render
             self._update_quality_visualizations()
             return
 
@@ -2053,8 +2095,9 @@ class SAM2VideoUI:
         if canvas_width <= 1:
             return
 
-        num_frames = len(self.inter_frame_changes)
-        if num_frames == 0:
+        # Use the rendered range for positioning
+        visible_frames = self.quality_viz_range_end - self.quality_viz_range_start + 1
+        if visible_frames <= 0:
             return
 
         # Clear and redraw backgrounds
@@ -2065,18 +2108,63 @@ class SAM2VideoUI:
         self.change_viz_canvas.create_image(0, 0, anchor='nw', image=self.change_viz_image)
         self.bg_viz_canvas.create_image(0, 0, anchor='nw', image=self.bg_viz_image)
 
-        # Draw current frame indicator
+        # Draw current frame indicator (positioned relative to visible range)
         if hasattr(self, 'current_frame_idx'):
-            pixels_per_frame = canvas_width / num_frames
-            x_pos = self.current_frame_idx * pixels_per_frame
-            self.change_viz_canvas.create_line(
-                x_pos, 0, x_pos, canvas_height,
-                fill='blue', width=2
-            )
-            self.bg_viz_canvas.create_line(
-                x_pos, 0, x_pos, canvas_height,
-                fill='blue', width=2
-            )
+            # Only draw if current frame is within visible range
+            if (self.quality_viz_range_start <= self.current_frame_idx <= self.quality_viz_range_end):
+                # Calculate position relative to visible range
+                relative_pos = self.current_frame_idx - self.quality_viz_range_start
+                pixels_per_frame = canvas_width / visible_frames
+                x_pos = relative_pos * pixels_per_frame
+
+                self.change_viz_canvas.create_line(
+                    x_pos, 0, x_pos, canvas_height,
+                    fill='blue', width=2
+                )
+                self.bg_viz_canvas.create_line(
+                    x_pos, 0, x_pos, canvas_height,
+                    fill='blue', width=2
+                )
+
+    def _get_quality_viz_range(self):
+        """
+        Get the frame range that should be displayed in quality visualizations.
+
+        Returns:
+            tuple: (range_start, range_end, zoom_level)
+        """
+        if not hasattr(self, 'slider_zoom_level') or not self.frames:
+            total = len(self.inter_frame_changes) if self.inter_frame_changes else 0
+            return (0, max(0, total - 1), 1)
+
+        zoom_level = self.slider_zoom_level.get()
+        total_frames = len(self.frames)
+
+        if zoom_level == 1:
+            # Full range mode - show all frames
+            return (0, total_frames - 1, 1)
+        else:
+            # Zoomed mode - get current slider window bounds
+            window_start = int(self.frame_slider.cget('from'))
+            window_end = int(self.frame_slider.cget('to'))
+            return (window_start, window_end, zoom_level)
+
+    def _quality_range_changed(self):
+        """
+        Check if the visible range for quality visualization has changed.
+
+        Returns:
+            bool: True if range changed and re-render is needed, False otherwise
+        """
+        range_start, range_end, zoom_level = self._get_quality_viz_range()
+
+        # Check if anything changed
+        if (range_start != self.quality_viz_range_start or
+            range_end != self.quality_viz_range_end or
+            zoom_level != self.quality_viz_zoom_level):
+            return True
+
+        return False
 
     def _update_quality_visualizations(self):
         """
@@ -2200,23 +2288,33 @@ class SAM2VideoUI:
     def _on_viz_canvas_click(self, event):
         """
         Handle clicks on visualization canvas to jump to frame.
+        Maps click position to the currently visible range (respects zoom).
         """
         if not self.inter_frame_changes:
             return
 
         canvas_width = event.widget.winfo_width()
-        num_frames = len(self.inter_frame_changes)
 
-        # Calculate which frame was clicked
+        # Use the currently rendered visible range
+        range_start = self.quality_viz_range_start
+        range_end = self.quality_viz_range_end
+        visible_frames = range_end - range_start + 1
+
+        if visible_frames <= 0:
+            return
+
+        # Calculate which frame was clicked (relative to visible range)
         click_ratio = event.x / canvas_width
-        target_frame = int(click_ratio * num_frames)
-        target_frame = max(0, min(target_frame, num_frames - 1))
+        relative_frame = int(click_ratio * visible_frames)
+        target_frame = range_start + relative_frame
+        target_frame = max(range_start, min(target_frame, range_end))
 
         # Jump to frame
         self.current_frame_idx = target_frame
         self.frame_var.set(target_frame)
         self.display_current_frame()
-        self._update_quality_visualizations()
+        # Note: don't call _update_quality_visualizations here as it may
+        # be called by display_current_frame() via _update_quality_indicator()
 
     def _get_session_cache_key(self, video_path, frame_indices):
         """
@@ -2249,8 +2347,8 @@ class SAM2VideoUI:
         if not self.frames:
             return
         
-        # Handle lazy loading (skip when viewing segmented video)
-        if self.lazy_load_var.get() and hasattr(self, 'video_props') and not getattr(self, 'segmented_video_displayed', False):
+        # Handle lazy loading (works for both original and segmented videos)
+        if self.lazy_load_var.get() and hasattr(self, 'video_props'):
             # Load frame on demand
             frame = self._load_frame_lazy(self.current_frame_idx)
             if frame is None:
@@ -2799,6 +2897,10 @@ class SAM2VideoUI:
         self.status_label.config(text=f"Slider zoom: {zoom_level}x")
         self._update_zoom_button_highlight()
 
+        # Re-render quality visualizations for new zoom range
+        if self.inter_frame_changes and self.background_ratios:
+            self._update_quality_visualizations()
+
     def set_playback_speed(self, speed):
         """Set playback speed multiplier"""
         self.playback_speed.set(speed)
@@ -2891,6 +2993,10 @@ class SAM2VideoUI:
 
         # Flash notification
         # self._flash_zoom_jump_notification(old_min, old_max, window_start, window_end)
+
+        # Re-render quality visualizations for new window
+        if self.inter_frame_changes and self.background_ratios:
+            self._update_quality_visualizations()
 
         self.zoom_jump_scheduled = None
 
@@ -3836,36 +3942,26 @@ class SAM2VideoUI:
                         try:
                             segmented_video_path = os.path.join(output_base_dir, "segmented_video.avi")
                             if os.path.exists(segmented_video_path):
-                                # Clear old frames
-                                self.frames = []
+                                # Clean up existing lazy loading state before reloading
+                                if hasattr(self, 'video_cap_lazy') and self.video_cap_lazy:
+                                    self.video_cap_lazy.release()
+                                    self.video_cap_lazy = None
+                                if hasattr(self, 'frame_cache'):
+                                    self.frame_cache = {}
 
-                                # Open segmented video
-                                reload_cap = cv2.VideoCapture(segmented_video_path)
-                                frame_count = int(reload_cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
-                                print(f"Loading {frame_count} frames from segmented video...")
-
-                                # Load frames into memory (they're already processed, so eager loading is fine)
-                                for idx in range(frame_count):
-                                    ret, frame = reload_cap.read()
-                                    if not ret:
-                                        break
-                                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                                    self.frames.append(frame_rgb)
-
-                                reload_cap.release()
-
-                                # Update UI controls
-                                self.frame_slider.config(to=len(self.frames)-1)
-                                self.current_frame_idx = 0
-                                self.frame_var.set(0)
+                                # Load segmented video using standard path (respects lazy loading preference)
+                                # This is consistent with how import_masks() loads videos (lines 1167-1175)
+                                print(f"Loading segmented video: {segmented_video_path}")
+                                self.video_path = segmented_video_path
                                 self.segmented_video_displayed = True
                                 self.has_prerendered_masks = True  # Frames have masks baked in
 
-                                # Display first frame
-                                self.display_current_frame()
-
-                                print(f"Loaded {len(self.frames)} frames from segmented video")
+                                # load_video_frames() handles:
+                                # - Setting up video_props and video_cap_lazy if lazy loading enabled
+                                # - Loading all frames into self.frames if lazy loading disabled
+                                # - Updating frame_slider, current_frame_idx
+                                # - Calling display_current_frame()
+                                self.load_video_frames()
                             else:
                                 print("WARNING: Segmented video not found, keeping current frames")
 
