@@ -361,7 +361,12 @@ def patch_sam3_for_device():
 
 
 def _patch_sam3_tracker_predictor():
-    """Patch Sam3TrackerPredictor._get_image_feature to fix hardcoded .cuda() call."""
+    """Patch Sam3TrackerPredictor methods to fix hardcoded device issues.
+
+    Patches:
+    - _get_image_feature: fixes hardcoded .cuda() call
+    - init_state: fixes hardcoded torch.device("cuda") for storage_device
+    """
     try:
         from sam3.model.sam3_tracking_predictor import Sam3TrackerPredictor
     except ImportError:
@@ -417,12 +422,88 @@ def _patch_sam3_tracker_predictor():
     Sam3TrackerPredictor._get_image_feature = _patched_get_image_feature
     print("  [patch_sam3_for_device] Patched Sam3TrackerPredictor._get_image_feature")
 
+    # Also patch init_state to fix storage_device hardcoding
+    if not hasattr(Sam3TrackerPredictor, '_original_init_state'):
+        Sam3TrackerPredictor._original_init_state = Sam3TrackerPredictor.init_state
+
+        @torch.inference_mode()
+        def _patched_init_state(
+            self,
+            video_height=None,
+            video_width=None,
+            num_frames=None,
+            video_path=None,
+            cached_features=None,
+            offload_video_to_cpu=False,
+            offload_state_to_cpu=False,
+            async_loading_frames=False,
+        ):
+            """Initialize inference state (patched to use self.device instead of hardcoded cuda)."""
+            from collections import OrderedDict
+            from sam3.model.utils.sam2_utils import load_video_frames
+
+            inference_state = {}
+            inference_state["offload_video_to_cpu"] = offload_video_to_cpu
+            inference_state["offload_state_to_cpu"] = offload_state_to_cpu
+            inference_state["device"] = self.device
+
+            # PATCHED: Use self.device instead of hardcoded torch.device("cuda")
+            if offload_state_to_cpu:
+                inference_state["storage_device"] = torch.device("cpu")
+            else:
+                inference_state["storage_device"] = self.device  # <-- THE FIX
+
+            if video_path is not None:
+                images, video_height, video_width = load_video_frames(
+                    video_path=video_path,
+                    image_size=self.image_size,
+                    offload_video_to_cpu=offload_video_to_cpu,
+                    async_loading_frames=async_loading_frames,
+                    compute_device=inference_state["storage_device"],
+                )
+                inference_state["images"] = images
+                inference_state["num_frames"] = len(images)
+                inference_state["video_height"] = video_height
+                inference_state["video_width"] = video_width
+            else:
+                inference_state["video_height"] = video_height
+                inference_state["video_width"] = video_width
+                inference_state["num_frames"] = num_frames
+
+            inference_state["point_inputs_per_obj"] = {}
+            inference_state["mask_inputs_per_obj"] = {}
+            inference_state["cached_features"] = (
+                {} if cached_features is None else cached_features
+            )
+            inference_state["constants"] = {}
+            inference_state["obj_id_to_idx"] = OrderedDict()
+            inference_state["obj_idx_to_id"] = OrderedDict()
+            inference_state["obj_ids"] = []
+            inference_state["output_dict"] = {
+                "cond_frame_outputs": {},
+                "non_cond_frame_outputs": {},
+            }
+            inference_state["first_ann_frame_idx"] = None
+            inference_state["output_dict_per_obj"] = {}
+            inference_state["temp_output_dict_per_obj"] = {}
+            inference_state["consolidated_frame_inds"] = {
+                "cond_frame_outputs": set(),
+                "non_cond_frame_outputs": set(),
+            }
+            inference_state["tracking_has_started"] = False
+            inference_state["frames_already_tracked"] = {}
+            self.clear_all_points_in_video(inference_state)
+            return inference_state
+
+        Sam3TrackerPredictor.init_state = _patched_init_state
+        print("  [patch_sam3_for_device] Patched Sam3TrackerPredictor.init_state")
+
 
 def _patch_sam3_tracker_base():
     """Patch Sam3TrackerBase._prepare_memory_conditioned_features to fix hardcoded .cuda() calls."""
     try:
         from sam3.model.sam3_tracker_base import Sam3TrackerBase
-        from sam3.utils.misc import select_closest_cond_frames
+        from sam3.model.sam3_tracker_utils import select_closest_cond_frames
     except ImportError:
         return  # SAM3 not installed
 

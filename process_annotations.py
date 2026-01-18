@@ -51,6 +51,15 @@ from utils import (
     compress_video_with_ffmpeg,
 )
 
+# Import shared segmentation module
+from segment import (
+    PointAnnotation,
+    SegmentationConfig,
+    SegmentationResult,
+    VideoSegmenter,
+    ProgressCallback,
+)
+
 try:
     from sam2.build_sam import build_sam2_video_predictor
 except ImportError as e:
@@ -145,6 +154,66 @@ def _auto_select_default_model():
 
     print("  Selected: sam2.1-base+ (default, checkpoint may be missing)")
     return "sam2.1-base+"
+
+
+class ConsoleProgressCallback:
+    """
+    Console-based progress callback for VideoSegmenter.
+
+    Prints progress updates with memory monitoring for CLI usage.
+    """
+
+    def __init__(self, verbose: bool = True):
+        """
+        Initialize the console progress callback.
+
+        Args:
+            verbose: Whether to print detailed progress updates
+        """
+        self.verbose = verbose
+        self._phase_total = 0
+        self._current_phase = ""
+
+    def on_phase_start(self, phase: str, total_steps: int) -> None:
+        """Called when a new phase begins."""
+        self._current_phase = phase
+        self._phase_total = total_steps
+
+        phase_labels = {
+            "extracting": "Extracting frames...",
+            "initializing": "Initializing SAM inference...",
+            "adding_points": "Adding annotation prompts...",
+            "forward": f"Propagating masks forward (0->{total_steps-1})...",
+            "backward": f"Propagating masks backward ({total_steps-1}->0)...",
+        }
+        print(f"\n{phase_labels.get(phase, f'Processing {phase}...')}")
+
+    def on_progress(self, phase: str, current: int, total: int, message: str) -> None:
+        """Report progress within a phase."""
+        if not self.verbose:
+            return
+
+        # Only report every 50 frames for propagation phases
+        if phase in ("forward", "backward") and current % 50 != 0:
+            return
+
+        # Monitor memory usage
+        if torch.cuda.is_available():
+            gpu_allocated = torch.cuda.memory_allocated() / (1024**3)
+            gpu_peak = torch.cuda.max_memory_allocated() / (1024**3)
+            process = psutil.Process()
+            ram_used = process.memory_info().rss / (1024**3)
+
+            print(f"  {phase.capitalize()}: Frame {current}/{total} | "
+                  f"GPU: {gpu_allocated:.2f}GB (peak: {gpu_peak:.2f}GB) | "
+                  f"RAM: {ram_used:.2f}GB")
+        else:
+            print(f"  {phase.capitalize()}: Frame {current}/{total}")
+
+    def on_phase_complete(self, phase: str) -> None:
+        """Called when a phase completes."""
+        print(f"  {phase.capitalize()} complete.")
+
 
 class SAM2Processor:
     def __init__(self, config_file=None, checkpoint_file=None, model_name="sam2.1-base+", offload_to_cpu=False, async_loading=False, smooth_masks=False, use_bfloat16=False, device=None):

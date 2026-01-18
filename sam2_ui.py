@@ -32,6 +32,15 @@ from utils import (
     compress_video_with_ffmpeg,
 )
 
+# Import shared segmentation module
+from segment import (
+    PointAnnotation,
+    SegmentationConfig,
+    SegmentationResult,
+    VideoSegmenter,
+    ProgressCallback,
+)
+
 # Add SAM2 path to Python path - dynamically detect project root
 def get_project_root():
     """Dynamically detect the project root directory (where sam2_ui.py lives)"""
@@ -84,6 +93,80 @@ def _check_sam3_available():
         return False
 
 SAM3_AVAILABLE = _check_sam3_available()
+
+
+class TkProgressCallback:
+    """
+    Tkinter-based progress callback for VideoSegmenter.
+
+    Updates a Tkinter progress bar and status label during segmentation.
+    """
+
+    def __init__(self, root: tk.Tk, progress_var: tk.DoubleVar, status_label: tk.Label):
+        """
+        Initialize the Tkinter progress callback.
+
+        Args:
+            root: Tkinter root window for update_idletasks()
+            progress_var: Tkinter DoubleVar bound to a progress bar
+            status_label: Tkinter Label for status messages
+        """
+        self.root = root
+        self.progress_var = progress_var
+        self.status_label = status_label
+        self._phase_progress_base = 0.0
+        self._phase_progress_range = 0.0
+
+    def on_phase_start(self, phase: str, total_steps: int) -> None:
+        """Called when a new phase begins."""
+        # Map phases to progress bar ranges
+        phase_ranges = {
+            "extracting": (0, 30),
+            "initializing": (30, 35),
+            "adding_points": (35, 40),
+            "forward": (40, 70),
+            "backward": (70, 100),
+        }
+        start, end = phase_ranges.get(phase, (0, 100))
+        self._phase_progress_base = start
+        self._phase_progress_range = end - start
+
+        phase_labels = {
+            "extracting": "Extracting frames...",
+            "initializing": "Initializing SAM inference...",
+            "adding_points": "Adding annotation prompts...",
+            "forward": "Propagating masks forward...",
+            "backward": "Propagating masks backward...",
+        }
+        self.status_label.config(text=phase_labels.get(phase, f"Processing {phase}..."))
+        self.progress_var.set(start)
+        self.root.update_idletasks()
+
+    def on_progress(self, phase: str, current: int, total: int, message: str) -> None:
+        """Report progress within a phase."""
+        if total > 0:
+            progress = self._phase_progress_base + (current / total) * self._phase_progress_range
+            self.progress_var.set(min(progress, 100))
+
+        self.status_label.config(text=message)
+
+        # Only update UI every few iterations to avoid lag
+        if current % 10 == 0:
+            self.root.update_idletasks()
+
+    def on_phase_complete(self, phase: str) -> None:
+        """Called when a phase completes."""
+        # Set progress to end of phase range
+        phase_ends = {
+            "extracting": 30,
+            "initializing": 35,
+            "adding_points": 40,
+            "forward": 70,
+            "backward": 100,
+        }
+        self.progress_var.set(phase_ends.get(phase, 100))
+        self.root.update_idletasks()
+
 
 class SAM2VideoUI:
     def __init__(self, root):
@@ -3451,23 +3534,23 @@ class SAM2VideoUI:
     
 
     def segment_video(self):
-        """Segment video using SAM2 model"""
+        """Segment video using SAM2/SAM3 model via VideoSegmenter."""
         if not self.frames:
             messagebox.showwarning("Warning", "Please load a video first")
             return
-            
+
         if not self.model_loaded or not self.sam2_model:
             messagebox.showwarning("Warning", "Please load a SAM model first")
             return
-            
+
         if not self.click_points:
             messagebox.showwarning("Warning", "Please add some click points first")
             return
-        
+
         # Validate annotations
         is_valid, error_msg = self._validate_annotations_before_segmentation()
         if not is_valid:
-            messagebox.showerror("Invalid Annotations", 
+            messagebox.showerror("Invalid Annotations",
                             f"{error_msg}\n\n"
                             f"This usually happens when:\n"
                             f"1. Annotations were saved with different video settings\n"
@@ -3475,9 +3558,8 @@ class SAM2VideoUI:
                             f"Please reload the video with the same settings used when creating annotations, "
                             f"or create new annotations for the current video.")
             return
-        
+
         # Ask for output directory for results
-        # Use parent of last export dir if available, otherwise home directory
         initial_dir = os.path.dirname(self.last_export_dir) if self.last_export_dir else os.path.expanduser("~")
         output_base_dir = filedialog.askdirectory(
             title="Select Output Directory for Segmentation Results (Cancel to abort)",
@@ -3485,13 +3567,12 @@ class SAM2VideoUI:
         )
 
         if not output_base_dir:
-            # User cancelled - abort segmentation
-            return
+            return  # User cancelled
 
         # Save this directory for next time
         self._save_last_export_dir(output_base_dir)
 
-        # Create output directory structure directly (no temp directories)
+        # Create output directory structure
         try:
             os.makedirs(output_base_dir, exist_ok=True)
             masks_output_dir = os.path.join(output_base_dir, "masks")
@@ -3503,8 +3584,7 @@ class SAM2VideoUI:
             return
 
         try:
-            self.status_label.config(text="Preparing frames for SAM model...")
-
+            self.status_label.config(text="Preparing for segmentation...")
             self.progress_bar.pack(fill=tk.X, pady=(5, 0))
             self.progress_var.set(0)
             self.root.update()
@@ -3516,99 +3596,17 @@ class SAM2VideoUI:
                 if not segmentation_video_path:
                     return  # User cancelled
 
-            # Process all frames
+            source_video = segmentation_video_path or self.video_path
             total_frames = len(self.frames)
             frames_to_process = list(range(0, total_frames))
             print(f"Processing full video: {len(frames_to_process)} frames at original resolution")
 
-            # Get or reuse session-based cache directory
-            # Reuses cache if same video within session, creates new if different video
-            source_video = segmentation_video_path or self.video_path
+            # Get or reuse session-based cache directory for frames
             temp_dir = self._get_session_cache_dir(source_video)
-
-            # Use the user-selected directory for mask output (no temp directory)
             export_dir = masks_output_dir
 
             try:
-                # Check if frames already exist in cache (session reuse)
-                existing_frames = sorted(glob.glob(os.path.join(temp_dir, "*.jpg")))
-                if len(existing_frames) == len(frames_to_process):
-                    print(f"Reusing {len(existing_frames)} cached frames from: {temp_dir}")
-                    self.status_label.config(text="Using cached frames...")
-                    self.progress_var.set(30)
-                else:
-                    # Extract frames from original video
-                    source_video = segmentation_video_path or self.video_path
-                    print(f"Extracting frames from: {source_video}")
-
-                    cap = cv2.VideoCapture(source_video)
-
-                    for save_idx, original_frame_num in enumerate(frames_to_process):
-                        cap.set(cv2.CAP_PROP_POS_FRAMES, original_frame_num)
-                        ret, frame_bgr = cap.read()
-                        if not ret:
-                            print(f"Warning: Could not read frame {original_frame_num}, skipping...")
-                            continue
-
-                        # Save at ORIGINAL resolution (no scaling)
-                        frame_path = os.path.join(temp_dir, f"{save_idx:05d}.jpg")
-                        cv2.imwrite(frame_path, frame_bgr)
-
-                        progress = (save_idx / len(frames_to_process)) * 30
-                        self.progress_var.set(progress)
-                        if save_idx % 10 == 0:
-                            self.root.update_idletasks()
-
-                    cap.release()
-
-                self.status_label.config(text="Initializing SAM inference...")
-                self.progress_var.set(30)
-                self.root.update()
-                
-                # Always reset inference state to clear dimension cache
-                # This ensures SAM2 uses current frame dimensions, not cached ones
-                if hasattr(self, 'inference_state') and self.inference_state is not None:
-                    # Reset existing state
-                    try:
-                        self.sam2_model.reset_state(self.inference_state)
-                    except:
-                        pass  # If reset_state doesn't exist, just clear the reference
-                    self.inference_state = None
-
-                # Initialize fresh state with current frames
-                # Enable memory optimizations (always on)
-
-                # Get the device the model is on
-                device = self._get_selected_device()
-
-                # Temporarily set default CUDA device to match model's device
-                # This ensures init_state loads frames to the correct device
-                original_device = None
-                if device.startswith("cuda:") and torch.cuda.is_available():
-                    gpu_id = int(device.split(":")[1])
-                    original_device = torch.cuda.current_device()
-                    torch.cuda.set_device(gpu_id)
-                    print(f"Set default CUDA device to {gpu_id} for init_state")
-
-                try:
-                    self.inference_state = self.sam2_model.init_state(
-                        video_path=temp_dir,
-                        offload_video_to_cpu=True,  # Reduce GPU memory usage
-                        offload_state_to_cpu=True   # Offload model state to CPU when not in use
-                    )
-                    print("Memory optimizations enabled: CPU offloading")
-                finally:
-                    # Restore original default CUDA device (if possible)
-                    if original_device is not None:
-                        try:
-                            torch.cuda.set_device(original_device)
-                            print(f"Restored default CUDA device to {original_device}")
-                        except Exception as e:
-                            # If we can't restore (e.g., original device is out of memory),
-                            # just continue with the current device
-                            print(f"Note: Could not restore default CUDA device to {original_device}: {e}")
-
-                # Calculate coordinate scaling if re-segmenting
+                # Calculate coordinate scaling for re-segmentation
                 coord_scale_x = 1.0
                 coord_scale_y = 1.0
                 if segmentation_video_path:
@@ -3617,7 +3615,6 @@ class SAM2VideoUI:
                     orig_height = int(cap_temp.get(cv2.CAP_PROP_FRAME_HEIGHT))
                     cap_temp.release()
 
-                    # Get dimensions using unified method (works in all modes)
                     dims = self._get_frame_dimensions()
                     if dims is None:
                         raise ValueError("Cannot determine segmented video dimensions")
@@ -3626,350 +3623,96 @@ class SAM2VideoUI:
                     coord_scale_y = orig_height / seg_height
 
                     print(f"Re-segmentation coordinate scaling: {coord_scale_x:.3f}x (width), {coord_scale_y:.3f}x (height)")
-                    print(f"  Segmented video: {seg_width}x{seg_height}")
-                    print(f"  Original video: {orig_width}x{orig_height}")
 
-                # Group click points by frame and by object ID
-                points_by_frame_and_object = {}
+                # Convert click_points to PointAnnotation objects with coordinate scaling
+                annotations = []
                 for x, y, is_pos, obj_id, frame_idx in self.click_points:
-                    # Check if this frame is in our processing list
                     if frame_idx not in frames_to_process:
-                        continue  # Skip points outside the processing range
+                        continue
 
-                    # Get sequential index in frames_to_process (for SAM input)
+                    # Get sequential index for SAM
                     sequential_frame_idx = frames_to_process.index(frame_idx)
-                    
-                    # Handle coordinate scaling for re-segmentation
-                    if coord_scale_x != 1.0 or coord_scale_y != 1.0:
-                        # Re-segmentation: Scale from segmented video dimensions to original video dimensions
-                        scaled_x = x * coord_scale_x
-                        scaled_y = y * coord_scale_y
-                    else:
-                        # Coordinates are stored at original resolution
-                        # Since frames are now always extracted at original resolution (even when UI displays downsampled),
-                        # no coordinate scaling is needed
-                        scaled_x = x
-                        scaled_y = y
-                    
-                    if sequential_frame_idx not in points_by_frame_and_object:
-                        points_by_frame_and_object[sequential_frame_idx] = {}
-                    if obj_id not in points_by_frame_and_object[sequential_frame_idx]:
-                        points_by_frame_and_object[sequential_frame_idx][obj_id] = {'points': [], 'labels': []}
 
-                    # Use SCALED coordinates for SAM2 (matching current frame size)
-                    points_by_frame_and_object[sequential_frame_idx][obj_id]['points'].append([scaled_x, scaled_y])
-                    points_by_frame_and_object[sequential_frame_idx][obj_id]['labels'].append(1 if is_pos else 0)
-                    
-                    
-                
-                self.status_label.config(text="Adding prompts to SAM...")
-                self.progress_var.set(35)
-                self.root.update()
+                    # Apply coordinate scaling for re-segmentation
+                    scaled_x = x * coord_scale_x
+                    scaled_y = y * coord_scale_y
 
-                # Initialize metadata list instead of pre-allocating masks (memory optimization)
+                    annotations.append(PointAnnotation(
+                        x=scaled_x,
+                        y=scaled_y,
+                        is_positive=bool(is_pos),
+                        object_id=obj_id,
+                        frame_idx=sequential_frame_idx,
+                        object_name=self.object_names.get(obj_id, f"Object_{obj_id}")
+                    ))
+
+                # Create segmentation config
+                config = SegmentationConfig(
+                    output_dir=output_base_dir,
+                    masks_subdir="masks",
+                    frame_dir=temp_dir,  # Use session cache
+                    enable_backward_propagation=True,
+                    frames_to_keep=20,
+                    offload_video_to_cpu=True,
+                    offload_state_to_cpu=True,
+                    calculate_quality_metrics=True,
+                    cleanup_temp_frames=False  # Don't cleanup session cache
+                )
+
+                # Create progress callback
+                progress_callback = TkProgressCallback(
+                    self.root, self.progress_var, self.status_label
+                )
+
+                # Get device
+                device = self._get_selected_device()
+
+                # Determine if using bfloat16
+                use_bfloat16 = (device.startswith("cuda") and
+                               hasattr(self, 'use_bfloat16') and self.use_bfloat16)
+
+                # Create VideoSegmenter
+                segmenter = VideoSegmenter(
+                    predictor=self.sam2_model,
+                    device=device,
+                    use_bfloat16=use_bfloat16
+                )
+                segmenter.set_progress_callback(progress_callback)
+
+                # Run segmentation
+                result = segmenter.segment(
+                    video_path=source_video,
+                    annotations=annotations,
+                    object_names=self.object_names,
+                    object_colors=self.object_colors,
+                    config=config
+                )
+
+                # Store inference state for potential reuse
+                self.inference_state = result.inference_state
+
+                # Convert result to UI's expected format
                 mask_metadata = []
-                
-                # Determine which frames to annotate based on where points exist
-                annotation_frames = sorted(points_by_frame_and_object.keys())
-                # Use for metadata
-                ann_frame_idx = annotation_frames[0] if annotation_frames else self.current_frame_idx
-                self.ann_frame_idx = ann_frame_idx
+                self.masks = {}
+                for frame_idx, frame_data in result.masks_metadata.items():
+                    for obj_id, mask_info in frame_data.items():
+                        mask_metadata.append({
+                            'frame_idx': frame_idx,
+                            'obj_id': obj_id,
+                            'mask_file': mask_info['filename'],
+                            'object_name': mask_info['name'],
+                            'color': mask_info['color']
+                        })
+                        if frame_idx not in self.masks:
+                            self.masks[frame_idx] = {}
+                        self.masks[frame_idx][obj_id] = None  # Placeholder
 
-                # Check if using SAM3 (different API signature for add_new_points_or_box)
-                is_sam3 = hasattr(self.sam2_model, '__class__') and 'Sam3' in self.sam2_model.__class__.__name__
+                # Store export directory
+                self.mask_export_dir = export_dir
 
-                # Get frame dimensions using unified method (works for both SAM2 and SAM3)
-                dims = self._get_frame_dimensions()
-                if dims is None:
-                    raise ValueError("Cannot determine frame dimensions")
-                frame_height, frame_width = dims
-                print(f"Frame dimensions: {frame_width}x{frame_height}")
-
-                # Process each annotation frame and its objects
-                for ann_frame in annotation_frames:
-                    obj_dict = points_by_frame_and_object[ann_frame]
-                    for obj_id, point_data in obj_dict.items():
-                        points = np.array(point_data['points'], dtype=np.float32)
-                        labels = np.array(point_data['labels'], dtype=np.int32)
-                        
-                        obj_name = self.object_names.get(obj_id, f"Object_{obj_id}")
-                        self.status_label.config(text=f"Processing {obj_name} on frame {ann_frame+1}...")
-                        self.root.update()
-                        
-                        try:
-                            # Get device
-                            device = self._get_selected_device()
-
-                            # ===== SAM3: Convert pixel coordinates to relative [0-1] coordinates =====
-                            if is_sam3:
-                                # SAM3 requires relative coordinates [0-1]
-                                rel_points = [[x / frame_width, y / frame_height] for x, y in points]
-                                points_to_use = np.array(rel_points, dtype=np.float32)
-
-                                print(f"  SAM3 coordinate conversion for {obj_name} on frame {ann_frame}:")
-                                if len(points) > 0:
-                                    print(f"    Example: Pixel {points[0]} → Relative [{rel_points[0][0]:.4f}, {rel_points[0][1]:.4f}]")
-                            else:
-                                # SAM2 uses pixel coordinates
-                                points_to_use = points
-                            # ======================================================================
-
-                            # Convert to tensors with Float32 (autocast will handle BFloat16 conversion)
-                            points_tensor = torch.from_numpy(points_to_use).to(dtype=torch.float32, device=device)
-                            labels_tensor = torch.from_numpy(labels).to(dtype=torch.int64, device=device)
-
-                            # Make sure tensors are contiguous
-                            points_tensor = points_tensor.contiguous()
-                            labels_tensor = labels_tensor.contiguous()
-
-                            # ===== SAM3: Use add_new_points (NOT add_new_points_or_box) =====
-                            if is_sam3:
-                                # SAM3 add_new_points returns 4 values
-                                _, out_obj_ids, low_res_masks, video_res_masks = self.sam2_model.add_new_points(
-                                    inference_state=self.inference_state,
-                                    frame_idx=ann_frame,
-                                    obj_id=obj_id,
-                                    points=points_tensor,
-                                    labels=labels_tensor,
-                                    clear_old_points=False,
-                                )
-                                print(f"  Successfully added {len(points)} points for {obj_name} on frame {ann_frame}")
-                                print(f"  Returned {len(out_obj_ids)} object IDs: {out_obj_ids}")
-                            # ================================================================
-                            else:
-                                # ===== SAM2: Use add_new_points_or_box =====
-                                _ = self.sam2_model.add_new_points_or_box(
-                                    inference_state=self.inference_state,
-                                    frame_idx=ann_frame,
-                                    obj_id=obj_id,
-                                    points=points_tensor,
-                                    labels=labels_tensor,
-                                    clear_old_points=False,
-                                )
-                                print(f"  Successfully added {len(points)} points for {obj_name} on frame {ann_frame}")
-                            # ============================================
-                            
-                        except Exception as e:
-                            error_msg = f"Error adding points for {obj_name} on frame {ann_frame}: {e}"
-                            print(error_msg)
-                            traceback.print_exc()
-                            messagebox.showerror("Segmentation Error", error_msg)
-                            return
-                
-                # Process entire video
-                self.status_label.config(text="Propagating through entire video...")
-                # Process all frames
-                frames_to_process = list(range(0, len(self.frames)))
-                
-                # Store the processing range for later use
-                self.processing_range = frames_to_process
-                
-                self.progress_var.set(40)
-                self.root.update()
-
-                processed_frames = 0
-                # Track propagation success for conditional success messages
-                propagation_success = True
-
-                # Check if using SAM3 (different API signature)
-                is_sam3 = hasattr(self.sam2_model, '__class__') and 'Sam3' in self.sam2_model.__class__.__name__
-
-                # Initialize incremental quality metrics calculator
-                if self.frames:
-                    if hasattr(self, 'video_cap_lazy') and self.video_cap_lazy:
-                        frame = self._load_frame_lazy(0)
-                    else:
-                        frame = self.frames[0]
-                    frame_height, frame_width = frame.shape[:2]
-                    quality_calculator = IncrementalQualityMetricsCalculator(
-                        frame_dimensions=(frame_height, frame_width),
-                        num_frames=len(frames_to_process)
-                    )
-                else:
-                    quality_calculator = None
-
-                try:
-                    # SAM3 requires additional arguments for propagate_in_video
-                    if is_sam3:
-                        propagate_iterator = self.sam2_model.propagate_in_video(
-                            self.inference_state,
-                            start_frame_idx=0,
-                            max_frame_num_to_track=len(frames_to_process),
-                            reverse=False,
-                            propagate_preflight=True  # Required to consolidate points into cond_frame_outputs
-                        )
-                    else:
-                        propagate_iterator = self.sam2_model.propagate_in_video(self.inference_state)
-
-                    for result in propagate_iterator:
-                        # Unpack based on model type (SAM3 returns 5 values, SAM2 returns 3)
-                        if is_sam3:
-                            out_frame_idx, out_obj_ids, out_low_res_masks, out_mask_logits, out_obj_scores = result
-                        else:
-                            out_frame_idx, out_obj_ids, out_mask_logits = result
-
-                        # Map sequential frame index back to original frame number
-                        if out_frame_idx >= len(frames_to_process):
-                            continue
-                        original_frame_num = frames_to_process[out_frame_idx]
-
-                        # Collect masks for quality metrics calculation
-                        frame_masks_for_quality = {}
-
-                        # Process each object mask
-                        for i, out_obj_id in enumerate(out_obj_ids):
-                            # Only keep masks for objects that were annotated anywhere
-                            if any(out_obj_id in obj_dict for obj_dict in points_by_frame_and_object.values()):
-                                mask_logits = out_mask_logits[i]
-
-                                # Convert from BFloat16 to Float32 only when moving to CPU for numpy
-                                if hasattr(mask_logits, 'cpu'):
-                                    # Convert to float32 for CPU operations (numpy doesn't support bfloat16)
-                                    mask_logits = mask_logits.float().cpu()
-                                if hasattr(mask_logits, 'numpy'):
-                                    mask_logits = mask_logits.numpy()
-
-                                # Convert to binary mask
-                                mask = (mask_logits > 0.0)
-
-                                # Ensure mask is 2D
-                                if len(mask.shape) > 2:
-                                    mask = mask.squeeze()
-
-                                # Always export to disk (streaming) for memory efficiency
-                                mask_uint8 = (mask * 255).astype(np.uint8)
-                                self._export_mask_to_disk(original_frame_num, out_obj_id, mask_uint8, export_dir, mask_metadata)
-
-                                # Store mask for quality metrics calculation
-                                frame_masks_for_quality[out_obj_id] = mask_uint8
-
-                                # Explicitly delete tensors
-                                del mask_logits
-                                del mask
-
-                        # Update quality metrics incrementally during forward pass
-                        if quality_calculator is not None:
-                            quality_calculator.update_forward(original_frame_num, frame_masks_for_quality)
-                        del frame_masks_for_quality
-
-                        # Clean up old frames from cache to prevent memory growth
-                        self._cleanup_frame_cache(out_frame_idx, self.inference_state)
-
-                        # Monitor memory usage
-                        self._monitor_memory(out_frame_idx, len(frames_to_process))
-
-                        processed_frames += 1
-                        progress = 40 + (processed_frames / max(1, len(frames_to_process))) * 30
-                        self.progress_var.set(min(progress, 70))
-                        
-                        if processed_frames % 10 == 0:
-                            self.status_label.config(text=f"Processing frame {processed_frames}/{len(frames_to_process)}")
-                            self.root.update_idletasks()
-                            
-                except Exception as e:
-                    print(f"Error during forward propagation: {e}")
-                    traceback.print_exc()
-                    propagation_success = False  # Mark propagation as failed
-                    messagebox.showwarning("Propagation Warning",
-                                        f"Encountered issue during forward propagation: {str(e)}")
-
-                # BACKWARD PROPAGATION 
-
-                
-                self.status_label.config(text=f"Propagating backward ...")
-                self.root.update()
-
-                try:
-                    backward_processed = 0
-                    frames_to_backward = len(frames_to_process)  # Total number of frames to process
-
-                    # SAM3 requires additional arguments for backward propagation
-                    if is_sam3:
-                        backward_iterator = self.sam2_model.propagate_in_video(
-                            self.inference_state,
-                            start_frame_idx=frames_to_backward - 1,
-                            max_frame_num_to_track=frames_to_backward,
-                            reverse=True,
-                            propagate_preflight=True  # Required to consolidate points into cond_frame_outputs
-                        )
-                    else:
-                        backward_iterator = self.sam2_model.propagate_in_video(
-                            self.inference_state, reverse=True
-                        )
-
-                    for result in backward_iterator:
-                        # Unpack based on model type (SAM3 returns 5 values, SAM2 returns 3)
-                        if is_sam3:
-                            out_frame_idx, out_obj_ids, out_low_res_masks, out_mask_logits, out_obj_scores = result
-                        else:
-                            out_frame_idx, out_obj_ids, out_mask_logits = result
-
-                        # Map sequential frame index back to original frame number
-                        if out_frame_idx >= len(frames_to_process):
-                            continue
-                        original_frame_num = frames_to_process[out_frame_idx]
-
-                        # Collect masks for quality metrics calculation
-                        frame_masks_for_quality = {}
-
-                        # Process each object mask
-                        for i, out_obj_id in enumerate(out_obj_ids):
-                            if any(out_obj_id in obj_dict for obj_dict in points_by_frame_and_object.values()):
-                                mask_logits = out_mask_logits[i]
-
-                                # Convert from BFloat16 to Float32 only when moving to CPU for numpy
-                                if hasattr(mask_logits, 'cpu'):
-                                    mask_logits = mask_logits.float().cpu()
-                                if hasattr(mask_logits, 'numpy'):
-                                    mask_logits = mask_logits.numpy()
-
-                                # Convert to binary mask
-                                mask = (mask_logits > 0.0)
-
-                                # Ensure mask is 2D
-                                if len(mask.shape) > 2:
-                                    mask = mask.squeeze()
-
-                                # Always export to disk (streaming) for memory efficiency
-                                mask_uint8 = (mask * 255).astype(np.uint8)
-                                self._export_mask_to_disk(original_frame_num, out_obj_id, mask_uint8, export_dir, mask_metadata)
-
-                                # Store mask for quality metrics calculation
-                                frame_masks_for_quality[out_obj_id] = mask_uint8
-
-                                # Explicitly delete tensors
-                                del mask_logits
-                                del mask
-
-                        # Update quality metrics incrementally during backward pass
-                        if quality_calculator is not None:
-                            quality_calculator.update_backward(original_frame_num, frame_masks_for_quality)
-                        del frame_masks_for_quality
-
-                        # Clean up old frames from cache to prevent memory growth
-                        self._cleanup_frame_cache(out_frame_idx, self.inference_state)
-
-                        # Monitor memory usage
-                        self._monitor_memory(out_frame_idx, len(frames_to_process))
-
-                        backward_processed += 1
-                        # Update progress (backward propagation gets remaining progress from 70% to 100%)
-                        if frames_to_backward > 0:
-                            backward_progress = 70 + (backward_processed / frames_to_backward) * 30
-                            self.progress_var.set(min(backward_progress, 100))
-
-                        if backward_processed % 10 == 0:
-                            self.status_label.config(text=f"Backward: Processing frame {backward_processed}/{frames_to_backward}")
-                            self.root.update_idletasks()
-
-                        
-
-                except Exception as e:
-                    print(f"Error during backward propagation: {e}")
-                    traceback.print_exc()
-                    propagation_success = False  # Mark propagation as failed
-                    messagebox.showwarning("Backward Propagation Warning",
-                                        f"Encountered issue during backward propagation: {str(e)}")
+                # Get quality metrics from result
+                quality_metrics = result.quality_metrics
+                propagation_success = len(mask_metadata) > 0
 
                 # Save metadata and temporary directory
                 metadata_path = os.path.join(export_dir, "segmentation_metadata.json")
@@ -4126,13 +3869,12 @@ class SAM2VideoUI:
                             traceback.print_exc()
                             # Continue anyway - segmentation succeeded even if reload failed
 
-                        # Get quality metrics from incremental calculator (already calculated during propagation)
-                        if quality_calculator is not None:
-                            self.inter_frame_changes, self.background_ratios = quality_calculator.get_results()
-                            quality_calculator.print_summary()
+                        # Get quality metrics from segmentation result
+                        if quality_metrics is not None:
+                            self.inter_frame_changes, self.background_ratios = quality_metrics
                             self._update_quality_visualizations()
                         else:
-                            # Fallback to disk-based calculation if calculator wasn't initialized
+                            # Fallback to disk-based calculation if metrics weren't calculated
                             self._calculate_segmentation_quality_metrics()
 
                         # Save quality metrics to disk
