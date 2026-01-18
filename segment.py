@@ -117,6 +117,7 @@ class SegmentationConfig:
         offload_state_to_cpu: Offload model state to CPU when not in use
         calculate_quality_metrics: Whether to calculate quality metrics
         cleanup_temp_frames: Whether to cleanup temporary frame directory
+        frame_format: Format for extracted frames ("jpg" for lossy/smaller, "png" for lossless)
     """
     output_dir: str
     masks_subdir: str = "masks"
@@ -129,6 +130,7 @@ class SegmentationConfig:
     offload_state_to_cpu: bool = True
     calculate_quality_metrics: bool = True
     cleanup_temp_frames: bool = True
+    frame_format: str = "jpg"  # "jpg" (default, smaller) or "png" (lossless)
 
     @property
     def masks_output_dir(self) -> str:
@@ -308,15 +310,17 @@ class VideoSegmenter:
         self,
         video_path: str,
         output_dir: str,
-        frame_range: Optional[Tuple[int, int]] = None
+        frame_range: Optional[Tuple[int, int]] = None,
+        frame_format: str = "jpg"
     ) -> int:
         """
-        Extract frames from video to JPEG files.
+        Extract frames from video to image files.
 
         Args:
             video_path: Path to input video
             output_dir: Directory to save extracted frames
             frame_range: Optional (start, end) for partial extraction
+            frame_format: Format for extracted frames ("jpg" or "png")
 
         Returns:
             Number of frames extracted
@@ -344,6 +348,11 @@ class VideoSegmenter:
         if start_frame > 0:
             cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
 
+        # Validate frame format
+        if frame_format not in ("jpg", "png"):
+            print(f"WARNING: Unknown frame format '{frame_format}', defaulting to 'jpg'")
+            frame_format = "jpg"
+
         extracted = 0
         for frame_num in range(start_frame, end_frame):
             ret, frame = cap.read()
@@ -351,8 +360,13 @@ class VideoSegmenter:
                 break
 
             # Save frame with sequential naming (SAM expects 00000.jpg, 00001.jpg, ...)
-            frame_path = os.path.join(output_dir, f"{extracted:05d}.jpg")
-            cv2.imwrite(frame_path, frame)
+            frame_path = os.path.join(output_dir, f"{extracted:05d}.{frame_format}")
+            if frame_format == "png":
+                # Use fast PNG compression (level 1 is fast, level 9 is slow but smaller)
+                cv2.imwrite(frame_path, frame, [cv2.IMWRITE_PNG_COMPRESSION, 1])
+            else:
+                # Default JPEG quality
+                cv2.imwrite(frame_path, frame)
             extracted += 1
 
             if extracted % 100 == 0:
@@ -849,21 +863,30 @@ class VideoSegmenter:
             is_persistent = False
 
         try:
-            # Check if frames already exist
+            # Check if frames already exist (support both jpg and png formats)
             existing_frames = sorted(Path(frame_dir).glob("*.jpg"))
+            if not existing_frames:
+                existing_frames = sorted(Path(frame_dir).glob("*.png"))
+
             if existing_frames:
                 print(f"Reusing {len(existing_frames)} existing frames from: {frame_dir}")
                 num_frames = len(existing_frames)
             else:
-                # Extract frames from video
-                print(f"Extracting frames to: {frame_dir}")
+                # Extract frames from video using configured format
+                print(f"Extracting frames to: {frame_dir} (format: {config.frame_format})")
                 num_frames = self._extract_frames(
-                    video_path, frame_dir, config.frame_range
+                    video_path, frame_dir, config.frame_range, config.frame_format
                 )
                 print(f"Extracted {num_frames} frames")
 
-            # Get frame dimensions
-            first_frame_path = sorted(Path(frame_dir).glob("*.jpg"))[0]
+            # Get frame dimensions (find first frame file)
+            frame_files = sorted(Path(frame_dir).glob("*.jpg"))
+            if not frame_files:
+                frame_files = sorted(Path(frame_dir).glob("*.png"))
+            if not frame_files:
+                raise ValueError(f"No frame files found in: {frame_dir}")
+
+            first_frame_path = frame_files[0]
             first_frame = cv2.imread(str(first_frame_path))
             if first_frame is None:
                 raise ValueError(f"Cannot read first frame: {first_frame_path}")

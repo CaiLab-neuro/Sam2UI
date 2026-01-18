@@ -30,6 +30,9 @@ from utils import (
     should_disable_cuda_for_device,
     patch_sam3_for_device,
     compress_video_with_ffmpeg,
+    export_segmented_video,
+    get_contrasting_text_color,
+    HybridFrameSource,
 )
 
 # Import shared segmentation module
@@ -1148,6 +1151,7 @@ class SAM2VideoUI:
             # Clear existing state
             self.frames = []
             self.masks = {}
+            self.mask_cache = {}  # Clear mask cache to prevent stale data from previous session
             self.click_points = []
             self.annotated_frames = set()
 
@@ -1646,6 +1650,7 @@ class SAM2VideoUI:
 
             self.frames = []
             self.masks = {}
+            self.mask_cache = {}  # Clear mask cache to prevent stale data from previous video
             self.click_points = []
 
             # Only reset these flags and clear original video path when loading a fresh video
@@ -3931,170 +3936,85 @@ class SAM2VideoUI:
 
     def _export_segmented_video(self, output_dir, masks_dir, fps=30, overlay_opacity=0.4, source_video_path=None):
         """
-        Export segmented video with mask overlays and text labels
-        Following the pattern from process_annotations.py
+        Export segmented video with mask overlays and text labels.
+        Uses shared export_segmented_video from utils.py for consistency with CLI.
 
         Args:
-            source_video_path: Path to original video file (used when re-segmenting to avoid duplicate labels)
+            output_dir: Directory to save the output video
+            masks_dir: Directory containing mask PNG files
+            fps: Frames per second for output video
+            overlay_opacity: Opacity for mask overlay (0.0 to 1.0)
+            source_video_path: Path to original video file (used when re-segmenting)
         """
-        print("Exporting segmented video...")
-
-        video_output_path_final = Path(output_dir) / "segmented_video.avi"
-        video_output_path_temp = Path(output_dir) / "segmented_video.temp.avi"
-
-        # Determine if we should load from source video or use cached frames
-        use_source_video = source_video_path is not None and os.path.exists(source_video_path)
-
-        if use_source_video:
-            # Open source video to get dimensions and frame count
-            cap = cv2.VideoCapture(source_video_path)
-            if not cap.isOpened():
-                print(f"ERROR: Could not open source video: {source_video_path}")
-                return False
-
-            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
-            print(f"  Loading frames from original video: {source_video_path}")
-            print(f"  Video dimensions: {width}x{height}, {total_frames} frames")
+        # Determine video source
+        if source_video_path and os.path.exists(source_video_path):
+            video_path = source_video_path
+        elif hasattr(self, 'video_path') and self.video_path:
+            video_path = self.video_path
         else:
-            # Get dimensions from video_props or frames
-            if hasattr(self, 'video_props') and self.video_props:
-                height, width = self.video_props['height'], self.video_props['width']
-            elif self.frames and len(self.frames) > 0:
-                height, width = self.frames[0].shape[:2]
-            else:
-                raise ValueError("Cannot determine video dimensions")
-            total_frames = len(self.frames)
-            cap = None
-
-        # Use H.264 codec (matching process_annotations.py)
-        # for codec in ['avc1', 'H264', 'X264', 'mp4v']:
-        #     fourcc = cv2.VideoWriter_fourcc(*codec)
-        #     out = cv2.VideoWriter(video_output_path_temp, fourcc, fps, (width, height))
-        #     if out.isOpened():
-        #         if codec != 'mp4v':
-        #             print(f"  Using {codec} codec for video encoding")
-        #         break
-        fourcc = cv2.VideoWriter_fourcc(*"MJPG")
-        out = cv2.VideoWriter(str(video_output_path_temp.with_suffix(".avi")),
-            fourcc, fps, (width, height))
-
-
-        if not out.isOpened():
-            print("  WARNING: Could not initialize video writer with any codec")
-            if cap:
-                cap.release()
+            print("ERROR: No video source available for export")
             return False
 
-        processed_frames = 0
-        for frame_idx in range(total_frames):
-            # Load frame from source video or cached frames
-            if use_source_video:
-                # Read from source video
-                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-                ret, frame_bgr = cap.read()
-                if not ret:
-                    print(f"WARNING: Could not read frame {frame_idx} from source video, skipping")
+        # Get session cache dir for frame reuse (if available)
+        frame_dir = None
+        if hasattr(self, '_get_session_cache_dir'):
+            try:
+                cache_dir = self._get_session_cache_dir()
+                if cache_dir and os.path.exists(cache_dir):
+                    # Check if frames exist in cache
+                    frame_files = list(Path(cache_dir).glob("*.jpg"))
+                    if frame_files:
+                        frame_dir = cache_dir
+            except Exception:
+                pass  # Fall back to video-only source
+
+        # Create hybrid frame source for efficiency
+        try:
+            frame_source = HybridFrameSource(video_path, frame_dir)
+        except ValueError as e:
+            print(f"ERROR: Could not create frame source: {e}")
+            return False
+
+        # Define mask data callback for UI state
+        def get_mask_data_from_ui(frame_idx):
+            """Load mask data from UI state (self.masks)."""
+            result = []
+            if frame_idx not in self.masks or not self.masks[frame_idx]:
+                return result
+
+            for obj_id in self.masks[frame_idx].keys():
+                # Load mask from disk
+                mask = self._load_mask(frame_idx, obj_id)
+                if mask is None:
                     continue
-                # Convert BGR to RGB
-                frame = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-            else:
-                # Load from cached frames (handles lazy loading)
-                if hasattr(self, 'video_cap_lazy') and self.video_cap_lazy:
-                    frame = self._load_frame_lazy(frame_idx)
-                else:
-                    frame = self.frames[frame_idx]
 
-            if frame is None:
-                print(f"WARNING: Could not load frame {frame_idx}, skipping")
-                continue
+                mask_bool = (mask > 0).astype(bool)
+                color = self.object_colors.get(obj_id, [255, 0, 0])  # Default red
+                # Ensure color is a tuple for consistency
+                if isinstance(color, list):
+                    color = tuple(color)
+                name = self.object_names.get(obj_id, f"Object_{obj_id}")
 
-            # Resize frame to original dimensions if it was scaled
-            # (This ensures masks and frames have matching dimensions for blending)
-            if frame.shape[:2] != (height, width):
-                print(f"WARNING: Frame size mismatch detected at frame {frame_idx}")
-                print(f"  Frame size: {frame.shape[1]}x{frame.shape[0]} (WxH)")
-                print(f"  Expected size: {width}x{height} (WxH)")
-                print(f"  Resizing frame to match mask dimensions...")
-                frame_resized = cv2.resize(frame, (width, height), interpolation=cv2.INTER_LINEAR)
-            else:
-                frame_resized = frame
+                result.append((mask_bool, color, name, obj_id))
 
-            overlay_frame = frame_resized.copy()
+            return result
 
-            # Check if this frame has masks
-            if frame_idx in self.masks and self.masks[frame_idx]:
-                # Collect mask data
-                mask_data_list = []
-                for obj_id in self.masks[frame_idx].keys():
-                    # Load mask from disk
-                    mask = self._load_mask(frame_idx, obj_id)
-                    if mask is None:
-                        continue
+        output_path = Path(output_dir) / "segmented_video.avi"
 
-                    mask_bool = (mask > 0).astype(bool)
-                    color = self.object_colors.get(obj_id, [255, 0, 0])  # Default red
-                    name = self.object_names.get(obj_id, f"Object_{obj_id}")
-
-                    mask_data_list.append((mask_bool, color, name, obj_id))
-
-                if mask_data_list:
-                    # Create overlay with averaged colors for overlapping regions
-                    combined_overlay = np.zeros((height, width, 3), dtype=np.float32)
-                    overlap_count = np.zeros((height, width), dtype=np.int32)
-
-                    for mask_bool, color, name, obj_id in mask_data_list:
-                        # Convert RGB to BGR for OpenCV
-                        color_bgr = color[::-1] if isinstance(color, (list, tuple)) else [0, 0, 255]
-                        combined_overlay[mask_bool] += color_bgr
-                        overlap_count[mask_bool] += 1
-
-                    # Average colors where masks overlap
-                    mask_pixels = overlap_count > 0
-                    combined_overlay[mask_pixels] /= overlap_count[mask_pixels, np.newaxis]
-                    combined_overlay = combined_overlay.astype(np.uint8)
-
-                    # Single blend operation
-                    overlay_frame = cv2.addWeighted(frame, 1-overlay_opacity,
-                                                  combined_overlay, overlay_opacity, 0)
-
-                    # Add text labels
-                    for mask_bool, color, name, obj_id in mask_data_list:
-                        if mask_bool.any():
-                            y_coords, x_coords = np.where(mask_bool)
-                            if len(y_coords) > 0:
-                                center_x = int(np.mean(x_coords))
-                                center_y = int(np.mean(y_coords))
-
-                                # Get contrasting text color
-                                luminance = 0.299 * color[0] + 0.587 * color[1] + 0.114 * color[2]
-                                text_color = (0, 0, 0) if luminance > 127 else (255, 255, 255)
-
-                                cv2.putText(overlay_frame, name, (center_x, center_y),
-                                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, text_color, 2)
-
-            out.write(overlay_frame)
-            processed_frames += 1
-
-            if processed_frames % 100 == 0:
-                print(f"   Processed {processed_frames}/{total_frames} frames...")
-
-        out.release()
-        if cap:
-            cap.release()
-
-        # Compress with FFmpeg
-        print("Compressing video with FFmpeg...")
-        success = compress_video_with_ffmpeg(video_output_path_temp, video_output_path_final, crf=23)
-
-        if success:
-            print(f"OK: Exported and compressed segmented video to {video_output_path_final}")
-        else:
-            print(f"OK: Exported segmented video to {video_output_path_final} (compression skipped)")
-
-        return True
+        try:
+            success = export_segmented_video(
+                frame_source=frame_source,
+                masks_dir=str(masks_dir),
+                get_mask_data=get_mask_data_from_ui,
+                output_path=str(output_path),
+                fps=fps,
+                overlay_opacity=overlay_opacity,
+                compress=True,
+                crf=23,
+            )
+            return success
+        finally:
+            frame_source.close()
 
     def export_masks(self):
         """Export masks with enhanced metadata including object names"""

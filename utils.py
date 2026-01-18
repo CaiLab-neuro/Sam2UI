@@ -1414,3 +1414,515 @@ def load_quality_metrics(output_dir: str) -> Tuple[Optional[List[float]], Option
     except Exception as e:
         print(f"WARNING: Failed to load quality metrics: {e}")
         return None, None
+
+
+# =============================================================================
+# Frame Source Abstractions for Video Export
+# =============================================================================
+
+from abc import ABC, abstractmethod
+from pathlib import Path
+
+
+class FrameSource(ABC):
+    """
+    Abstract base class for providing frames during video export.
+
+    Implementations can load frames from video files, extracted JPEG directories,
+    or a combination of both (hybrid approach).
+    """
+
+    @abstractmethod
+    def __len__(self) -> int:
+        """Return the total number of frames."""
+        pass
+
+    @abstractmethod
+    def get_frame(self, frame_idx: int) -> Optional[np.ndarray]:
+        """
+        Get a frame by index.
+
+        Args:
+            frame_idx: Frame index (0-based)
+
+        Returns:
+            Frame as numpy array (H, W, 3) in BGR format, or None if not available
+        """
+        pass
+
+    @abstractmethod
+    def get_dimensions(self) -> Tuple[int, int]:
+        """
+        Get frame dimensions.
+
+        Returns:
+            Tuple of (height, width)
+        """
+        pass
+
+    @abstractmethod
+    def close(self) -> None:
+        """Release any resources held by the frame source."""
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+        return False
+
+
+class VideoFileFrameSource(FrameSource):
+    """
+    Load frames directly from a video file.
+
+    This is the traditional approach - reads frames on demand from the video.
+    """
+
+    def __init__(self, video_path: str):
+        """
+        Initialize video file frame source.
+
+        Args:
+            video_path: Path to the video file
+        """
+        self._video_path = video_path
+        self._cap = cv2.VideoCapture(video_path)
+        if not self._cap.isOpened():
+            raise ValueError(f"Cannot open video file: {video_path}")
+
+        self._total_frames = int(self._cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        self._width = int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        self._height = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        self._last_read_idx = -1
+
+    def __len__(self) -> int:
+        return self._total_frames
+
+    def get_frame(self, frame_idx: int) -> Optional[np.ndarray]:
+        if frame_idx < 0 or frame_idx >= self._total_frames:
+            return None
+
+        # Seek if not sequential read
+        if frame_idx != self._last_read_idx + 1:
+            self._cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+
+        ret, frame = self._cap.read()
+        if ret:
+            self._last_read_idx = frame_idx
+            return frame
+        return None
+
+    def get_dimensions(self) -> Tuple[int, int]:
+        return (self._height, self._width)
+
+    def close(self) -> None:
+        if self._cap is not None:
+            self._cap.release()
+            self._cap = None
+
+
+class ExtractedFramesSource(FrameSource):
+    """
+    Load frames from a directory of extracted JPEG/PNG images.
+
+    This is faster than reading from video since JPEGs are already decoded
+    and don't require sequential seeking.
+    """
+
+    def __init__(self, frame_dir: str):
+        """
+        Initialize extracted frames source.
+
+        Args:
+            frame_dir: Directory containing extracted frame images
+        """
+        self._frame_dir = Path(frame_dir)
+        if not self._frame_dir.exists():
+            raise ValueError(f"Frame directory does not exist: {frame_dir}")
+
+        # Find all frame files (try both jpg and png)
+        self._frame_files = sorted(self._frame_dir.glob("*.jpg"))
+        if not self._frame_files:
+            self._frame_files = sorted(self._frame_dir.glob("*.png"))
+
+        if not self._frame_files:
+            raise ValueError(f"No frame images found in: {frame_dir}")
+
+        # Build frame index mapping (handle gaps in numbering)
+        self._frame_index: Dict[int, Path] = {}
+        for frame_path in self._frame_files:
+            # Extract frame number from filename (e.g., "00001.jpg" -> 1)
+            try:
+                frame_num = int(frame_path.stem)
+                self._frame_index[frame_num] = frame_path
+            except ValueError:
+                continue
+
+        # Determine dimensions from first frame
+        first_frame = cv2.imread(str(self._frame_files[0]))
+        if first_frame is None:
+            raise ValueError(f"Cannot read first frame: {self._frame_files[0]}")
+        self._height, self._width = first_frame.shape[:2]
+
+        # Total frames is the maximum index + 1
+        if self._frame_index:
+            self._total_frames = max(self._frame_index.keys()) + 1
+        else:
+            self._total_frames = len(self._frame_files)
+
+    def __len__(self) -> int:
+        return self._total_frames
+
+    def get_frame(self, frame_idx: int) -> Optional[np.ndarray]:
+        if frame_idx < 0 or frame_idx >= self._total_frames:
+            return None
+
+        frame_path = self._frame_index.get(frame_idx)
+        if frame_path is None:
+            return None
+
+        return cv2.imread(str(frame_path))
+
+    def get_dimensions(self) -> Tuple[int, int]:
+        return (self._height, self._width)
+
+    def has_frame(self, frame_idx: int) -> bool:
+        """Check if a specific frame is available."""
+        return frame_idx in self._frame_index
+
+    def get_available_frames(self) -> set:
+        """Get set of available frame indices."""
+        return set(self._frame_index.keys())
+
+    def close(self) -> None:
+        # No resources to release for file-based source
+        pass
+
+
+class HybridFrameSource(FrameSource):
+    """
+    Try extracted frames first, fall back to video file.
+
+    This is the most flexible option - uses fast JPEG loading when available,
+    but falls back to reading from the original video for missing frames.
+
+    Includes safety check to detect frame/video dimension mismatch.
+    """
+
+    def __init__(self, video_path: str, frame_dir: Optional[str] = None):
+        """
+        Initialize hybrid frame source.
+
+        Args:
+            video_path: Path to the original video file
+            frame_dir: Optional path to extracted frames directory
+        """
+        self._video_source = VideoFileFrameSource(video_path)
+        self._extracted_source: Optional[ExtractedFramesSource] = None
+        self._available_extracted: set = set()
+
+        if frame_dir and Path(frame_dir).exists():
+            try:
+                candidate_source = ExtractedFramesSource(frame_dir)
+
+                # SAFETY CHECK: Validate frame dimensions match video
+                video_h, video_w = self._video_source.get_dimensions()
+                frame_h, frame_w = candidate_source.get_dimensions()
+
+                if (frame_h, frame_w) != (video_h, video_w):
+                    print(f"WARNING: Frame cache dimensions ({frame_w}x{frame_h}) "
+                          f"don't match video ({video_w}x{video_h}). "
+                          f"Ignoring cached frames.")
+                else:
+                    self._extracted_source = candidate_source
+                    self._available_extracted = candidate_source.get_available_frames()
+                    print(f"  Using {len(self._available_extracted)} cached frames from: {frame_dir}")
+            except ValueError as e:
+                print(f"WARNING: Could not use extracted frames: {e}")
+
+    def __len__(self) -> int:
+        return len(self._video_source)
+
+    def get_frame(self, frame_idx: int) -> Optional[np.ndarray]:
+        # Try extracted frames first if available
+        if frame_idx in self._available_extracted and self._extracted_source:
+            frame = self._extracted_source.get_frame(frame_idx)
+            if frame is not None:
+                return frame
+
+        # Fall back to video file
+        return self._video_source.get_frame(frame_idx)
+
+    def get_dimensions(self) -> Tuple[int, int]:
+        return self._video_source.get_dimensions()
+
+    def uses_extracted_frames(self) -> bool:
+        """Check if any extracted frames are being used."""
+        return len(self._available_extracted) > 0
+
+    def close(self) -> None:
+        self._video_source.close()
+        if self._extracted_source:
+            self._extracted_source.close()
+
+
+# =============================================================================
+# Contrasting Text Color Utility
+# =============================================================================
+
+def get_contrasting_text_color(bg_color: Tuple[int, int, int]) -> Tuple[int, int, int]:
+    """
+    Calculate contrasting text color (white or black) based on background luminance.
+
+    Uses ITU-R BT.709 formula for relative luminance calculation.
+
+    Args:
+        bg_color: RGB color tuple (e.g., (255, 0, 0) for red)
+
+    Returns:
+        (R, G, B) tuple: (255, 255, 255) for white or (0, 0, 0) for black
+    """
+    if isinstance(bg_color, (list, tuple)) and len(bg_color) >= 3:
+        r, g, b = bg_color[0], bg_color[1], bg_color[2]
+    else:
+        r, g, b = 255, 255, 255  # Default white
+
+    # Calculate relative luminance (ITU-R BT.709)
+    luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+    # Return white for dark colors, black for bright colors
+    return (255, 255, 255) if luminance < 128 else (0, 0, 0)
+
+
+# =============================================================================
+# Video Export Functions
+# =============================================================================
+
+def export_segmented_video(
+    frame_source: FrameSource,
+    masks_dir: str,
+    get_mask_data: Callable[[int], List[Tuple[np.ndarray, Tuple[int, int, int], str, int]]],
+    output_path: str,
+    fps: float = 30.0,
+    overlay_opacity: float = 0.4,
+    compress: bool = True,
+    crf: int = 23,
+    progress_callback: Optional[Callable[[int, int], None]] = None
+) -> bool:
+    """
+    Export segmented video with mask overlays and text labels.
+
+    This is the core export function that handles the common logic for both
+    CLI and UI export workflows.
+
+    Args:
+        frame_source: FrameSource instance providing video frames
+        masks_dir: Directory containing mask PNG files
+        get_mask_data: Function that takes frame_idx and returns list of
+                       (mask_array, rgb_color, name, obj_id) tuples
+        output_path: Path for the output video file
+        fps: Frames per second for output video
+        overlay_opacity: Opacity for mask overlay (0.0 to 1.0)
+        compress: Whether to compress with FFmpeg after writing
+        crf: CRF value for FFmpeg compression (lower = better quality)
+        progress_callback: Optional callback(current_frame, total_frames) for progress
+
+    Returns:
+        True if export succeeded, False otherwise
+    """
+    print("Exporting segmented video...")
+
+    output_path = Path(output_path)
+    output_dir = output_path.parent
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    height, width = frame_source.get_dimensions()
+    total_frames = len(frame_source)
+
+    # Use temp file for compression workflow
+    if compress:
+        temp_path = output_path.parent / f"{output_path.stem}.temp.avi"
+    else:
+        temp_path = output_path.with_suffix(".avi")
+
+    # Initialize video writer with MJPEG codec
+    fourcc = cv2.VideoWriter_fourcc(*"MJPG")
+    out = cv2.VideoWriter(str(temp_path), fourcc, fps, (width, height))
+
+    if not out.isOpened():
+        print("ERROR: Could not initialize video writer")
+        return False
+
+    processed_frames = 0
+
+    try:
+        for frame_idx in range(total_frames):
+            frame = frame_source.get_frame(frame_idx)
+            if frame is None:
+                print(f"WARNING: Could not read frame {frame_idx}, skipping")
+                continue
+
+            # Ensure frame dimensions match expected
+            if frame.shape[:2] != (height, width):
+                frame = cv2.resize(frame, (width, height), interpolation=cv2.INTER_LINEAR)
+
+            overlay_frame = frame.copy()
+
+            # Get mask data for this frame
+            mask_data_list = get_mask_data(frame_idx)
+
+            if mask_data_list:
+                # Create overlay with averaged colors for overlapping regions
+                combined_overlay = np.zeros((height, width, 3), dtype=np.float32)
+                overlap_count = np.zeros((height, width), dtype=np.int32)
+
+                for mask_bool, color_rgb, name, obj_id in mask_data_list:
+                    # Resize mask if needed
+                    if mask_bool.shape != (height, width):
+                        from PIL import Image as PILImage
+                        mask_pil = PILImage.fromarray((mask_bool * 255).astype(np.uint8))
+                        mask_pil = mask_pil.resize((width, height), PILImage.BILINEAR)
+                        mask_bool = np.array(mask_pil) > 127
+
+                    # Convert RGB to BGR for OpenCV
+                    color_bgr = (color_rgb[2], color_rgb[1], color_rgb[0])
+                    combined_overlay[mask_bool] += color_bgr
+                    overlap_count[mask_bool] += 1
+
+                # Average colors where masks overlap
+                mask_pixels = overlap_count > 0
+                if mask_pixels.any():
+                    combined_overlay[mask_pixels] /= overlap_count[mask_pixels, np.newaxis]
+                    combined_overlay = combined_overlay.astype(np.uint8)
+
+                    # Single blend operation - fixes cumulative darkening bug
+                    overlay_frame = cv2.addWeighted(frame, 1 - overlay_opacity,
+                                                    combined_overlay, overlay_opacity, 0)
+
+                    # Add text labels with smart contrast
+                    for mask_bool, color_rgb, name, obj_id in mask_data_list:
+                        # Resize mask again for label calculation if needed
+                        if mask_bool.shape != (height, width):
+                            from PIL import Image as PILImage
+                            mask_pil = PILImage.fromarray((mask_bool * 255).astype(np.uint8))
+                            mask_pil = mask_pil.resize((width, height), PILImage.BILINEAR)
+                            mask_bool = np.array(mask_pil) > 127
+
+                        if mask_bool.any():
+                            y_coords, x_coords = np.where(mask_bool)
+                            if len(y_coords) > 0:
+                                center_x = int(np.mean(x_coords))
+                                center_y = int(np.mean(y_coords))
+
+                                # Calculate contrasting text color (ITU-R BT.709)
+                                text_color = get_contrasting_text_color(color_rgb)
+
+                                cv2.putText(overlay_frame, name, (center_x, center_y),
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, text_color, 2)
+
+            out.write(overlay_frame)
+            processed_frames += 1
+
+            if progress_callback:
+                progress_callback(processed_frames, total_frames)
+            elif processed_frames % 100 == 0:
+                print(f"   Processed {processed_frames}/{total_frames} frames...")
+
+    finally:
+        out.release()
+
+    # Compress with FFmpeg if requested
+    if compress:
+        print("Compressing video with FFmpeg...")
+        final_path = output_path.with_suffix(".avi")
+        success = compress_video_with_ffmpeg(str(temp_path), str(final_path), crf=crf)
+        if success:
+            print(f"OK: Exported and compressed segmented video to {final_path}")
+        else:
+            print(f"OK: Exported segmented video to {final_path} (compression skipped)")
+    else:
+        print(f"OK: Exported segmented video to {temp_path}")
+
+    return True
+
+
+def export_video_from_dict(
+    video_path: str,
+    masks_by_frame: Dict[int, Dict[int, Dict[str, Any]]],
+    object_names: Dict[int, str],
+    object_colors: Dict[int, Tuple[int, int, int]],
+    output_dir: str,
+    fps: float = 30.0,
+    overlay_opacity: float = 0.4,
+    compress: bool = True,
+    crf: int = 23,
+    frame_dir: Optional[str] = None,
+    progress_callback: Optional[Callable[[int, int], None]] = None
+) -> bool:
+    """
+    Export segmented video from masks_by_frame dictionary (CLI usage).
+
+    This is a convenience wrapper around export_segmented_video() for use
+    with process_annotations.py workflow.
+
+    Args:
+        video_path: Path to the original video file
+        masks_by_frame: Dict mapping frame_idx -> {obj_id -> mask_metadata}
+        object_names: Dict mapping object_id -> name string
+        object_colors: Dict mapping object_id -> (R, G, B) tuple
+        output_dir: Directory for output files
+        fps: Frames per second for output video
+        overlay_opacity: Opacity for mask overlay (0.0 to 1.0)
+        compress: Whether to compress with FFmpeg
+        crf: CRF value for FFmpeg compression
+        frame_dir: Optional path to extracted frames directory (for reuse)
+        progress_callback: Optional progress callback
+
+    Returns:
+        True if export succeeded, False otherwise
+    """
+    masks_dir = Path(output_dir) / "masks"
+    output_path = Path(output_dir) / "segmented_video.avi"
+
+    # Create frame source - use hybrid if frame_dir provided
+    frame_source = HybridFrameSource(video_path, frame_dir)
+
+    def get_mask_data_from_dict(frame_idx: int) -> List[Tuple[np.ndarray, Tuple[int, int, int], str, int]]:
+        """Load mask data from masks_by_frame dictionary."""
+        result = []
+        if frame_idx not in masks_by_frame:
+            return result
+
+        for obj_id, mask_data in masks_by_frame[frame_idx].items():
+            # Load mask from disk
+            mask_path = masks_dir / mask_data['filename']
+            mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+            if mask is None:
+                print(f"WARNING: Could not load mask: {mask_path}")
+                continue
+
+            mask_bool = (mask > 0).astype(bool)
+            color = object_colors.get(obj_id, (255, 0, 0))  # Default red
+            name = object_names.get(obj_id, f"Object_{obj_id}")
+
+            result.append((mask_bool, color, name, obj_id))
+
+        return result
+
+    try:
+        success = export_segmented_video(
+            frame_source=frame_source,
+            masks_dir=str(masks_dir),
+            get_mask_data=get_mask_data_from_dict,
+            output_path=str(output_path),
+            fps=fps,
+            overlay_opacity=overlay_opacity,
+            compress=compress,
+            crf=crf,
+            progress_callback=progress_callback
+        )
+        return success
+    finally:
+        frame_source.close()

@@ -49,6 +49,7 @@ from utils import (
     should_disable_cuda_for_device,
     patch_sam3_modules_for_device,
     compress_video_with_ffmpeg,
+    export_video_from_dict,
 )
 
 # Import shared segmentation module
@@ -216,7 +217,7 @@ class ConsoleProgressCallback:
 
 
 class SAM2Processor:
-    def __init__(self, config_file=None, checkpoint_file=None, model_name="sam2.1-base+", offload_to_cpu=False, async_loading=False, smooth_masks=False, use_bfloat16=False, device=None):
+    def __init__(self, config_file=None, checkpoint_file=None, model_name="sam2.1-base+", offload_to_cpu=False, async_loading=False, smooth_masks=False, use_bfloat16=False, device=None, frame_format="jpg"):
         """
         Initialize SAM2 Processor
 
@@ -229,6 +230,7 @@ class SAM2Processor:
             smooth_masks: Apply morphological smoothing to reduce pixelation in masks
             use_bfloat16: Use BFloat16 precision for faster inference (requires compatible GPU)
             device: Device to use (e.g., 'cpu', 'cuda', 'cuda:0', 'cuda:1'). If None, auto-detect.
+            frame_format: Format for extracted frames ("jpg" or "png")
         """
         # Store model name for detection
         self.model_name = model_name
@@ -280,6 +282,7 @@ class SAM2Processor:
         self.use_bfloat16 = use_bfloat16
         self.no_backward_propagation = False  # Will be set from command line args
         self.requested_device = device  # User-requested device (None = auto-detect)
+        self.frame_format = frame_format  # Format for extracted frames
 
     @property
     def use_sam3(self):
@@ -560,21 +563,23 @@ class SAM2Processor:
             temp_dir.mkdir(parents=True, exist_ok=True)
             is_persistent = True
 
-            # Check if frames already exist
+            # Check if frames already exist (support both jpg and png formats)
             existing_frames = sorted(temp_dir.glob("*.jpg"))
+            if not existing_frames:
+                existing_frames = sorted(temp_dir.glob("*.png"))
             if existing_frames:
                 print(f"  Reusing existing frames from: {temp_dir}")
                 print(f"  Found {len(existing_frames)} frames")
                 skip_extraction = True
             else:
-                print(f"  Extracting frames to persistent directory: {temp_dir}")
+                print(f"  Extracting frames to persistent directory: {temp_dir} (format: {self.frame_format})")
                 skip_extraction = False
         else:
             # Use temporary directory (will be deleted after processing)
             temp_dir = Path(tempfile.mkdtemp(prefix='sam2_frames_'))
             is_persistent = False
             skip_extraction = False
-            print(f"  Extracting frames to temporary directory: {temp_dir}")
+            print(f"  Extracting frames to temporary directory: {temp_dir} (format: {self.frame_format})")
 
         try:
             # Extract frames if needed
@@ -588,8 +593,13 @@ class SAM2Processor:
                     ret, frame = cap.read()
                     if not ret:
                         break
-                    frame_path = temp_dir / f"{save_idx:05d}.jpg"
-                    cv2.imwrite(str(frame_path), frame)
+                    frame_path = temp_dir / f"{save_idx:05d}.{self.frame_format}"
+                    if self.frame_format == "png":
+                        # Use fast PNG compression (level 1 is fast, level 9 is slow but smaller)
+                        cv2.imwrite(str(frame_path), frame, [cv2.IMWRITE_PNG_COMPRESSION, 1])
+                    else:
+                        # Default JPEG quality
+                        cv2.imwrite(str(frame_path), frame)
                     save_idx += 1
 
                     if save_idx % 500 == 0:
@@ -601,7 +611,14 @@ class SAM2Processor:
                 print(f"  Skipping frame extraction (using existing frames)")
 
             # Get frame dimensions (needed for SAM3 coordinate conversion and quality metrics)
-            first_frame_path = sorted(temp_dir.glob("*.jpg"))[0]
+            # Support both jpg and png formats
+            frame_files = sorted(temp_dir.glob("*.jpg"))
+            if not frame_files:
+                frame_files = sorted(temp_dir.glob("*.png"))
+            if not frame_files:
+                raise ValueError(f"No frame files found in: {temp_dir}")
+
+            first_frame_path = frame_files[0]
             first_frame = cv2.imread(str(first_frame_path))
             if first_frame is None:
                 raise ValueError(f"Cannot read first frame: {first_frame_path}")
@@ -969,18 +986,18 @@ class SAM2Processor:
             save_quality_metrics(str(output_dir), inter_frame_changes, background_ratios)
 
             print(f"\nOK: Generated masks for {len(masks_metadata)} frames")
-            return masks_metadata, object_names, object_colors, num_frames
+            # Return frame_dir to allow reuse during export, defer cleanup to caller
+            return masks_metadata, object_names, object_colors, num_frames, str(temp_dir), is_persistent
 
-        finally:
-            # Clean up temporary directory (only if not persistent)
+        except Exception:
+            # Clean up on error only
             if not is_persistent:
                 try:
                     shutil.rmtree(temp_dir)
-                    print(f"Cleaned up temporary frames: {temp_dir}")
-                except Exception as e:
-                    print(f"WARNING: Could not clean up temp directory: {e}")
-            else:
-                print(f"Keeping frames in persistent directory: {temp_dir}")
+                    print(f"Cleaned up temporary frames after error: {temp_dir}")
+                except Exception as cleanup_error:
+                    print(f"WARNING: Could not clean up temp directory: {cleanup_error}")
+            raise
     
     def export_masks(self, masks_by_frame, video_path, object_names, output_dir):
         """Verify mask images (already exported during propagation)"""
@@ -1213,6 +1230,25 @@ class SAM2Processor:
         print(f"OK: Exported metadata to {metadata_path}")
         return True
 
+    @staticmethod
+    def cleanup_frame_dir(frame_dir: str, is_persistent: bool) -> None:
+        """
+        Clean up the frame directory after video export.
+
+        Args:
+            frame_dir: Path to the frame directory
+            is_persistent: If True, keep the directory; if False, delete it
+        """
+        if is_persistent:
+            print(f"Keeping frames in persistent directory: {frame_dir}")
+        else:
+            try:
+                shutil.rmtree(frame_dir)
+                print(f"Cleaned up temporary frames: {frame_dir}")
+            except Exception as e:
+                print(f"WARNING: Could not clean up temp directory: {e}")
+
+
 def main():
     """Main processing function"""
     parser = argparse.ArgumentParser(
@@ -1271,6 +1307,8 @@ Examples:
                        help="Persistent directory for video frames (default: auto-generated in /tmp). If specified, frames will be reused from previous runs and not deleted after processing.")
     parser.add_argument("--frame-cache-size", type=int, default=20,
                        help="Number of frames to keep in memory cache (default: 20, ~2GB). Minimum: 10, Recommended: 20-50.")
+    parser.add_argument("--frame-format", type=str, default="jpg", choices=["jpg", "png"],
+                       help="Format for extracted frames (default: jpg). Use 'png' for lossless quality at the cost of larger files.")
     parser.add_argument("--no-backward", action="store_true", dest="no_backward",
                        help="Disable backward propagation (not recommended, may result in lower quality segmentation for frames before first annotation)")
     parser.add_argument("--device", type=str, default=None,
@@ -1365,11 +1403,12 @@ Examples:
             processor = SAM2Processor(config_file=args.config, checkpoint_file=args.checkpoint,
                                      offload_to_cpu=args.offload_to_cpu, async_loading=args.async_loading,
                                      smooth_masks=args.smooth_masks, use_bfloat16=args.use_bfloat16,
-                                     device=args.device)
+                                     device=args.device, frame_format=args.frame_format)
         else:
             processor = SAM2Processor(model_name=args.model, offload_to_cpu=args.offload_to_cpu,
                                      async_loading=args.async_loading, smooth_masks=args.smooth_masks,
-                                     use_bfloat16=args.use_bfloat16, device=args.device)
+                                     use_bfloat16=args.use_bfloat16, device=args.device,
+                                     frame_format=args.frame_format)
 
         # Set no_backward flag
         processor.no_backward_propagation = args.no_backward
@@ -1396,11 +1435,15 @@ Examples:
     if args.fps == 30.0 and fps:
         args.fps = fps
     
+    frame_dir_used = None
+    is_persistent = False
+
     try:
         # Process segmentation
-        masks_by_frame, object_names, object_colors, num_frames = processor.process_segmentation(
+        result = processor.process_segmentation(
             args.video_file, annotations_data, output_dir, frame_dir=args.frame_dir
         )
+        masks_by_frame, object_names, object_colors, num_frames, frame_dir_used, is_persistent = result
 
         if masks_by_frame is None:
             print("ERROR: No masks generated")
@@ -1410,8 +1453,21 @@ Examples:
 
         # Export results
         processor.export_masks(masks_by_frame, args.video_file, object_names, output_dir)
-        processor.export_video(masks_by_frame, args.video_file, object_names, object_colors,
-                             output_dir, args.fps, args.opacity)
+
+        # Use shared export function from utils - reuses extracted frames for efficiency
+        export_video_from_dict(
+            video_path=args.video_file,
+            masks_by_frame=masks_by_frame,
+            object_names=object_names,
+            object_colors=object_colors,
+            output_dir=str(output_dir),
+            fps=args.fps,
+            overlay_opacity=args.opacity,
+            compress=True,
+            crf=23,
+            frame_dir=frame_dir_used,  # Reuse extracted frames
+        )
+
         processor.export_metadata(annotations_data, masks_by_frame, output_dir, num_frames,
                                 video_path=args.video_file)
 
@@ -1434,6 +1490,11 @@ Examples:
         import traceback
         traceback.print_exc()
         return 1
+
+    finally:
+        # Clean up frame directory after export
+        if frame_dir_used:
+            SAM2Processor.cleanup_frame_dir(frame_dir_used, is_persistent)
 
 if __name__ == "__main__":
     try:
