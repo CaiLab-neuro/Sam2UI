@@ -27,20 +27,79 @@ def check_python():
     """Check Python version"""
     print("Checking Python version...")
     version = sys.version_info
-    if version.major < 3 or (version.major == 3 and version.minor < 10):
-        print(f"ERROR: Python {version.major}.{version.minor} detected.")
-        print("   SAM2 requires Python 3.10 or higher.")
-        return False
+
+    # Handle Python 2
+    if version.major == 2:
+        if version.minor < 7:
+            print(f"ERROR: Python {version.major}.{version.minor} detected.")
+            print("   Python 2.6 and below are not supported.")
+            print("   Please upgrade to Python 3.12 or higher.")
+            return False
+        else:
+            # Python 2.7
+            print(f"WARNING: Python {version.major}.{version.minor} (legacy) detected.")
+            print("   Python 2.7 is end-of-life and not recommended.")
+            print("   SAM2/SAM3 require Python 3.10 or higher.")
+            choice = input("\nContinue with Python 2.7? (y/n) [default: n]: ").strip().lower()
+            if choice != 'y':
+                print("Please install Python 3.12 or higher and re-run setup.")
+                return False
+
+    # Handle Python 3
+    elif version.major == 3:
+        if version.minor < 10:
+            print(f"ERROR: Python {version.major}.{version.minor} detected.")
+            print("   SAM2 requires Python 3.10 or higher.")
+            print("   Recommended: Python 3.12 or higher for full feature support.")
+            return False
+        elif version.minor < 12:
+            # Python 3.10 or 3.11
+            print(f"WARNING: Python {version.major}.{version.minor} detected.")
+            print("   SAM2 will work, but SAM3 (text-based prompting) requires Python 3.12+")
+            choice = input("\nContinue with Python 3.{}? (y/n) [default: y]: ".format(version.minor)).strip().lower()
+            if choice and choice != 'y':
+                return False
+
     print(f"OK: Python {version.major}.{version.minor}.{version.micro}")
+    if version.major == 3 and version.minor >= 12:
+        print("   Full feature support (SAM2 + SAM3)")
+
     return True
 
 def install_packages():
     """Install required packages"""
     print("\nInstalling Python packages...")
 
+    # Detect CUDA availability and version
+    cuda_available = False
+    cuda_version = "cpu"
+    print("\nDetecting CUDA...")
+    try:
+        result = subprocess.run(["nvidia-smi"], capture_output=True, text=True, timeout=5)
+        if result.returncode == 0:
+            print("NVIDIA GPU detected")
+            # Try to detect CUDA version from nvidia-smi output
+            for line in result.stdout.split('\n'):
+                if 'CUDA Version' in line:
+                    cuda_str = line.split(':')[-1].strip().split()[0]
+                    cuda_major, cuda_minor = cuda_str.split('.')[:2]
+                    cuda_version = f"cu{cuda_major}{cuda_minor}"
+                    cuda_available = True
+                    print(f"Detected CUDA {cuda_str} -> {cuda_version}")
+                    break
+    except Exception as e:
+        pass
+
+    if not cuda_available:
+        print("WARNING: CUDA not detected. Installing CPU-only PyTorch.")
+        print("For GPU acceleration:")
+        print("  1. Install CUDA from: https://developer.nvidia.com/cuda-downloads")
+        print("  2. Re-run setup.py to install CUDA-compatible PyTorch")
+    else:
+        print(f"Installing CUDA-compatible PyTorch ({cuda_version})")
+
     # Base packages for Sam2UI (compatible with SAM2 requirements)
     packages = [
-        "torch>=2.5.1",
         "torchvision>=0.20.1",
         "opencv-python>=4.5.0",
         "numpy>=1.24.4",
@@ -54,17 +113,39 @@ def install_packages():
         "pycocotools>=2.0.2"
     ]
 
-    
+    # Install PyTorch first with appropriate index URL
+    print("\nInstalling PyTorch and torchvision...")
+    try:
+        if cuda_available:
+            # Install CUDA-compatible PyTorch
+            index_url = f"https://download.pytorch.org/whl/{cuda_version}"
+            print(f"Using PyTorch index: {index_url}")
+            subprocess.run([
+                sys.executable, "-m", "pip", "install",
+                "torch>=2.5.1", "torchvision>=0.20.1", "torchaudio",
+                "--index-url", index_url
+            ], check=True, capture_output=True)
+        else:
+            # Install CPU-only PyTorch
+            subprocess.run([
+                sys.executable, "-m", "pip", "install",
+                "torch>=2.5.1", "torchvision>=0.20.1", "torchaudio"
+            ], check=True, capture_output=True)
+        print("OK: PyTorch installed")
+    except subprocess.CalledProcessError as e:
+        print("FAILED: PyTorch installation failed")
+        return False
+
     for package in packages:
         print(f"Installing {package}...")
         try:
-            subprocess.run([sys.executable, "-m", "pip", "install", package], 
+            subprocess.run([sys.executable, "-m", "pip", "install", package],
                           check=True, capture_output=True)
             print(f"OK: {package}")
         except subprocess.CalledProcessError:
             print(f"FAILED: {package}")
             return False
-    
+
     return True
 
 def create_directories():
