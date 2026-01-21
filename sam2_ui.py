@@ -287,6 +287,12 @@ class SAM2VideoUI:
         self.quality_viz_range_end = 0      # End frame of rendered range
         self.quality_viz_zoom_level = 1     # Zoom level when last rendered
 
+        # Refine segmentation controls
+        self.refine_frame_start_var = tk.StringVar(value="")
+        self.refine_frame_end_var = tk.StringVar(value="")
+        self.refine_regenerate_video_var = tk.BooleanVar(value=True)
+        self.refine_button = None
+
         # Initialize default colors and names
         self._initialize_objects()
         
@@ -451,17 +457,15 @@ class SAM2VideoUI:
         list_frame.pack(fill=tk.BOTH, expand=True, pady=5)
 
         # Create Treeview for object list
-        self.object_tree = ttk.Treeview(list_frame, columns=("name", "points", "masks"),
+        self.object_tree = ttk.Treeview(list_frame, columns=("name", "points"),
                                        show="tree headings", height=8)
         self.object_tree.heading("#0", text="ID")
         self.object_tree.heading("name", text="Name")
         self.object_tree.heading("points", text="Points")
-        self.object_tree.heading("masks", text="Masks")
 
         self.object_tree.column("#0", width=40)
-        self.object_tree.column("name", width=100)
+        self.object_tree.column("name", width=120)
         self.object_tree.column("points", width=60)
-        self.object_tree.column("masks", width=60)
 
         # Scrollbar for object list
         tree_scroll = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.object_tree.yview)
@@ -579,6 +583,38 @@ class SAM2VideoUI:
 
         ttk.Button(seg_frame, text="Import Segmentation",
                   command=self.import_masks, width=15).pack(fill=tk.X, pady=2)
+
+        # Refine Segmentation controls
+        refine_frame = ttk.LabelFrame(seg_frame, text="Refine Segmentation", padding=5)
+        refine_frame.pack(fill=tk.X, pady=(10, 5))
+
+        # Frame range inputs
+        range_frame = ttk.Frame(refine_frame)
+        range_frame.pack(fill=tk.X, pady=2)
+
+        ttk.Label(range_frame, text="Start:", width=5).pack(side=tk.LEFT)
+        refine_start_entry = ttk.Entry(range_frame, textvariable=self.refine_frame_start_var, width=8)
+        refine_start_entry.pack(side=tk.LEFT, padx=(0, 10))
+        refine_start_entry.bind('<KeyRelease>', lambda e: self._update_refine_button_state())
+
+        ttk.Label(range_frame, text="End:", width=4).pack(side=tk.LEFT)
+        refine_end_entry = ttk.Entry(range_frame, textvariable=self.refine_frame_end_var, width=8)
+        refine_end_entry.pack(side=tk.LEFT)
+        refine_end_entry.bind('<KeyRelease>', lambda e: self._update_refine_button_state())
+
+        # Help text
+        ttk.Label(refine_frame, text="(1-indexed, inclusive)",
+                 foreground='gray', font=('Arial', 8, 'italic')).pack(anchor=tk.W)
+
+        # Regenerate video checkbox
+        ttk.Checkbutton(refine_frame, text="Regenerate video",
+                       variable=self.refine_regenerate_video_var).pack(anchor=tk.W, pady=(2, 0))
+
+        # Refine button (initially disabled)
+        self.refine_button = ttk.Button(refine_frame, text="Refine Range",
+                                        command=self.refine_segmentation, width=12)
+        self.refine_button.pack(fill=tk.X, pady=(5, 0))
+        self.refine_button.configure(state='disabled')
 
         # Optional export controls (exports happen automatically during segmentation)
         ttk.Label(seg_frame, text="(Optional - exports happen automatically during segmentation)",
@@ -801,33 +837,31 @@ class SAM2VideoUI:
         for item in self.object_tree.get_children():
             self.object_tree.delete(item)
         
-        # Add objects that have been used
+        # Add objects that should be shown
         used_objects = set()
-        
+
+        # Pattern for generic object names (e.g., "Object 1", "Object 99")
+        generic_pattern = re.compile(r'^Object_\d+$')
+
         # Find objects with points
         for _, _, _, obj_id, _ in self.click_points:
             used_objects.add(obj_id)
-        
-        # Find objects with masks
-        for frame_masks in self.masks.values():
-            used_objects.update(frame_masks.keys())
-        
+
+        # Find objects with non-generic names
+        for obj_id, name in self.object_names.items():
+            if not generic_pattern.match(name):
+                used_objects.add(obj_id)
+
         # Always show current object
         used_objects.add(self.current_object_id)
-        
+
         for obj_id in sorted(used_objects):
             # Count points for this object
             point_count = sum(1 for _, _, _, oid, _ in self.click_points if oid == obj_id)
-            
-            # Count masks for this object
-            mask_count = sum(1 for frame_masks in self.masks.values() if obj_id in frame_masks)
-            
-            # Get color for display
-            color_hex = self._rgb_to_hex(self.object_colors[obj_id])
-            
+
             # Insert into tree
             item = self.object_tree.insert("", "end", text=str(obj_id),
-                                          values=(self.object_names[obj_id], point_count, mask_count))
+                                          values=(self.object_names[obj_id], point_count))
             
             # Highlight current object
             if obj_id == self.current_object_id:
@@ -1186,15 +1220,15 @@ class SAM2VideoUI:
                 return
             self.mask_export_dir = masks_dir
 
-            # Populate self.masks with placeholders from metadata
-            # This enables flash functionality and mask lookup
-            mask_metadata = metadata.get('masks', [])
-            for item in mask_metadata:
-                frame_idx = item.get('frame_idx')
-                obj_id = item.get('obj_id')
-                if frame_idx is not None and obj_id is not None:
-                    if frame_idx not in self.masks:
-                        self.masks[frame_idx] = {}
+            # Reconstruct self.masks from processing_info (all objects have masks for all frames)
+            # This enables flash functionality, mask lookup, and Refine Range button
+            processing_info = metadata.get('processing_info', {})
+            total_frames = processing_info.get('total_frames_processed', len(self.frames))
+            object_ids = processing_info.get('objects_detected', [])
+
+            for frame_idx in range(total_frames):
+                self.masks[frame_idx] = {}
+                for obj_id in object_ids:
                     # Store placeholder - actual mask loaded from disk on demand
                     self.masks[frame_idx][obj_id] = None
 
@@ -1230,6 +1264,9 @@ class SAM2VideoUI:
 
             # Enable Flash Mask button now that segmentation is loaded
             self._enable_flash_mask_button()
+
+            # Enable Refine button if model is loaded
+            self._update_refine_button_state()
 
             messagebox.showinfo("Success",
                               f"Loaded segmentation results successfully!\n\n"
@@ -1663,9 +1700,12 @@ class SAM2VideoUI:
             self.status_label.config(text=f"Video loaded using {successful_backend} backend")
 
             self.frames = []
-            self.masks = {}
+            # Only clear masks and click_points when loading a fresh video
+            # When loading a segmented video (via import_masks), masks and click_points are already populated
+            if not self.segmented_video_displayed:
+                self.masks = {}
+                self.click_points = []
             self.mask_cache = {}  # Clear mask cache to prevent stale data from previous video
-            self.click_points = []
 
             # Only reset these flags and clear original video path when loading a fresh video
             # When loading a segmented video (via import_masks), these are already set correctly before calling load_video_frames()
@@ -3985,6 +4025,9 @@ class SAM2VideoUI:
                         print(f"[WARNING] Failed to export results: {e}")
                         traceback.print_exc()
 
+                    # Enable Refine button now that segmentation is complete
+                    self._update_refine_button_state()
+
                     messagebox.showinfo("Success",
                                       f"Segmentation completed!\n"
                                       f"Objects: {len(unique_objects)}\n"
@@ -4029,6 +4072,676 @@ class SAM2VideoUI:
             return False, f"Found {len(invalid_points)} annotations with invalid frame indices"
 
         return True, "All annotations valid"
+
+    def _update_refine_button_state(self):
+        """Enable/disable the Refine button based on current state."""
+        if not self.refine_button:
+            return
+
+        # Requirements for refinement:
+        # 1. Have masks loaded (either from segmentation or import)
+        # 2. Have a video loaded
+        # 3. Have a model loaded
+        can_refine = (
+            self.masks and
+            self.frames and
+            self.model_loaded and
+            self.sam2_model is not None
+        )
+
+        if can_refine:
+            self.refine_button.configure(state='normal')
+        else:
+            self.refine_button.configure(state='disabled')
+
+    def _validate_refine_inputs(self):
+        """
+        Validate frame range inputs for refinement.
+
+        User inputs are 1-indexed (matching the UI display).
+        Returns 0-indexed values for internal use.
+
+        Returns:
+            (is_valid, start_frame_0indexed, end_frame_0indexed, error_message)
+        """
+        start_str = self.refine_frame_start_var.get().strip()
+        end_str = self.refine_frame_end_var.get().strip()
+
+        # Check if both fields are provided
+        if not start_str or not end_str:
+            return False, None, None, "Please enter both start and end frame numbers."
+
+        # Parse integers (user provides 1-indexed values)
+        try:
+            start_1based = int(start_str)
+            end_1based = int(end_str)
+        except ValueError:
+            return False, None, None, "Frame numbers must be valid integers."
+
+        total_frames = len(self.frames)
+
+        # Validate range bounds (in 1-based terms for user-friendly messages)
+        if start_1based < 1:
+            return False, None, None, f"Start frame must be at least 1 (got {start_1based})."
+        if end_1based > total_frames:
+            return False, None, None, f"End frame {end_1based} exceeds video length ({total_frames} frames)."
+        if start_1based > end_1based:
+            return False, None, None, f"Start frame ({start_1based}) must be <= end frame ({end_1based})."
+
+        # Convert to 0-indexed for internal use
+        start = start_1based - 1
+        end = end_1based - 1
+
+        # Warning for selecting entire video
+        if start == 0 and end == total_frames - 1:
+            return False, None, None, "You've selected the entire video. Use 'Segment Video' instead."
+
+        return True, start, end, None
+
+    def _prepare_annotations_for_range(self, start_frame, end_frame):
+        """
+        Filter and adjust annotations for the specified frame range.
+
+        Args:
+            start_frame: Start of range (inclusive, 0-indexed)
+            end_frame: End of range (inclusive, 0-indexed)
+
+        Returns:
+            List of PointAnnotation objects with adjusted frame indices
+        """
+        from segment import PointAnnotation
+
+        annotations = []
+        for x, y, is_positive, obj_id, frame_idx in self.click_points:
+            if start_frame <= frame_idx <= end_frame:
+                # Adjust frame index: relative to extracted range (SAM expects 0-based)
+                adjusted_frame_idx = frame_idx - start_frame
+                annotations.append(PointAnnotation(
+                    x=x,
+                    y=y,
+                    is_positive=is_positive,
+                    object_id=obj_id,
+                    frame_idx=adjusted_frame_idx
+                ))
+
+        return annotations
+
+    def refine_segmentation(self):
+        """
+        Main entry point for refining segmentation in a specific frame range.
+        Re-segments only the specified range and updates masks.
+        """
+        # Basic checks
+        if not self.frames:
+            messagebox.showwarning("Warning", "Please load a video first.")
+            return
+
+        if not self.model_loaded or not self.sam2_model:
+            messagebox.showwarning("Warning", "Please load a SAM model first.")
+            return
+
+        if not self.masks:
+            messagebox.showwarning("Warning", "No existing segmentation found. Use 'Segment Video' first.")
+            return
+
+        # Validate inputs
+        is_valid, start_frame, end_frame, error_msg = self._validate_refine_inputs()
+        if not is_valid:
+            messagebox.showwarning("Invalid Range", error_msg)
+            return
+
+        # Check for annotations in the range
+        annotations_in_range = self._prepare_annotations_for_range(start_frame, end_frame)
+        if not annotations_in_range:
+            messagebox.showwarning("No Annotations",
+                                  f"No annotation points found in frames {start_frame + 1}-{end_frame + 1}.\n\n"
+                                  f"Add annotation points in this range before refining.")
+            return
+
+        # Get output directory (use existing results dir if available)
+        if self.results_output_dir and os.path.exists(self.results_output_dir):
+            output_dir = self.results_output_dir
+        else:
+            output_dir = filedialog.askdirectory(
+                title="Select Output Directory for Refined Results",
+                initialdir=os.path.dirname(self.last_export_dir) if self.last_export_dir else os.path.expanduser("~")
+            )
+            if not output_dir:
+                return
+
+        # Confirmation dialog
+        regenerate_video = self.refine_regenerate_video_var.get()
+        num_frames = end_frame - start_frame + 1
+        num_annotations = len(annotations_in_range)
+
+        confirm_msg = (
+            f"Refine Segmentation\n\n"
+            f"Frame range: {start_frame + 1} to {end_frame + 1} ({num_frames} frames)\n"
+            f"Annotations in range: {num_annotations}\n"
+            f"Output directory: {output_dir}\n"
+            f"Regenerate video: {'Yes' if regenerate_video else 'No'}\n\n"
+            f"This will overwrite existing masks in this range.\n"
+            f"Continue?"
+        )
+
+        if not messagebox.askyesno("Confirm Refinement", confirm_msg):
+            return
+
+        # Run the refinement
+        self._run_range_segmentation(start_frame, end_frame, annotations_in_range, output_dir, regenerate_video)
+
+    def _run_range_segmentation(self, start_frame, end_frame, annotations, output_dir, regenerate_video):
+        """
+        Execute VideoSegmenter for a specific frame range.
+
+        Args:
+            start_frame: Start frame index (0-indexed, inclusive)
+            end_frame: End frame index (0-indexed, inclusive)
+            annotations: List of PointAnnotation with adjusted frame indices (0-based within range)
+            output_dir: Directory to save results
+            regenerate_video: Whether to regenerate the video after refinement
+        """
+        import tempfile
+        import traceback
+        from segment import VideoSegmenter, SegmentationConfig
+
+        try:
+            self.status_label.config(text="Preparing for range segmentation...")
+            self.progress_bar.pack(fill=tk.X, pady=(5, 0))
+            self.progress_var.set(0)
+            self.root.update()
+
+            # Get original video path (not the segmented video being displayed)
+            original_video = self._get_original_video_for_resegmentation()
+            if not original_video:
+                self.progress_bar.pack_forget()
+                return
+
+            # Validate original video exists
+            if not os.path.exists(original_video):
+                messagebox.showerror("Error", f"Original video not found: {original_video}")
+                self.progress_bar.pack_forget()
+                return
+
+            # Create dedicated temp directory for refinement (separate from session cache)
+            refine_temp_dir = tempfile.mkdtemp(prefix='sam2_refine_')
+            masks_dir = os.path.join(output_dir, "masks")
+
+            # Progress callback for UI updates
+            class UIProgressCallback:
+                def __init__(self, ui):
+                    self.ui = ui
+                    self.current_phase = ""
+                    self.total_steps = 0
+
+                def on_progress(self, phase, current, total, message):
+                    if total > 0:
+                        progress = (current / total) * 100
+                        self.ui.progress_var.set(progress)
+                    self.ui.status_label.config(text=message)
+                    self.ui.root.update()
+
+                def on_phase_start(self, phase, total_steps):
+                    self.current_phase = phase
+                    self.total_steps = total_steps
+                    self.ui.status_label.config(text=f"Starting {phase}...")
+                    self.ui.root.update()
+
+                def on_phase_complete(self, phase):
+                    self.ui.status_label.config(text=f"Completed {phase}")
+                    self.ui.root.update()
+
+            try:
+                # Create VideoSegmenter with the existing predictor
+                segmenter = VideoSegmenter(
+                    predictor=self.sam2_model.predictor,
+                    device=self._get_selected_device(),
+                    use_bfloat16=self.use_bfloat16
+                )
+                segmenter.set_progress_callback(UIProgressCallback(self))
+
+                # Configure segmentation for the range
+                # frame_range is (start, end) where end is exclusive
+                # frame_offset ensures output mask files use global frame indices
+                config = SegmentationConfig(
+                    output_dir=output_dir,
+                    frame_dir=refine_temp_dir,
+                    frame_range=(start_frame, end_frame + 1),  # end is exclusive
+                    frame_offset=start_frame,  # Output files use global indices
+                    enable_backward_propagation=True,
+                    frames_to_keep=20,
+                    calculate_quality_metrics=False,  # We'll update metrics separately
+                    cleanup_temp_frames=True
+                )
+
+                self.status_label.config(text="Running range segmentation...")
+                self.root.update()
+
+                # Run segmentation
+                result = segmenter.segment(
+                    video_path=original_video,
+                    annotations=annotations,
+                    object_names=self.object_names,
+                    object_colors=self.object_colors,
+                    config=config
+                )
+
+                # Update self.masks for the refined range
+                self.status_label.config(text="Updating masks...")
+                self.root.update()
+
+                for frame_idx, obj_masks in result.masks_metadata.items():
+                    # frame_idx from result should already be global (due to frame_offset)
+                    if frame_idx not in self.masks:
+                        self.masks[frame_idx] = {}
+                    for obj_id, mask_meta in obj_masks.items():
+                        self.masks[frame_idx][obj_id] = mask_meta
+
+                # Update quality metrics for the range (plus boundary frames)
+                self._update_quality_metrics_for_range(start_frame, end_frame, masks_dir)
+
+                # Regenerate video if requested
+                if regenerate_video:
+                    self.status_label.config(text="Regenerating video...")
+                    self.root.update()
+                    self._regenerate_video_with_stitching(start_frame, end_frame, output_dir, masks_dir, original_video)
+
+                # Clear mask cache for affected frames (force reload from disk)
+                for frame_idx in range(start_frame, end_frame + 1):
+                    keys_to_remove = [k for k in self.mask_cache if k[0] == frame_idx]
+                    for key in keys_to_remove:
+                        del self.mask_cache[key]
+
+                # Refresh display
+                self.display_current_frame()
+
+                self.progress_bar.pack_forget()
+                self.status_label.config(text=f"Refined frames {start_frame}-{end_frame}")
+
+                messagebox.showinfo("Refinement Complete",
+                                   f"Successfully refined frames {start_frame} to {end_frame}.\n\n"
+                                   f"Masks updated: {end_frame - start_frame + 1} frames\n"
+                                   f"Video regenerated: {'Yes' if regenerate_video else 'No'}")
+
+            except Exception as e:
+                self.progress_bar.pack_forget()
+                self.status_label.config(text="Refinement failed")
+                traceback.print_exc()
+                messagebox.showerror("Refinement Error", f"Failed to refine segmentation: {str(e)}")
+
+            finally:
+                # Clean up temp directory
+                try:
+                    import shutil
+                    if os.path.exists(refine_temp_dir):
+                        shutil.rmtree(refine_temp_dir)
+                except Exception:
+                    pass
+
+        except Exception as e:
+            self.progress_bar.pack_forget()
+            self.status_label.config(text="Refinement failed")
+            traceback.print_exc()
+            messagebox.showerror("Refinement Error", f"Unexpected error: {str(e)}")
+
+    def _update_quality_metrics_for_range(self, start_frame, end_frame, masks_dir):
+        """
+        Update quality metrics for the refined frame range and its boundaries.
+
+        Args:
+            start_frame: Start of refined range (inclusive)
+            end_frame: End of refined range (inclusive)
+            masks_dir: Directory containing mask files
+        """
+        import numpy as np
+        from pathlib import Path
+
+        total_frames = len(self.frames)
+
+        # Extend range by 1 frame on each side for boundary calculations
+        metrics_start = max(0, start_frame - 1)
+        metrics_end = min(total_frames - 1, end_frame + 1)
+
+        # Ensure we have quality metrics arrays
+        if not self.inter_frame_changes or len(self.inter_frame_changes) != total_frames - 1:
+            self.inter_frame_changes = [0.0] * (total_frames - 1)
+        if not self.background_ratios or len(self.background_ratios) != total_frames:
+            self.background_ratios = [0.0] * total_frames
+
+        # Load masks for the extended range and recalculate metrics
+        masks_path = Path(masks_dir)
+        prev_combined_mask = None
+
+        for frame_idx in range(metrics_start, metrics_end + 1):
+            # Load all object masks for this frame and combine them
+            combined_mask = None
+            frame_pattern = f"mask_f{frame_idx:06d}_*.png"
+            mask_files = list(masks_path.glob(frame_pattern))
+
+            if mask_files:
+                for mask_file in mask_files:
+                    mask = cv2.imread(str(mask_file), cv2.IMREAD_GRAYSCALE)
+                    if mask is not None:
+                        if combined_mask is None:
+                            combined_mask = (mask > 0).astype(np.uint8)
+                        else:
+                            combined_mask = np.logical_or(combined_mask, mask > 0).astype(np.uint8)
+
+            # Calculate background ratio for this frame
+            if combined_mask is not None:
+                total_pixels = combined_mask.shape[0] * combined_mask.shape[1]
+                foreground_pixels = np.sum(combined_mask > 0)
+                background_ratio = 1.0 - (foreground_pixels / total_pixels)
+                self.background_ratios[frame_idx] = background_ratio
+
+            # Calculate inter-frame change (comparing to previous frame)
+            if prev_combined_mask is not None and combined_mask is not None and frame_idx > 0:
+                # Calculate pixel differences
+                changed_pixels = np.sum(prev_combined_mask != combined_mask)
+                total_pixels = combined_mask.shape[0] * combined_mask.shape[1]
+                change_ratio = changed_pixels / total_pixels
+                # inter_frame_changes[i] represents change between frame i and i+1
+                change_idx = frame_idx - 1
+                if 0 <= change_idx < len(self.inter_frame_changes):
+                    self.inter_frame_changes[change_idx] = change_ratio
+
+            prev_combined_mask = combined_mask
+
+        # Save updated metrics to disk
+        if self.results_output_dir:
+            self._save_quality_metrics(self.results_output_dir)
+
+        # Refresh quality visualizations
+        self._update_quality_visualizations()
+
+    def _regenerate_video_with_stitching(self, start_frame, end_frame, output_dir, masks_dir, original_video_path):
+        """
+        Smart video regeneration: attempt to stitch segments if possible, otherwise full re-export.
+
+        Args:
+            start_frame: Start of refined range (inclusive)
+            end_frame: End of refined range (inclusive)
+            output_dir: Directory containing output files
+            masks_dir: Directory containing mask files
+            original_video_path: Path to the original video
+        """
+        import tempfile
+        from pathlib import Path
+
+        total_frames = len(self.frames)
+        existing_video = os.path.join(output_dir, "segmented_video.avi")
+
+        # Check if we can use stitching approach
+        # Requirements: start > 0 AND end < total-1 AND ffmpeg available AND existing video exists
+        can_stitch = (
+            start_frame > 0 and
+            end_frame < total_frames - 1 and
+            self._has_ffmpeg() and
+            os.path.exists(existing_video)
+        )
+
+        if can_stitch:
+            try:
+                self.status_label.config(text="Stitching video segments...")
+                self.root.update()
+                success = self._stitch_video_segments(
+                    start_frame, end_frame, output_dir, masks_dir,
+                    original_video_path, existing_video
+                )
+                if success:
+                    return
+                # Fall through to full re-export if stitching failed
+                print("Video stitching failed, falling back to full re-export")
+            except Exception as e:
+                print(f"Video stitching error: {e}, falling back to full re-export")
+
+        # Fallback: full video re-export
+        self.status_label.config(text="Re-exporting entire video...")
+        self.root.update()
+        self._full_video_reexport(output_dir, masks_dir, original_video_path)
+
+    def _has_ffmpeg(self):
+        """Check if ffmpeg is available in the system PATH."""
+        import subprocess
+        try:
+            subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True)
+            return True
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            return False
+
+    def _stitch_video_segments(self, start_frame, end_frame, output_dir, masks_dir,
+                               original_video_path, existing_video_path):
+        """
+        Stitch video using ffmpeg: pre-segment + rendered middle + post-segment.
+
+        Args:
+            start_frame: Start of refined range
+            end_frame: End of refined range
+            output_dir: Directory for output
+            masks_dir: Directory containing masks
+            original_video_path: Original video for frame extraction
+            existing_video_path: Existing segmented video for pre/post segments
+
+        Returns:
+            True if stitching succeeded, False otherwise
+        """
+        import subprocess
+        import tempfile
+        from pathlib import Path
+
+        total_frames = len(self.frames)
+
+        # Get video properties
+        cap = cv2.VideoCapture(existing_video_path)
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        cap.release()
+
+        if fps <= 0:
+            fps = 30
+
+        temp_dir = tempfile.mkdtemp(prefix='sam2_stitch_')
+
+        try:
+            # Calculate timestamps
+            pre_end_time = start_frame / fps  # End time for pre-segment (exclusive)
+            post_start_time = (end_frame + 1) / fps  # Start time for post-segment
+
+            segments = []
+
+            # 1. Extract pre-segment (frames 0 to start_frame-1)
+            if start_frame > 0:
+                pre_segment = os.path.join(temp_dir, "pre_segment.avi")
+                cmd_pre = [
+                    'ffmpeg', '-y', '-i', existing_video_path,
+                    '-t', str(pre_end_time),
+                    '-c:v', 'libx264', '-preset', 'fast', '-crf', '18',
+                    pre_segment
+                ]
+                result = subprocess.run(cmd_pre, capture_output=True, text=True)
+                if result.returncode == 0 and os.path.exists(pre_segment):
+                    segments.append(pre_segment)
+                else:
+                    print(f"Pre-segment extraction failed: {result.stderr}")
+                    return False
+
+            # 2. Render middle segment (refined frames with new masks)
+            middle_segment = os.path.join(temp_dir, "middle_segment.avi")
+            if not self._render_frame_range_to_video(
+                start_frame, end_frame, masks_dir, original_video_path,
+                middle_segment, width, height, fps
+            ):
+                return False
+            segments.append(middle_segment)
+
+            # 3. Extract post-segment (frames end_frame+1 to end)
+            if end_frame < total_frames - 1:
+                post_segment = os.path.join(temp_dir, "post_segment.avi")
+                cmd_post = [
+                    'ffmpeg', '-y', '-i', existing_video_path,
+                    '-ss', str(post_start_time),
+                    '-c:v', 'libx264', '-preset', 'fast', '-crf', '18',
+                    post_segment
+                ]
+                result = subprocess.run(cmd_post, capture_output=True, text=True)
+                if result.returncode == 0 and os.path.exists(post_segment):
+                    segments.append(post_segment)
+                else:
+                    print(f"Post-segment extraction failed: {result.stderr}")
+                    return False
+
+            # 4. Create concat list file
+            concat_list = os.path.join(temp_dir, "concat_list.txt")
+            with open(concat_list, 'w') as f:
+                for seg in segments:
+                    f.write(f"file '{seg}'\n")
+
+            # 5. Concatenate segments
+            output_video = os.path.join(output_dir, "segmented_video.avi")
+            temp_output = os.path.join(temp_dir, "concat_output.avi")
+            cmd_concat = [
+                'ffmpeg', '-y', '-f', 'concat', '-safe', '0',
+                '-i', concat_list,
+                '-c:v', 'libx264', '-preset', 'fast', '-crf', '18',
+                temp_output
+            ]
+            result = subprocess.run(cmd_concat, capture_output=True, text=True)
+            if result.returncode != 0:
+                print(f"Concatenation failed: {result.stderr}")
+                return False
+
+            # Move temp output to final location (replacing original)
+            import shutil
+            shutil.move(temp_output, output_video)
+
+            return True
+
+        except Exception as e:
+            print(f"Stitching error: {e}")
+            return False
+
+        finally:
+            # Clean up temp directory
+            try:
+                import shutil
+                if os.path.exists(temp_dir):
+                    shutil.rmtree(temp_dir)
+            except Exception:
+                pass
+
+    def _render_frame_range_to_video(self, start_frame, end_frame, masks_dir,
+                                     original_video_path, output_path,
+                                     width, height, fps):
+        """
+        Render a range of frames with mask overlays to a video file.
+
+        Args:
+            start_frame: Start frame index
+            end_frame: End frame index
+            masks_dir: Directory containing mask files
+            original_video_path: Path to original video for frame data
+            output_path: Output video path
+            width: Video width
+            height: Video height
+            fps: Frames per second
+
+        Returns:
+            True if successful, False otherwise
+        """
+        from pathlib import Path
+        import numpy as np
+
+        try:
+            # Open original video
+            cap = cv2.VideoCapture(original_video_path)
+            if not cap.isOpened():
+                return False
+
+            # Create video writer
+            fourcc = cv2.VideoWriter_fourcc(*'XVID')
+            out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+
+            masks_path = Path(masks_dir)
+            overlay_opacity = self.mask_opacity_var.get() if hasattr(self, 'mask_opacity_var') else 0.4
+
+            # Seek to start frame
+            cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+
+            for frame_idx in range(start_frame, end_frame + 1):
+                ret, frame = cap.read()
+                if not ret:
+                    break
+
+                # Resize if needed
+                if frame.shape[1] != width or frame.shape[0] != height:
+                    frame = cv2.resize(frame, (width, height))
+
+                # Overlay masks for this frame
+                frame_pattern = f"mask_f{frame_idx:06d}_*.png"
+                mask_files = list(masks_path.glob(frame_pattern))
+
+                for mask_file in mask_files:
+                    # Extract object ID from filename
+                    parts = mask_file.stem.split('_')
+                    try:
+                        obj_id = int(parts[-1].replace('obj', ''))
+                    except (ValueError, IndexError):
+                        continue
+
+                    mask = cv2.imread(str(mask_file), cv2.IMREAD_GRAYSCALE)
+                    if mask is None:
+                        continue
+
+                    if mask.shape[0] != height or mask.shape[1] != width:
+                        mask = cv2.resize(mask, (width, height))
+
+                    # Get object color
+                    color = self.object_colors.get(obj_id, [255, 0, 0])
+                    if isinstance(color, list):
+                        color = tuple(color)
+
+                    # Apply mask overlay
+                    mask_bool = mask > 0
+                    overlay = frame.copy()
+                    overlay[mask_bool] = [color[2], color[1], color[0]]  # BGR
+                    frame = cv2.addWeighted(frame, 1 - overlay_opacity, overlay, overlay_opacity, 0)
+
+                out.write(frame)
+
+            cap.release()
+            out.release()
+
+            return os.path.exists(output_path)
+
+        except Exception as e:
+            print(f"Frame range rendering error: {e}")
+            return False
+
+    def _full_video_reexport(self, output_dir, masks_dir, original_video_path):
+        """
+        Fallback: complete video re-export when stitching is not possible.
+
+        Args:
+            output_dir: Directory for output
+            masks_dir: Directory containing masks
+            original_video_path: Original video for frames
+        """
+        # Use existing export functionality
+        try:
+            fps = self.video_fps if hasattr(self, 'video_fps') else 30
+            self._export_segmented_video(
+                output_dir=output_dir,
+                masks_dir=masks_dir,
+                fps=fps,
+                overlay_opacity=self.mask_opacity_var.get() if hasattr(self, 'mask_opacity_var') else 0.4,
+                source_video_path=original_video_path
+            )
+        except Exception as e:
+            print(f"Full video re-export failed: {e}")
+            messagebox.showwarning("Video Export Warning",
+                                  f"Could not regenerate video: {e}\n\n"
+                                  f"Masks have been updated. You can manually export the video later.")
 
     def _export_segmented_video(self, output_dir, masks_dir, fps=30, overlay_opacity=0.4, source_video_path=None):
         """
@@ -5151,6 +5864,9 @@ class SAM2VideoUI:
                 raise AttributeError("Model does not have 'init_state' method. Check SAM2 installation.")
             if not hasattr(self.sam2_model, 'add_new_points'):
                 raise AttributeError("Model does not have 'add_new_points' method. Check SAM2 installation.")
+
+            # Update refine button state now that model is loaded
+            self._update_refine_button_state()
 
         except Exception as e:
             self.model_loaded = False
