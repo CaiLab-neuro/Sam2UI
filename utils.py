@@ -1904,8 +1904,10 @@ def export_video_from_dict(
                 continue
 
             mask_bool = (mask > 0).astype(bool)
-            color = object_colors.get(obj_id, (255, 0, 0))  # Default red
-            name = object_names.get(obj_id, f"Object_{obj_id}")
+            # Use stored name and color from masks_metadata (set during propagation)
+            # These are the authoritative values - they may differ from input dicts
+            name = mask_data.get('name', object_names.get(obj_id, f"Object_{obj_id}"))
+            color = mask_data.get('color', object_colors.get(obj_id, (255, 0, 0)))
 
             result.append((mask_bool, color, name, obj_id))
 
