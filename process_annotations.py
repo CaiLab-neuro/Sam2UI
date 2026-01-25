@@ -109,6 +109,28 @@ MODEL_CONFIGS = {
     "sam3": (None, "sam_models/sam3/checkpoints/sam3.pt"),  # Config loaded automatically
 }
 
+def _get_cuda_device_index(device: str) -> int:
+    """
+    Extract CUDA device index from device string.
+
+    Args:
+        device: Device string (e.g., 'cuda', 'cuda:0', 'cuda:1', 'cpu')
+
+    Returns:
+        Device index (0 for 'cuda'), or None if device is 'cpu'
+    """
+    if not device or device == "cpu":
+        return None
+    if device == "cuda":
+        return 0
+    if device.startswith("cuda:"):
+        try:
+            return int(device.split(":")[1])
+        except (ValueError, IndexError):
+            return 0
+    return 0
+
+
 def _auto_select_default_model():
     """Auto-select best SAM2.1 model based on GPU memory (mimics UI behavior)"""
     preference_order = [
@@ -164,16 +186,19 @@ class ConsoleProgressCallback:
     Prints progress updates with memory monitoring for CLI usage.
     """
 
-    def __init__(self, verbose: bool = True):
+    def __init__(self, verbose: bool = True, device: str = None):
         """
         Initialize the console progress callback.
 
         Args:
             verbose: Whether to print detailed progress updates
+            device: Device being used (e.g., 'cuda', 'cuda:0', 'cuda:1', 'cpu')
         """
         self.verbose = verbose
         self._phase_total = 0
         self._current_phase = ""
+        self.device = device or "cuda"
+        self._cuda_device_index = _get_cuda_device_index(self.device)
 
     def on_phase_start(self, phase: str, total_steps: int) -> None:
         """Called when a new phase begins."""
@@ -199,9 +224,9 @@ class ConsoleProgressCallback:
             return
 
         # Monitor memory usage
-        if torch.cuda.is_available():
-            gpu_allocated = torch.cuda.memory_allocated() / (1024**3)
-            gpu_peak = torch.cuda.max_memory_allocated() / (1024**3)
+        if torch.cuda.is_available() and self._cuda_device_index is not None:
+            gpu_allocated = torch.cuda.memory_allocated(device=self._cuda_device_index) / (1024**3)
+            gpu_peak = torch.cuda.max_memory_allocated(device=self._cuda_device_index) / (1024**3)
             process = psutil.Process()
             ram_used = process.memory_info().rss / (1024**3)
 
@@ -834,8 +859,13 @@ class SAM2Processor:
 
                     if (out_frame_idx + 1) % 50 == 0:
                         # Monitor GPU and RAM usage
-                        gpu_allocated = torch.cuda.memory_allocated() / (1024**3)
-                        gpu_peak = torch.cuda.max_memory_allocated() / (1024**3)
+                        cuda_device_index = _get_cuda_device_index(device)
+                        if cuda_device_index is not None:
+                            gpu_allocated = torch.cuda.memory_allocated(device=cuda_device_index) / (1024**3)
+                            gpu_peak = torch.cuda.max_memory_allocated(device=cuda_device_index) / (1024**3)
+                        else:
+                            gpu_allocated = 0.0
+                            gpu_peak = 0.0
                         process = psutil.Process()
                         ram_used = process.memory_info().rss / (1024**3)
 
@@ -875,9 +905,12 @@ class SAM2Processor:
                             propagate_preflight=True
                         )
                     else:
-                        # SAM2: Use default backward propagation
+                        # SAM2: Need explicit frame range for backward propagation
                         propagate_iterator = self.video_predictor.propagate_in_video(
-                            inference_state, reverse=True
+                            inference_state,
+                            start_frame_idx=num_frames - 1,
+                            max_frame_num_to_track=num_frames,
+                            reverse=True
                         )
 
                     for result in propagate_iterator:
@@ -942,8 +975,14 @@ class SAM2Processor:
                         self._cleanup_inference_state(inference_state, out_frame_idx, frames_to_keep=20, reverse=True, verbose=True)
 
                         if (out_frame_idx + 1) % 50 == 0:
-                            gpu_allocated = torch.cuda.memory_allocated() / (1024**3)
-                            gpu_peak = torch.cuda.max_memory_allocated() / (1024**3)
+                            # Monitor GPU and RAM usage
+                            cuda_device_index = _get_cuda_device_index(device)
+                            if cuda_device_index is not None:
+                                gpu_allocated = torch.cuda.memory_allocated(device=cuda_device_index) / (1024**3)
+                                gpu_peak = torch.cuda.max_memory_allocated(device=cuda_device_index) / (1024**3)
+                            else:
+                                gpu_allocated = 0.0
+                                gpu_peak = 0.0
                             process = psutil.Process()
                             ram_used = process.memory_info().rss / (1024**3)
 

@@ -737,9 +737,20 @@ class VideoSegmenter:
                     )
             else:
                 # SAM2 propagation
-                propagate_iterator = self.predictor.propagate_in_video(
-                    inference_state, reverse=reverse
-                )
+                if reverse:
+                    propagate_iterator = self.predictor.propagate_in_video(
+                        inference_state,
+                        start_frame_idx=num_frames - 1,
+                        max_frame_num_to_track=num_frames,
+                        reverse=True
+                    )
+                else:
+                    propagate_iterator = self.predictor.propagate_in_video(
+                        inference_state,
+                        start_frame_idx=0,
+                        max_frame_num_to_track=num_frames,
+                        reverse=False
+                    )
 
             processed = 0
             for result in propagate_iterator:

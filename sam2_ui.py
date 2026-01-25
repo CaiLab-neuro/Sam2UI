@@ -290,7 +290,6 @@ class SAM2VideoUI:
         # Refine segmentation controls
         self.refine_frame_start_var = tk.StringVar(value="")
         self.refine_frame_end_var = tk.StringVar(value="")
-        self.refine_regenerate_video_var = tk.BooleanVar(value=True)
         self.refine_button = None
 
         # Initialize default colors and names
@@ -606,9 +605,6 @@ class SAM2VideoUI:
         ttk.Label(refine_frame, text="(1-indexed, inclusive)",
                  foreground='gray', font=('Arial', 8, 'italic')).pack(anchor=tk.W)
 
-        # Regenerate video checkbox
-        ttk.Checkbutton(refine_frame, text="Regenerate video",
-                       variable=self.refine_regenerate_video_var).pack(anchor=tk.W, pady=(2, 0))
 
         # Refine button (initially disabled)
         self.refine_button = ttk.Button(refine_frame, text="Refine Range",
@@ -2197,6 +2193,12 @@ class SAM2VideoUI:
             bool: True if range changed and re-render is needed, False otherwise
         """
         range_start, range_end, zoom_level = self._get_quality_viz_range()
+
+        # Apply the same clamping as _render_quality_backgrounds() to ensure consistency
+        if self.inter_frame_changes:
+            total_metric_frames = len(self.inter_frame_changes)
+            range_start = max(0, min(range_start, total_metric_frames - 1))
+            range_end = max(0, min(range_end, total_metric_frames - 1))
 
         # Check if anything changed
         if (range_start != self.quality_viz_range_start or
@@ -3818,9 +3820,8 @@ class SAM2VideoUI:
                 # Get device
                 device = self._get_selected_device()
 
-                # Determine if using bfloat16
-                use_bfloat16 = (device.startswith("cuda") and
-                               hasattr(self, 'use_bfloat16') and self.use_bfloat16)
+                # Use the bfloat16 setting from model initialization
+                use_bfloat16 = getattr(self, 'use_bfloat16', False)
 
                 # Create VideoSegmenter
                 segmenter = VideoSegmenter(
@@ -4090,9 +4091,16 @@ class SAM2VideoUI:
         )
 
         if can_refine:
-            self.refine_button.configure(state='normal')
+            self.refine_button.configure(state='normal', text="Refine Range")
         else:
-            self.refine_button.configure(state='disabled')
+            # Provide helpful text indicating what's missing
+            if not (self.masks and self.frames):
+                reason = "Refine Range (no video)"
+            elif not (self.model_loaded and self.sam2_model is not None):
+                reason = "Refine Range (load model first)"
+            else:
+                reason = "Refine Range"
+            self.refine_button.configure(state='disabled', text=reason)
 
     def _validate_refine_inputs(self):
         """
@@ -4209,17 +4217,22 @@ class SAM2VideoUI:
             if not output_dir:
                 return
 
-        # Confirmation dialog
-        regenerate_video = self.refine_regenerate_video_var.get()
+        # Determine if video regeneration is needed
+        # Auto-regenerate for partial refinements (not all frames)
+        total_frames = len(self.frames)
+        is_partial_refinement = (start_frame > 0 or end_frame < total_frames - 1)
+        regenerate_video = is_partial_refinement
+
         num_frames = end_frame - start_frame + 1
         num_annotations = len(annotations_in_range)
 
+        # Confirmation dialog
         confirm_msg = (
             f"Refine Segmentation\n\n"
             f"Frame range: {start_frame + 1} to {end_frame + 1} ({num_frames} frames)\n"
             f"Annotations in range: {num_annotations}\n"
             f"Output directory: {output_dir}\n"
-            f"Regenerate video: {'Yes' if regenerate_video else 'No'}\n\n"
+            f"Regenerate video: {'Yes (automatic)' if regenerate_video else 'No (full range)'}\n\n"
             f"This will overwrite existing masks in this range.\n"
             f"Continue?"
         )
@@ -4293,10 +4306,11 @@ class SAM2VideoUI:
 
             try:
                 # Create VideoSegmenter with the existing predictor
+                # Use the bfloat16 setting from model initialization
                 segmenter = VideoSegmenter(
-                    predictor=self.sam2_model.predictor,
+                    predictor=self.sam2_model,
                     device=self._get_selected_device(),
-                    use_bfloat16=self.use_bfloat16
+                    use_bfloat16=getattr(self, 'use_bfloat16', False)
                 )
                 segmenter.set_progress_callback(UIProgressCallback(self))
 
@@ -4544,18 +4558,17 @@ class SAM2VideoUI:
         temp_dir = tempfile.mkdtemp(prefix='sam2_stitch_')
 
         try:
-            # Calculate timestamps
-            pre_end_time = start_frame / fps  # End time for pre-segment (exclusive)
-            post_start_time = (end_frame + 1) / fps  # Start time for post-segment
-
             segments = []
 
-            # 1. Extract pre-segment (frames 0 to start_frame-1)
+            # 1. Extract pre-segment (frames 0 to start_frame-1) using frame-exact selection
             if start_frame > 0:
                 pre_segment = os.path.join(temp_dir, "pre_segment.avi")
+                # Use select filter for frame-exact cutting
+                # select='lt(n,START_FRAME)' selects frames where frame number < start_frame
                 cmd_pre = [
                     'ffmpeg', '-y', '-i', existing_video_path,
-                    '-t', str(pre_end_time),
+                    '-vf', f"select='lt(n\\,{start_frame})'",
+                    '-vsync', '0',  # Prevent frame duplication/dropping
                     '-c:v', 'libx264', '-preset', 'fast', '-crf', '18',
                     pre_segment
                 ]
@@ -4575,12 +4588,15 @@ class SAM2VideoUI:
                 return False
             segments.append(middle_segment)
 
-            # 3. Extract post-segment (frames end_frame+1 to end)
+            # 3. Extract post-segment (frames end_frame+1 to end) using frame-exact selection
             if end_frame < total_frames - 1:
                 post_segment = os.path.join(temp_dir, "post_segment.avi")
+                # Use select filter for frame-exact cutting
+                # select='gt(n,END_FRAME)' selects frames where frame number > end_frame
                 cmd_post = [
                     'ffmpeg', '-y', '-i', existing_video_path,
-                    '-ss', str(post_start_time),
+                    '-vf', f"select='gt(n\\,{end_frame})'",
+                    '-vsync', '0',  # Prevent frame duplication/dropping
                     '-c:v', 'libx264', '-preset', 'fast', '-crf', '18',
                     post_segment
                 ]
@@ -5821,27 +5837,15 @@ class SAM2VideoUI:
                     )
 
             # Setup autocast context for BFloat16 (following SAM2 notebook pattern)
-            if device != "cpu" and torch.cuda.is_available():
-                # Enable autocast for BFloat16 as per SAM2 official notebook
-                # Note: torch.autocast with device_type="cuda" applies to all CUDA devices,
-                # not just the default one, so this is safe for multi-GPU setups
-                self.autocast_context = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+            # Use utility function to automatically detect GPU capabilities
+            from utils import setup_precision_context
+            self.autocast_context, self.use_bfloat16, precision_msg = setup_precision_context(device)
+
+            # Enter the autocast context if enabled
+            if self.autocast_context:
                 self.autocast_context.__enter__()
 
-                # Enable TF32 for Ampere GPUs (compute capability >= 8.0)
-                try:
-                    gpu_id = 0 if device == "cuda" else int(device.split(":")[1])
-                    if torch.cuda.get_device_properties(gpu_id).major >= 8:
-                        torch.backends.cuda.matmul.allow_tf32 = True
-                        torch.backends.cudnn.allow_tf32 = True
-                        print(f"Enabled TF32 for Ampere GPU (compute capability {torch.cuda.get_device_properties(gpu_id).major}.x)")
-                except Exception as e:
-                    print(f"Could not enable TF32: {e}")
-
-                print(f"Model loaded on {device} with BFloat16 autocast enabled")
-            else:
-                self.autocast_context = None
-                print(f"Model loaded on {device} (CPU mode, no autocast)")
+            print(precision_msg)
 
             self.model_loaded = True
             # Store model info (for SAM2 only; SAM3 doesn't use this)

@@ -75,6 +75,96 @@ def should_disable_cuda_for_device(device: str) -> bool:
     return device == "cpu" or (device.startswith("cuda:") and device != "cuda:0")
 
 
+def supports_bfloat16(device: str) -> bool:
+    """
+    Check if a device supports native BFloat16 operations.
+
+    BFloat16 is only supported on NVIDIA GPUs with compute capability >= 8.0
+    (Ampere architecture and newer: RTX 30xx+, RTX 40xx+, A100, H100, etc.).
+
+    Older GPUs (V100, RTX 20xx, GTX series) can run BFloat16 via software
+    emulation but performance is worse than Float32.
+
+    Args:
+        device: Device string (e.g., "cpu", "cuda", "cuda:0", "cuda:1")
+
+    Returns:
+        True if the device has native BFloat16 support, False otherwise
+    """
+    if torch is None or device == "cpu" or not torch.cuda.is_available():
+        return False
+
+    try:
+        # Extract GPU ID from device string
+        gpu_id = 0 if device == "cuda" else int(device.split(":")[1])
+
+        # Check compute capability (Ampere = 8.0+)
+        compute_cap = torch.cuda.get_device_properties(gpu_id).major
+        return compute_cap >= 8
+    except Exception:
+        # If we can't determine, assume no support
+        return False
+
+
+def setup_precision_context(device: str, force_bfloat16: bool = False):
+    """
+    Setup the appropriate precision context for a given device.
+
+    Automatically enables BFloat16 on Ampere+ GPUs and TF32 for matrix operations.
+    Returns a context manager and flags for the precision settings.
+
+    Args:
+        device: Device string (e.g., "cpu", "cuda", "cuda:0", "cuda:1")
+        force_bfloat16: If True, enable BFloat16 even on unsupported GPUs (not recommended)
+
+    Returns:
+        Tuple of (autocast_context, use_bfloat16: bool, info_message: str)
+        - autocast_context: Context manager to enter (or None)
+        - use_bfloat16: Boolean flag indicating if BFloat16 is active
+        - info_message: Human-readable string describing the setup
+
+    Example:
+        >>> autocast_ctx, use_bf16, msg = setup_precision_context("cuda:0")
+        >>> print(msg)
+        >>> if autocast_ctx:
+        >>>     autocast_ctx.__enter__()
+    """
+    if device == "cpu" or torch is None or not torch.cuda.is_available():
+        return None, False, f"Model loaded on {device} (CPU mode, no autocast)"
+
+    try:
+        # Extract GPU ID and get properties
+        gpu_id = 0 if device == "cuda" else int(device.split(":")[1])
+        gpu_props = torch.cuda.get_device_properties(gpu_id)
+        compute_cap = gpu_props.major
+        gpu_name = gpu_props.name
+
+        # Check BFloat16 support
+        has_bfloat16 = compute_cap >= 8
+
+        if has_bfloat16 or force_bfloat16:
+            # Enable BFloat16 autocast
+            autocast_ctx = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+
+            # Enable TF32 for Ampere+ (same requirement as BFloat16)
+            if compute_cap >= 8:
+                torch.backends.cuda.matmul.allow_tf32 = True
+                torch.backends.cudnn.allow_tf32 = True
+                msg = f"Model loaded on {device} with BFloat16 autocast and TF32 enabled (compute capability {compute_cap}.x)"
+            else:
+                msg = f"Model loaded on {device} with BFloat16 autocast (FORCED on compute capability {compute_cap}.x - may be slower)"
+
+            return autocast_ctx, True, msg
+        else:
+            # Use Float32 for older GPUs
+            msg = f"Model loaded on {device} with Float32 ({gpu_name}, compute capability {compute_cap}.x - BFloat16 not supported)"
+            return None, False, msg
+
+    except Exception as e:
+        # Fallback to Float32 if we can't detect capabilities
+        return None, False, f"Model loaded on {device} with Float32 (capability detection failed: {e})"
+
+
 # Global variable to store the target device for SAM3
 _SAM3_TARGET_DEVICE = None
 
