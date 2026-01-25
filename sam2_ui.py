@@ -298,8 +298,8 @@ class SAM2VideoUI:
         # SAM2 model
         self.sam2_model = None
         self.model_loaded = False
+        self.device = None  # Track segmentation device for GPU overlay
 
-        
         # UI styling
         self.setup_styles()
         self.setup_ui()
@@ -3819,6 +3819,7 @@ class SAM2VideoUI:
 
                 # Get device
                 device = self._get_selected_device()
+                self.device = device  # Store for use in export functions
 
                 # Use the bfloat16 setting from model initialization
                 use_bfloat16 = getattr(self, 'use_bfloat16', False)
@@ -4307,9 +4308,11 @@ class SAM2VideoUI:
             try:
                 # Create VideoSegmenter with the existing predictor
                 # Use the bfloat16 setting from model initialization
+                device = self._get_selected_device()
+                self.device = device  # Store for use in export functions
                 segmenter = VideoSegmenter(
                     predictor=self.sam2_model,
-                    device=self._get_selected_device(),
+                    device=device,
                     use_bfloat16=getattr(self, 'use_bfloat16', False)
                 )
                 segmenter.set_progress_callback(UIProgressCallback(self))
@@ -4359,6 +4362,37 @@ class SAM2VideoUI:
                     self.status_label.config(text="Regenerating video...")
                     self.root.update()
                     self._regenerate_video_with_stitching(start_frame, end_frame, output_dir, masks_dir, original_video)
+
+                    # Reload the newly generated segmented video for display
+                    self.status_label.config(text="Loading refined video...")
+                    self.root.update()
+
+                    segmented_video_path = os.path.join(output_dir, "segmented_video.avi")
+                    if os.path.exists(segmented_video_path):
+                        # Save current frame position to restore it after reload
+                        saved_frame_idx = self.current_frame_idx
+
+                        # Clean up any existing lazy loading state
+                        if hasattr(self, 'video_cap_lazy') and self.video_cap_lazy:
+                            self.video_cap_lazy.release()
+                            self.video_cap_lazy = None
+
+                        # Clear frame cache to prevent stale data
+                        if hasattr(self, 'frame_cache'):
+                            self.frame_cache = {}
+
+                        # Update to use the segmented video for display
+                        self.video_path = segmented_video_path
+                        self.segmented_video_displayed = True
+                        self.has_prerendered_masks = True
+
+                        # Reload video frames from the new segmented video
+                        self.load_video_frames()
+
+                        # Restore frame position
+                        if 0 <= saved_frame_idx < len(self.frames):
+                            self.current_frame_idx = saved_frame_idx
+                            self.slider.set(saved_frame_idx)
 
                 # Clear mask cache for affected frames (force reload from disk)
                 for frame_idx in range(start_frame, end_frame + 1):
@@ -4416,11 +4450,21 @@ class SAM2VideoUI:
         metrics_start = max(0, start_frame - 1)
         metrics_end = min(total_frames - 1, end_frame + 1)
 
-        # Ensure we have quality metrics arrays
-        if not self.inter_frame_changes or len(self.inter_frame_changes) != total_frames - 1:
-            self.inter_frame_changes = [0.0] * (total_frames - 1)
-        if not self.background_ratios or len(self.background_ratios) != total_frames:
-            self.background_ratios = [0.0] * total_frames
+        # Load existing quality metrics from disk to preserve values outside refined range
+        if self.results_output_dir:
+            loaded = self._load_quality_metrics(self.results_output_dir)
+            if not loaded:
+                # If loading fails, initialize with zeros
+                if not self.inter_frame_changes or len(self.inter_frame_changes) != total_frames - 1:
+                    self.inter_frame_changes = [0.0] * (total_frames - 1)
+                if not self.background_ratios or len(self.background_ratios) != total_frames:
+                    self.background_ratios = [0.0] * total_frames
+        else:
+            # No output dir, ensure arrays exist
+            if not self.inter_frame_changes or len(self.inter_frame_changes) != total_frames - 1:
+                self.inter_frame_changes = [0.0] * (total_frames - 1)
+            if not self.background_ratios or len(self.background_ratios) != total_frames:
+                self.background_ratios = [0.0] * total_frames
 
         # Load masks for the extended range and recalculate metrics
         masks_path = Path(masks_dir)
@@ -4569,12 +4613,13 @@ class SAM2VideoUI:
                     'ffmpeg', '-y', '-i', existing_video_path,
                     '-vf', f"select='lt(n\\,{start_frame})'",
                     '-vsync', '0',  # Prevent frame duplication/dropping
-                    '-c:v', 'libx264', '-preset', 'fast', '-crf', '18',
+                    '-c:v', 'mjpeg', '-q:v', '5',
                     pre_segment
                 ]
                 result = subprocess.run(cmd_pre, capture_output=True, text=True)
                 if result.returncode == 0 and os.path.exists(pre_segment):
                     segments.append(pre_segment)
+                    print(f"Pre-segment created: frames 0-{start_frame-1}")
                 else:
                     print(f"Pre-segment extraction failed: {result.stderr}")
                     return False
@@ -4597,12 +4642,13 @@ class SAM2VideoUI:
                     'ffmpeg', '-y', '-i', existing_video_path,
                     '-vf', f"select='gt(n\\,{end_frame})'",
                     '-vsync', '0',  # Prevent frame duplication/dropping
-                    '-c:v', 'libx264', '-preset', 'fast', '-crf', '18',
+                    '-c:v', 'mjpeg', '-q:v', '5',
                     post_segment
                 ]
                 result = subprocess.run(cmd_post, capture_output=True, text=True)
                 if result.returncode == 0 and os.path.exists(post_segment):
                     segments.append(post_segment)
+                    print(f"Post-segment created: frames {end_frame+1}-{total_frames-1}")
                 else:
                     print(f"Post-segment extraction failed: {result.stderr}")
                     return False
@@ -4613,19 +4659,25 @@ class SAM2VideoUI:
                 for seg in segments:
                     f.write(f"file '{seg}'\n")
 
+            print(f"Concatenating {len(segments)} segments:")
+            for i, seg in enumerate(segments):
+                print(f"  Segment {i+1}: {os.path.basename(seg)}")
+
             # 5. Concatenate segments
             output_video = os.path.join(output_dir, "segmented_video.avi")
             temp_output = os.path.join(temp_dir, "concat_output.avi")
             cmd_concat = [
                 'ffmpeg', '-y', '-f', 'concat', '-safe', '0',
                 '-i', concat_list,
-                '-c:v', 'libx264', '-preset', 'fast', '-crf', '18',
+                '-c:v', 'mjpeg', '-q:v', '5',
                 temp_output
             ]
             result = subprocess.run(cmd_concat, capture_output=True, text=True)
             if result.returncode != 0:
                 print(f"Concatenation failed: {result.stderr}")
                 return False
+
+            print(f"Concatenation successful, output: {temp_output}")
 
             # Move temp output to final location (replacing original)
             import shutil
@@ -4674,9 +4726,15 @@ class SAM2VideoUI:
             if not cap.isOpened():
                 return False
 
-            # Create video writer
-            fourcc = cv2.VideoWriter_fourcc(*'XVID')
+            # Create video writer (use MJPEG to match pre/post segments)
+            fourcc = cv2.VideoWriter_fourcc(*'MJPG')
             out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+
+            # Verify writer was created successfully
+            if not out.isOpened():
+                print(f"Failed to create VideoWriter for {output_path}")
+                cap.release()
+                return False
 
             masks_path = Path(masks_dir)
             overlay_opacity = self.mask_opacity_var.get() if hasattr(self, 'mask_opacity_var') else 0.4
@@ -4684,9 +4742,11 @@ class SAM2VideoUI:
             # Seek to start frame
             cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
 
+            frames_written = 0
             for frame_idx in range(start_frame, end_frame + 1):
                 ret, frame = cap.read()
                 if not ret:
+                    print(f"Warning: Failed to read frame {frame_idx} from original video")
                     break
 
                 # Resize if needed
@@ -4724,11 +4784,13 @@ class SAM2VideoUI:
                     frame = cv2.addWeighted(frame, 1 - overlay_opacity, overlay, overlay_opacity, 0)
 
                 out.write(frame)
+                frames_written += 1
 
             cap.release()
             out.release()
 
-            return os.path.exists(output_path)
+            print(f"Middle segment: wrote {frames_written} frames (expected {end_frame - start_frame + 1}) to {output_path}")
+            return os.path.exists(output_path) and frames_written > 0
 
         except Exception as e:
             print(f"Frame range rendering error: {e}")
@@ -4827,6 +4889,9 @@ class SAM2VideoUI:
         output_path = Path(output_dir) / "segmented_video.avi"
 
         try:
+            # Auto-enable GPU overlay if inference device is CUDA
+            use_gpu_overlay = self.device.startswith("cuda") if self.device else False
+
             success = export_segmented_video(
                 frame_source=frame_source,
                 masks_dir=str(masks_dir),
@@ -4836,6 +4901,8 @@ class SAM2VideoUI:
                 overlay_opacity=overlay_opacity,
                 compress=True,
                 crf=23,
+                use_gpu=use_gpu_overlay,
+                gpu_device=self.device if use_gpu_overlay else None,
             )
             return success
         finally:
@@ -5117,22 +5184,6 @@ class SAM2VideoUI:
                 'export_type': 'masks'
             }
 
-    def export_video(self):
-        """Export video with mask overlays and enhanced object visualization"""
-        if not self.frames:
-            messagebox.showwarning("Warning", "No video loaded")
-            return
-            
-        if not self.masks:
-            messagebox.showwarning("Warning", "No masks to export. Please segment the video first.")
-            return
-        
-        # Use checkbox setting to determine export mode
-        if self.background_export_var.get():
-            self._start_background_video_export()
-        else:
-            self._start_foreground_video_export()
-    
     def _start_background_video_export(self):
         """Start background video export"""
         # Get export settings from user first

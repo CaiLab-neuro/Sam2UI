@@ -48,7 +48,6 @@ from utils import (
     DisableCUDADuringInit,
     should_disable_cuda_for_device,
     patch_sam3_modules_for_device,
-    compress_video_with_ffmpeg,
     export_video_from_dict,
 )
 
@@ -307,6 +306,7 @@ class SAM2Processor:
         self.use_bfloat16 = use_bfloat16
         self.no_backward_propagation = False  # Will be set from command line args
         self.requested_device = device  # User-requested device (None = auto-detect)
+        self.device = None  # Will be set after loading model
         self.frame_format = frame_format  # Format for extracted frames
 
     @property
@@ -340,6 +340,9 @@ class SAM2Processor:
             else:
                 device = "cuda" if torch.cuda.is_available() else "cpu"
             print(f"  Device: {device}")
+
+            # Store device for later use (e.g., in export functions)
+            self.device = device
 
             # Common optimizations for both SAM2 and SAM3
             if device != "cpu" and torch.cuda.is_available():
@@ -430,10 +433,6 @@ class SAM2Processor:
         except Exception as e:
             print(f"ERROR: Failed to load annotations: {e}")
             return None
-
-    def _compress_video_with_ffmpeg(self, input_path, output_path, crf=23, preset='medium'):
-        """Wrapper for utils.compress_video_with_ffmpeg."""
-        return compress_video_with_ffmpeg(input_path, output_path, crf=crf, preset=preset)
 
     def get_video_info(self, video_path):
         """Get video frame count and properties without loading all frames"""
@@ -1061,181 +1060,6 @@ class SAM2Processor:
         print(f"OK: Verified {verified_count} mask files in {masks_dir}")
         return verified_count
 
-    def _get_contrasting_text_color(self, bg_color):
-        """Calculate contrasting text color (white or black) based on background luminance
-
-        Args:
-            bg_color: BGR color tuple (e.g., [255, 0, 0] for blue)
-
-        Returns:
-            (B, G, R) tuple: (255, 255, 255) for white or (0, 0, 0) for black
-        """
-        # Convert BGR to RGB
-        if isinstance(bg_color, (list, tuple)) and len(bg_color) >= 3:
-            r, g, b = bg_color[2], bg_color[1], bg_color[0]  # BGR to RGB
-        else:
-            r, g, b = 255, 255, 255  # Default white
-
-        # Calculate relative luminance (ITU-R BT.709)
-        luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b
-
-        # Return white for dark colors, black for bright colors
-        return (255, 255, 255) if luminance < 128 else (0, 0, 0)
-
-    def load_video_frames_for_export(self, video_path):
-        """Load video frames for export (needed after segmentation)"""
-        print(f"Loading video frames for export...")
-        try:
-            cap = cv2.VideoCapture(video_path)
-            if not cap.isOpened():
-                raise ValueError(f"Cannot open video file: {video_path}")
-
-            frames = []
-            frame_count = 0
-
-            while True:
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                frames.append(frame)
-                frame_count += 1
-
-                if frame_count % 100 == 0:
-                    print(f"   Loaded {frame_count} frames...")
-
-            cap.release()
-            print(f"OK: Loaded {len(frames)} frames for export")
-            return frames
-        except Exception as e:
-            print(f"ERROR: Failed to load video frames: {e}")
-            return None
-
-    def export_video(self, masks_by_frame, video_path, object_names, object_colors,
-                    output_dir, fps=30, overlay_opacity=0.4, compress=True, crf=23):
-        """Export segmented video with overlays and optional compression"""
-        print("Exporting segmented video...")
-
-        frames = self.load_video_frames_for_export(video_path)
-        if not frames:
-            return False
-
-        video_output_path_final = Path(output_dir) / "segmented_video.avi"
-        video_output_path_temp = Path(output_dir) / "segmented_video.temp.avi" if compress else video_output_path_final
-        
-        height, width = frames[0].shape[:2]
-
-        fourcc = cv2.VideoWriter_fourcc(*"MJPG")
-        out = cv2.VideoWriter(str(video_output_path_temp.with_suffix(".avi")),
-            fourcc, fps, (width, height))
-
-        # Use H.264 codec for much better compression and quality
-        # Try different codec identifiers based on system availability
-        # for codec in ['avc1', 'H264', 'X264', 'mp4v']:
-        #     fourcc = cv2.VideoWriter_fourcc(*codec)
-        #     out = cv2.VideoWriter(str(video_output_path_temp), fourcc, fps, (width, height))
-        #     if out.isOpened():
-        #         if codec != 'mp4v':
-        #             print(f"  Using {codec} codec for video encoding")
-        #         break
-
-        if not out.isOpened():
-            print("  WARNING: Could not initialize video writer with any codec")
-            return False
-        
-        processed_frames = 0
-        masks_dir = Path(output_dir) / "masks"
-
-        for frame_idx, frame in enumerate(frames):
-            overlay_frame = frame.copy()
-
-            if frame_idx in masks_by_frame:
-                frame_masks = masks_by_frame[frame_idx]
-
-                # Collect all mask data first
-                mask_data_list = []
-                for obj_id, mask_data in frame_masks.items():
-                    # Load mask from disk
-                    mask_path = masks_dir / mask_data['filename']
-                    mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
-                    if mask is None:
-                        print(f"WARNING: Could not load mask: {mask_path}")
-                        continue
-                    mask = (mask > 0).astype(bool)  # Convert to boolean
-
-                    color = mask_data['color']
-                    name = mask_data['name']
-
-                    # Resize mask if needed
-                    if mask.shape != (height, width):
-                        from PIL import Image as PILImage
-                        mask_pil = PILImage.fromarray((mask * 255).astype(np.uint8))
-                        # Use BILINEAR interpolation for smoother edges (vs NEAREST which causes pixelation)
-                        mask_pil = mask_pil.resize((width, height), PILImage.BILINEAR)
-                        # Threshold at 127 to maintain binary mask after interpolation
-                        mask = np.array(mask_pil) > 127
-
-                    mask_data_list.append((mask, color, name, obj_id))
-
-                if mask_data_list:
-                    # Create overlay with averaged colors for overlapping regions
-                    combined_overlay = np.zeros((height, width, 3), dtype=np.float32)
-                    overlap_count = np.zeros((height, width), dtype=np.int32)
-
-                    for mask_bool, color, name, obj_id in mask_data_list:
-                        # Add color to overlapping regions (accumulate for averaging)
-                        color_bgr = color[::-1] if isinstance(color, (list, tuple)) else [0, 0, 255]
-                        combined_overlay[mask_bool] += color_bgr
-                        overlap_count[mask_bool] += 1
-
-                    # Average colors where masks overlap
-                    mask_pixels = overlap_count > 0
-                    combined_overlay[mask_pixels] /= overlap_count[mask_pixels, np.newaxis]
-                    combined_overlay = combined_overlay.astype(np.uint8)
-
-                    # Single blend operation - fixes cumulative darkening bug
-                    overlay_frame = cv2.addWeighted(frame, 1-overlay_opacity,
-                                                  combined_overlay, overlay_opacity, 0)
-
-                    # Add text labels with smart contrast
-                    for mask_bool, color, name, obj_id in mask_data_list:
-                        if mask_bool.any():
-                            y_coords, x_coords = np.where(mask_bool)
-                            if len(y_coords) > 0:
-                                center_x = int(np.mean(x_coords))
-                                center_y = int(np.mean(y_coords))
-
-                                # Calculate contrasting text color based on mask color luminance
-                                text_color = self._get_contrasting_text_color(color)
-
-                                cv2.putText(overlay_frame, name, (center_x, center_y),
-                                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, text_color, 2)
-            
-            out.write(overlay_frame)
-            processed_frames += 1
-            
-            if processed_frames % 100 == 0:
-                print(f"   Processed {processed_frames}/{len(frames)} frames...")
-
-        out.release()
-
-        # Compress with FFmpeg if requested
-        if compress:
-            print("Compressing video with FFmpeg...")
-            success = self._compress_video_with_ffmpeg(
-                str(video_output_path_temp),
-                str(video_output_path_final),
-                crf=crf,
-                preset='medium'
-            )
-            if success:
-                print(f"OK: Exported and compressed segmented video to {video_output_path_final}")
-            else:
-                print(f"OK: Exported segmented video to {video_output_path_final} (compression skipped)")
-        else:
-            print(f"OK: Exported segmented video to {video_output_path_final}")
-
-        return True
-    
     def export_metadata(self, annotations_data, masks_by_frame, output_dir, num_frames=None, video_path=None):
         """Export processing metadata with file paths"""
         print("Exporting metadata...")
@@ -1494,6 +1318,8 @@ Examples:
         processor.export_masks(masks_by_frame, args.video_file, object_names, output_dir)
 
         # Use shared export function from utils - reuses extracted frames for efficiency
+        # Auto-enable GPU overlay if inference device is CUDA (unless export would hit memory limits)
+        use_gpu_overlay = processor.device.startswith("cuda") if processor.device else False
         export_video_from_dict(
             video_path=args.video_file,
             masks_by_frame=masks_by_frame,
@@ -1505,6 +1331,8 @@ Examples:
             compress=True,
             crf=23,
             frame_dir=frame_dir_used,  # Reuse extracted frames
+            use_gpu=use_gpu_overlay,
+            gpu_device=processor.device if use_gpu_overlay else None,
         )
 
         processor.export_metadata(annotations_data, masks_by_frame, output_dir, num_frames,

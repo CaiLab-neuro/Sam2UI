@@ -1787,6 +1787,140 @@ def get_contrasting_text_color(bg_color: Tuple[int, int, int]) -> Tuple[int, int
 
 
 # =============================================================================
+# GPU Overlay Computation
+# =============================================================================
+
+def compute_overlay_gpu(
+    frame: np.ndarray,
+    mask_data_list: List[Tuple[np.ndarray, Tuple[int, int, int], str, int]],
+    overlay_opacity: float = 0.4,
+    device: str = 'cuda:3'
+) -> Optional[np.ndarray]:
+    """
+    GPU-accelerated mask overlay computation.
+
+    Moves frame and masks to GPU, performs accumulation and blending on GPU,
+    returns result on CPU. Includes fallback to CPU on GPU errors.
+
+    Args:
+        frame: Input frame as numpy array (uint8, BGR)
+        mask_data_list: List of (mask_bool, color_rgb, name, obj_id) tuples
+        overlay_opacity: Opacity for overlay blending (0.0 to 1.0)
+        device: GPU device string (e.g., 'cuda:3')
+
+    Returns:
+        Blended frame with overlays (uint8, BGR) or None if overlay failed
+    """
+    if not torch or not mask_data_list:
+        return None
+
+    try:
+        with torch.no_grad():
+            height, width = frame.shape[:2]
+
+            # Convert frame to GPU tensor, normalize to [0, 1]
+            frame_gpu = torch.from_numpy(frame).float().to(device) / 255.0
+
+            # Initialize accumulators on GPU
+            combined_overlay = torch.zeros((height, width, 3), dtype=torch.float32, device=device)
+            overlap_count = torch.zeros((height, width), dtype=torch.uint8, device=device)
+
+            # Process each mask
+            for mask_bool, color_rgb, name, obj_id in mask_data_list:
+                # Convert mask to GPU
+                mask_gpu = torch.from_numpy(mask_bool).to(device)
+
+                # Convert RGB to BGR, normalize to [0, 1]
+                color_bgr = torch.tensor(
+                    (color_rgb[2], color_rgb[1], color_rgb[0]),
+                    dtype=torch.float32,
+                    device=device
+                ) / 255.0
+
+                # Accumulate color on masked regions
+                combined_overlay[mask_gpu] += color_bgr
+                overlap_count[mask_gpu] += 1
+
+                # Clean up mask tensor immediately
+                del mask_gpu
+
+            # Average overlapping regions
+            mask_pixels = overlap_count > 0
+            if mask_pixels.any():
+                combined_overlay[mask_pixels] /= overlap_count[mask_pixels].unsqueeze(1).float()
+
+                # Blend on GPU
+                alpha = overlay_opacity
+                beta = 1.0 - alpha
+                blended = (frame_gpu * beta + combined_overlay * alpha).clamp(0, 1)
+
+                # Convert back to uint8 CPU array
+                result = (blended * 255).byte().cpu().numpy()
+
+                # Clean up GPU memory
+                del frame_gpu, combined_overlay, overlap_count
+                torch.cuda.empty_cache()
+
+                return result
+
+            # Clean up if no overlays
+            del frame_gpu, combined_overlay, overlap_count
+            torch.cuda.empty_cache()
+            return None
+
+    except RuntimeError as e:
+        # GPU out of memory or other GPU error - return None for fallback to CPU
+        print(f"GPU overlay error: {e}, falling back to CPU")
+        torch.cuda.empty_cache()
+        return None
+
+
+def compute_overlay_cpu(
+    frame: np.ndarray,
+    mask_data_list: List[Tuple[np.ndarray, Tuple[int, int, int], str, int]],
+    overlay_opacity: float = 0.4
+) -> Optional[np.ndarray]:
+    """
+    CPU-based mask overlay computation (original implementation).
+
+    Args:
+        frame: Input frame as numpy array (uint8, BGR)
+        mask_data_list: List of (mask_bool, color_rgb, name, obj_id) tuples
+        overlay_opacity: Opacity for overlay blending (0.0 to 1.0)
+
+    Returns:
+        Blended frame with overlays (uint8, BGR) or None if overlay failed
+    """
+    if not mask_data_list:
+        return None
+
+    height, width = frame.shape[:2]
+
+    # Create overlay with averaged colors for overlapping regions
+    combined_overlay = np.zeros((height, width, 3), dtype=np.float32)
+    overlap_count = np.zeros((height, width), dtype=np.int32)
+
+    for mask_bool, color_rgb, name, obj_id in mask_data_list:
+        # Convert RGB to BGR
+        color_bgr = (color_rgb[2], color_rgb[1], color_rgb[0])
+        combined_overlay[mask_bool] += color_bgr
+        overlap_count[mask_bool] += 1
+
+    # Average colors where masks overlap
+    mask_pixels = overlap_count > 0
+    if mask_pixels.any():
+        combined_overlay[mask_pixels] /= overlap_count[mask_pixels, np.newaxis]
+        combined_overlay = combined_overlay.astype(np.uint8)
+
+        # Single blend operation
+        result = cv2.addWeighted(frame, 1 - overlay_opacity,
+                                combined_overlay, overlay_opacity, 0)
+        return result
+
+    return None
+
+
+# =============================================================================
 # Video Export Functions
 # =============================================================================
 
@@ -1799,6 +1933,8 @@ def export_segmented_video(
     overlay_opacity: float = 0.4,
     compress: bool = True,
     crf: int = 23,
+    use_gpu: bool = False,
+    gpu_device: Optional[str] = None,
     progress_callback: Optional[Callable[[int, int], None]] = None
 ) -> bool:
     """
@@ -1817,12 +1953,18 @@ def export_segmented_video(
         overlay_opacity: Opacity for mask overlay (0.0 to 1.0)
         compress: Whether to compress with FFmpeg after writing
         crf: CRF value for FFmpeg compression (lower = better quality)
+        use_gpu: Whether to use GPU-accelerated overlay computation
+        gpu_device: GPU device string (e.g., 'cuda:0', 'cuda:3'). If None, defaults to 'cuda'
         progress_callback: Optional callback(current_frame, total_frames) for progress
 
     Returns:
         True if export succeeded, False otherwise
     """
     print("Exporting segmented video...")
+    if use_gpu:
+        if gpu_device is None:
+            gpu_device = "cuda"
+        print(f"  Using GPU overlay acceleration on device: {gpu_device}")
 
     output_path = Path(output_path)
     output_dir = output_path.parent
@@ -1864,10 +2006,8 @@ def export_segmented_video(
             mask_data_list = get_mask_data(frame_idx)
 
             if mask_data_list:
-                # Create overlay with averaged colors for overlapping regions
-                combined_overlay = np.zeros((height, width, 3), dtype=np.float32)
-                overlap_count = np.zeros((height, width), dtype=np.int32)
-
+                # Preprocess masks to match frame dimensions
+                preprocessed_masks = []
                 for mask_bool, color_rgb, name, obj_id in mask_data_list:
                     # Resize mask if needed
                     if mask_bool.shape != (height, width):
@@ -1876,41 +2016,37 @@ def export_segmented_video(
                         mask_pil = mask_pil.resize((width, height), PILImage.BILINEAR)
                         mask_bool = np.array(mask_pil) > 127
 
-                    # Convert RGB to BGR for OpenCV
-                    color_bgr = (color_rgb[2], color_rgb[1], color_rgb[0])
-                    combined_overlay[mask_bool] += color_bgr
-                    overlap_count[mask_bool] += 1
+                    preprocessed_masks.append((mask_bool, color_rgb, name, obj_id))
 
-                # Average colors where masks overlap
-                mask_pixels = overlap_count > 0
-                if mask_pixels.any():
-                    combined_overlay[mask_pixels] /= overlap_count[mask_pixels, np.newaxis]
-                    combined_overlay = combined_overlay.astype(np.uint8)
+                # Try GPU overlay computation if enabled
+                if use_gpu and torch is not None:
+                    blended = compute_overlay_gpu(frame, preprocessed_masks, overlay_opacity, gpu_device)
+                    if blended is not None:
+                        overlay_frame = blended
+                    else:
+                        # Fall back to CPU if GPU fails
+                        blended = compute_overlay_cpu(frame, preprocessed_masks, overlay_opacity)
+                        if blended is not None:
+                            overlay_frame = blended
+                else:
+                    # Use CPU overlay computation
+                    blended = compute_overlay_cpu(frame, preprocessed_masks, overlay_opacity)
+                    if blended is not None:
+                        overlay_frame = blended
 
-                    # Single blend operation - fixes cumulative darkening bug
-                    overlay_frame = cv2.addWeighted(frame, 1 - overlay_opacity,
-                                                    combined_overlay, overlay_opacity, 0)
+                # Add text labels with smart contrast
+                for mask_bool, color_rgb, name, obj_id in preprocessed_masks:
+                    if mask_bool.any():
+                        y_coords, x_coords = np.where(mask_bool)
+                        if len(y_coords) > 0:
+                            center_x = int(np.mean(x_coords))
+                            center_y = int(np.mean(y_coords))
 
-                    # Add text labels with smart contrast
-                    for mask_bool, color_rgb, name, obj_id in mask_data_list:
-                        # Resize mask again for label calculation if needed
-                        if mask_bool.shape != (height, width):
-                            from PIL import Image as PILImage
-                            mask_pil = PILImage.fromarray((mask_bool * 255).astype(np.uint8))
-                            mask_pil = mask_pil.resize((width, height), PILImage.BILINEAR)
-                            mask_bool = np.array(mask_pil) > 127
+                            # Calculate contrasting text color (ITU-R BT.709)
+                            text_color = get_contrasting_text_color(color_rgb)
 
-                        if mask_bool.any():
-                            y_coords, x_coords = np.where(mask_bool)
-                            if len(y_coords) > 0:
-                                center_x = int(np.mean(x_coords))
-                                center_y = int(np.mean(y_coords))
-
-                                # Calculate contrasting text color (ITU-R BT.709)
-                                text_color = get_contrasting_text_color(color_rgb)
-
-                                cv2.putText(overlay_frame, name, (center_x, center_y),
-                                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, text_color, 2)
+                            cv2.putText(overlay_frame, name, (center_x, center_y),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, text_color, 2)
 
             out.write(overlay_frame)
             processed_frames += 1
@@ -1949,6 +2085,8 @@ def export_video_from_dict(
     compress: bool = True,
     crf: int = 23,
     frame_dir: Optional[str] = None,
+    use_gpu: bool = False,
+    gpu_device: Optional[str] = None,
     progress_callback: Optional[Callable[[int, int], None]] = None
 ) -> bool:
     """
@@ -1968,6 +2106,8 @@ def export_video_from_dict(
         compress: Whether to compress with FFmpeg
         crf: CRF value for FFmpeg compression
         frame_dir: Optional path to extracted frames directory (for reuse)
+        use_gpu: Whether to use GPU-accelerated overlay computation
+        gpu_device: GPU device string (e.g., 'cuda:0', 'cuda:3'). If None, defaults to 'cuda'
         progress_callback: Optional progress callback
 
     Returns:
@@ -2013,6 +2153,8 @@ def export_video_from_dict(
             overlay_opacity=overlay_opacity,
             compress=compress,
             crf=crf,
+            use_gpu=use_gpu,
+            gpu_device=gpu_device,
             progress_callback=progress_callback
         )
         return success
