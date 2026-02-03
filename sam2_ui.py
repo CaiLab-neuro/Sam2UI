@@ -4392,7 +4392,7 @@ class SAM2VideoUI:
                         # Restore frame position
                         if 0 <= saved_frame_idx < len(self.frames):
                             self.current_frame_idx = saved_frame_idx
-                            self.slider.set(saved_frame_idx)
+                            self.frame_slider.set(saved_frame_idx)
 
                 # Clear mask cache for affected frames (force reload from disk)
                 for frame_idx in range(start_frame, end_frame + 1):
