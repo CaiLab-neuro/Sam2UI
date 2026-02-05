@@ -566,12 +566,16 @@ def verify_setup():
         import tkinter as tk
         print("OK: All packages imported successfully")
 
-        # Check SAM2 installation
-        try:
-            from sam2.build_sam import build_sam2_video_predictor
+        # Check SAM2 installation (must use subprocess: editable installs via
+        # 'pip install -e' add .pth entries only visible to new interpreters)
+        sam2_check = subprocess.run([
+            sys.executable, "-c",
+            "from sam2.build_sam import build_sam2_video_predictor; print('OK')"
+        ], capture_output=True, text=True, timeout=30)
+        if sam2_check.returncode == 0:
             print("OK: SAM2 package imported successfully")
-        except ImportError as e:
-            print(f"ERROR: Could not import SAM2: {e}")
+        else:
+            print(f"ERROR: Could not import SAM2: {sam2_check.stderr.strip()}")
             return False
 
         if torch.cuda.is_available():
@@ -606,11 +610,13 @@ def verify_setup():
         # Optional: Check SAM3
         if Path("sam_models/sam3").exists():
             print("OK: SAM3 installed (optional)")
-            # Check SAM3 dependencies
-            try:
-                import einops
+            # Check SAM3 dependencies (subprocess for same reason as SAM2 above)
+            einops_check = subprocess.run([
+                sys.executable, "-c", "import einops; print('OK')"
+            ], capture_output=True, text=True, timeout=10)
+            if einops_check.returncode == 0:
                 print("OK: SAM3 dependencies (einops) available")
-            except ImportError:
+            else:
                 print("WARNING: einops not found - SAM3 may not work")
                 print("  Install with: pip install einops")
 

@@ -19,7 +19,6 @@ import re
 
 # Import utility functions
 from utils import (
-    generate_mask_filename,
     load_mask as load_mask_from_disk,
     export_mask_to_disk as export_mask_to_disk_util,
     calculate_quality_metrics,
@@ -264,6 +263,7 @@ class SAM2VideoUI:
         self.segmented_video_displayed = False  # Track if displaying segmented vs original
         self.has_prerendered_masks = False  # Track if frames have masks baked in (performance optimization)
         self.results_output_dir = None  # Store output directory
+        self.saved_opacity = 0.4  # Persisted overlay opacity (read from metadata on import)
 
         # Session-based frame cache (cleaned up when app closes)
         self.session_cache_dir = None  # Current temp directory for extracted frames
@@ -577,8 +577,18 @@ class SAM2VideoUI:
         ttk.Button(seg_frame, text="Segment Video",
                   command=self.segment_video, width=15).pack(fill=tk.X, pady=2)
 
-        
-        
+        # Mask opacity slider
+        opacity_frame = ttk.Frame(seg_frame)
+        opacity_frame.pack(fill=tk.X, pady=(5, 0))
+        ttk.Label(opacity_frame, text="Mask Opacity:").pack(anchor=tk.W)
+        self.mask_opacity_var = tk.DoubleVar(value=0.4)
+        opacity_slider = ttk.Scale(opacity_frame, from_=0.0, to=1.0,
+                                   variable=self.mask_opacity_var,
+                                   orient=tk.HORIZONTAL,
+                                   command=self.on_mask_opacity_change)
+        opacity_slider.pack(fill=tk.X, padx=(0, 5))
+        self.opacity_label = ttk.Label(opacity_frame, text="40%", foreground='gray')
+        self.opacity_label.pack(anchor=tk.W)
 
         ttk.Button(seg_frame, text="Import Segmentation",
                   command=self.import_masks, width=15).pack(fill=tk.X, pady=2)
@@ -612,42 +622,6 @@ class SAM2VideoUI:
         self.refine_button.pack(fill=tk.X, pady=(5, 0))
         self.refine_button.configure(state='disabled')
 
-        # Optional export controls (exports happen automatically during segmentation)
-        ttk.Label(seg_frame, text="(Optional - exports happen automatically during segmentation)",
-                 foreground='gray', font=('Arial', 8, 'italic')).pack(anchor=tk.W, pady=(10, 5))
-
-        ttk.Button(seg_frame, text="Export Masks",
-                  command=self.export_masks, width=15).pack(fill=tk.X, pady=2)
-        ttk.Button(seg_frame, text="Export Video",
-                  command=self.export_video, width=15).pack(fill=tk.X, pady=2)
-
-        # Display options
-        display_frame = ttk.LabelFrame(scrollable_frame, text="Display Options", padding=10)
-        display_frame.pack(fill=tk.X, pady=(0, 10))
-
-        # Show/Hide masks checkbox
-        self.show_masks_var = tk.BooleanVar()
-        ttk.Checkbutton(display_frame, text="Show Masks", 
-                    variable=self.show_masks_var,
-                    command=self.toggle_mask_display).pack(anchor=tk.W, pady=(0, 5))
-
-        # Mask opacity slider
-        opacity_frame = ttk.Frame(display_frame)
-        opacity_frame.pack(fill=tk.X, pady=(5, 0))
-
-        ttk.Label(opacity_frame, text="Mask Opacity:").pack(anchor=tk.W)
-
-        self.mask_opacity_var = tk.DoubleVar(value=0.4)  # Default 40%
-        opacity_slider = ttk.Scale(opacity_frame, from_=0.0, to=1.0, 
-                                variable=self.mask_opacity_var, 
-                                orient=tk.HORIZONTAL,
-                                command=self.on_mask_opacity_change)
-        opacity_slider.pack(fill=tk.X, padx=(0, 5))
-
-        # Opacity percentage label
-        self.opacity_label = ttk.Label(opacity_frame, text="40%", foreground='gray')
-        self.opacity_label.pack(anchor=tk.W)
-        
         # Status info
         status_frame = ttk.LabelFrame(scrollable_frame, text="Status", padding=10)
         status_frame.pack(fill=tk.X)
@@ -661,6 +635,10 @@ class SAM2VideoUI:
         
     def setup_right_panel(self, parent):
         """Setup the right video display panel"""
+        # Video filename display (truncated if path is long)
+        self.video_filename_label = ttk.Label(parent, text="", foreground='#aaaaaa', font=('Arial', 9))
+        self.video_filename_label.pack(fill=tk.X, pady=(0, 4))
+
         # Video display area
         display_frame = ttk.Frame(parent)
         display_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
@@ -1222,6 +1200,11 @@ class SAM2VideoUI:
             total_frames = processing_info.get('total_frames_processed', len(self.frames))
             object_ids = processing_info.get('objects_detected', [])
 
+            # Restore persisted overlay opacity
+            self.saved_opacity = processing_info.get('overlay_opacity', 0.4)
+            self.mask_opacity_var.set(self.saved_opacity)
+            self.opacity_label.config(text=f"{int(self.saved_opacity * 100)}%")
+
             for frame_idx in range(total_frames):
                 self.masks[frame_idx] = {}
                 for obj_id in object_ids:
@@ -1367,12 +1350,6 @@ class SAM2VideoUI:
                 "Flash requires either:\n"
                 "1. A completed segmentation, or\n"
                 "2. Loaded pre-segmented results with mask files")
-            return
-
-        # Check if masks are visible
-        if not self.show_masks_var.get():
-            messagebox.showinfo("Show Masks Required",
-                "Please enable the 'Show Masks' checkbox to use flash.")
             return
 
         # Try to load mask if not in memory or if it's a placeholder None value
@@ -1629,6 +1606,20 @@ class SAM2VideoUI:
         else:
             messagebox.showwarning("Limit Reached", f"Maximum {self.max_total_objects} objects supported.")
             
+    @staticmethod
+    def _truncate_path(path, max_len=50):
+        """Truncate a long path from the front, preserving directory boundaries at the end."""
+        if len(path) <= max_len:
+            return path
+        parts = path.replace("\\", "/").split("/")
+        result = parts[-1]  # always keep the filename
+        for part in reversed(parts[:-1]):
+            candidate = part + "/" + result
+            if len("…/" + candidate) > max_len:
+                break
+            result = candidate
+        return "…/" + result
+
     def load_video(self):
         """Load video file and extract frames"""
         # Clean up any existing lazy loading
@@ -1651,6 +1642,7 @@ class SAM2VideoUI:
             
         try:
             self.video_path = file_path
+            self.video_filename_label.config(text=self._truncate_path(file_path))
 
             # CRITICAL FIX: Reset prerendered flags when loading new original video
             # This ensures flash works after previously viewing a segmented video
@@ -2410,7 +2402,7 @@ class SAM2VideoUI:
                          (0, 165, 255), 8)
         
         # Apply mask overlay if enabled and masks exist
-        if self.show_masks_var.get() and self.current_frame_idx in self.masks:
+        if self.current_frame_idx in self.masks:
             # OPTIMIZATION: If displaying pre-rendered segmented video, skip mask loading
             # The frames already have masks baked in from the segmented video
             if self.has_prerendered_masks:
@@ -2436,7 +2428,7 @@ class SAM2VideoUI:
                             white_overlay[mask_bool] = [255, 255, 255]
 
                             # Blend white overlay on top of existing frame
-                            alpha = self.mask_opacity_var.get() if hasattr(self, 'mask_opacity_var') else 0.4
+                            alpha = 0.7
                             display_frame = cv2.addWeighted(display_frame, 1-alpha, white_overlay, alpha, 0)
                 pass
             else:
@@ -2755,11 +2747,6 @@ class SAM2VideoUI:
         if self.frames:
             self.display_current_frame()
             
-    def toggle_mask_display(self):
-        """Toggle mask overlay display"""
-        if self.frames:
-            self.display_current_frame()
-
     def on_mask_opacity_change(self, value=None):
         """Handle mask opacity slider change"""
         opacity = self.mask_opacity_var.get()
@@ -2767,7 +2754,7 @@ class SAM2VideoUI:
         self.opacity_label.config(text=f"{int(opacity * 100)}%")
         
         # Redraw frame if masks are visible
-        if self.show_masks_var.get() and self.frames:
+        if self.frames:
             self.display_current_frame()
             
     def prev_frame(self):
@@ -3090,14 +3077,25 @@ class SAM2VideoUI:
             
     def play_video(self):
         """Play video in separate thread"""
-        # Calculate frame delay based on video FPS and speed multiplier
+        # Calculate frame step and delay based on video FPS and speed multiplier.
+        # For speed >= 1x: skip frames (step > 1) to achieve speedup, since the
+        # per-frame display overhead dominates and shrinking the delay has no effect.
+        # For speed < 1x: stretch delay to slow down, no skipping.
         speed = self.playback_speed.get()
         base_delay = 1.0 / self.video_fps  # Delay for original FPS
-        adjusted_delay = base_delay / speed  # Adjust for playback speed
+        if speed >= 1.0:
+            frame_step = max(1, round(speed))
+            adjusted_delay = base_delay
+        else:
+            frame_step = 1
+            adjusted_delay = base_delay / speed
 
         while self.playing and self.frames:
             if self.current_frame_idx < len(self.frames) - 1:
-                self.current_frame_idx += 1
+                self.current_frame_idx = min(
+                    self.current_frame_idx + frame_step,
+                    len(self.frames) - 1
+                )
                 self.root.after(0, self.display_current_frame)
 
                 # Update slider position in zoomed mode
@@ -3920,7 +3918,6 @@ class SAM2VideoUI:
                     # Enable Flash Mask button now that segmentation is complete
                     self._enable_flash_mask_button()
 
-                    self.show_masks_var.set(True)
                     self.update_object_list()
                     self.display_current_frame()
 
@@ -3947,7 +3944,7 @@ class SAM2VideoUI:
                         # Export segmented video with overlays
                         self.status_label.config(text="Exporting segmented video...")
                         self.root.update()
-                        video_exported = self._export_segmented_video(output_base_dir, masks_output_dir, source_video_path=source_video)
+                        video_exported = self._export_segmented_video(output_base_dir, masks_output_dir, source_video_path=source_video, overlay_opacity=self.mask_opacity_var.get())
 
                         # Save processing metadata (matching process_annotations.py format)
                         metadata_path = os.path.join(output_base_dir, "processing_metadata.json")
@@ -3957,7 +3954,8 @@ class SAM2VideoUI:
                                     "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
                                     "total_frames_processed": len(frames_to_process),
                                     "total_masks_generated": total_masks,
-                                    "objects_detected": list(self.object_names.keys())
+                                    "objects_detected": list(self.object_names.keys()),
+                                    "overlay_opacity": self.mask_opacity_var.get()
                                 },
                                 "file_paths": {
                                     # Use original_video_path_for_resegment if available (when re-segmenting loaded results),
@@ -3968,6 +3966,8 @@ class SAM2VideoUI:
                                 },
                                 "original_annotations": annotations_data
                             }, f, indent=2)
+
+                        self.saved_opacity = self.mask_opacity_var.get()
 
                         print(f"[SUCCESS] Results saved to: {output_base_dir}")
                         print(f"   - Masks: {masks_output_dir}/ ({total_masks} files)")
@@ -4737,7 +4737,7 @@ class SAM2VideoUI:
                 return False
 
             masks_path = Path(masks_dir)
-            overlay_opacity = self.mask_opacity_var.get() if hasattr(self, 'mask_opacity_var') else 0.4
+            overlay_opacity = self.saved_opacity
 
             # Seek to start frame
             cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
@@ -4812,7 +4812,7 @@ class SAM2VideoUI:
                 output_dir=output_dir,
                 masks_dir=masks_dir,
                 fps=fps,
-                overlay_opacity=self.mask_opacity_var.get() if hasattr(self, 'mask_opacity_var') else 0.4,
+                overlay_opacity=self.saved_opacity,
                 source_video_path=original_video_path
             )
         except Exception as e:
@@ -4907,282 +4907,6 @@ class SAM2VideoUI:
             return success
         finally:
             frame_source.close()
-
-    def export_masks(self):
-        """Export masks with enhanced metadata including object names"""
-        if not self.masks:
-            messagebox.showwarning("Warning", "No masks to export. Please segment the video first.")
-            return
-        
-        try:
-            self._start_foreground_mask_export()
-        except Exception as e:
-            messagebox.showerror("Export Error", f"Failed to export masks: {str(e)}")
-            print(f"Error starting foreground mask export: {e}")
-
-    def _start_foreground_mask_export(self):
-        """Export masks in foreground (blocking)"""
-        if not self.masks:
-            messagebox.showwarning("Warning", "No masks to export.")
-            return
-        
-        # Get export directory
-        # Use parent of last export dir if available, otherwise home directory
-        initial_dir = os.path.dirname(self.last_export_dir) if self.last_export_dir else os.path.expanduser("~")
-        export_dir = filedialog.askdirectory(
-            title="Select Export Directory for Masks",
-            initialdir=initial_dir
-        )
-        if not export_dir:
-            return
-
-        # Save this directory for next time
-        self._save_last_export_dir(export_dir)
-
-        # Check if masks already exist in the directory
-        existing_masks = [f for f in os.listdir(export_dir) if f.startswith('mask_f') and f.endswith('.png')]
-        if existing_masks:
-            response = self._show_three_button_dialog(
-                "Masks Exist",
-                f"Directory already contains {len(existing_masks)} mask files.\n\n"
-                f"How would you like to proceed?",
-                "Overwrite All",
-                "Merge",
-                "Cancel"
-            )
-
-            if response is None:  # Cancel
-                return
-            elif response == 0:  # Overwrite All - delete existing
-                import shutil
-                for mask_file in existing_masks:
-                    try:
-                        os.remove(os.path.join(export_dir, mask_file))
-                    except Exception as e:
-                        print(f"Warning: Could not delete {mask_file}: {e}")
-                # Also delete metadata files if they exist
-                for meta_file in ["segmentation_metadata.json", "object_mapping.csv"]:
-                    meta_path = os.path.join(export_dir, meta_file)
-                    if os.path.exists(meta_path):
-                        try:
-                            os.remove(meta_path)
-                        except Exception as e:
-                            print(f"Warning: Could not delete {meta_file}: {e}")
-            # else: No - keep existing, just add new ones
-
-        try:
-            self.status_label.config(text="Exporting masks...")
-            self.progress_bar.pack(fill=tk.X, pady=(5, 0))
-            
-            # Export each frame's masks
-            total_frames = len(self.masks)
-            for idx, (frame_idx, frame_masks) in enumerate(self.masks.items()):
-                for obj_id in frame_masks.keys():
-                    # Load mask from disk (memory optimization)
-                    mask = self._load_mask(frame_idx, obj_id)
-                    if mask is None:
-                        continue
-                    obj_name = self.object_names.get(obj_id, f"Object_{obj_id}")
-                    # Use consolidated filename format from utils.py
-                    mask_filename = generate_mask_filename(frame_idx, obj_id, obj_name)
-                    mask_path = os.path.join(export_dir, mask_filename)
-                    
-                    progress = (idx / total_frames) * 90
-                    self.progress_var.set(progress)
-                    
-                    if idx % 100 == 0:
-                        self.root.update_idletasks()
-            
-            # Enhanced metadata export
-            metadata = {
-                "video_path": self.video_path,
-                "total_frames": len(self.frames),
-                "objects": {},
-                "click_points_by_object": {},
-                "prompt_frame": getattr(self, 'ann_frame_idx', self.current_frame_idx),
-                "export_timestamp": str(__import__('datetime').datetime.now()),
-                "sam2_info": {
-                    "base_path": self.sam2_base_path,
-                    "checkpoint_dir": self.checkpoint_dir,
-                    "config_dir": self.config_dir
-                }
-            }
-
-            # Object information with names and colors
-            for obj_id in range(1, self.max_total_objects + 1):
-                if any(obj_id in frame_masks for frame_masks in self.masks.values()):
-                    mask_count = sum(1 for frame_masks in self.masks.values() if obj_id in frame_masks)
-                    point_count = sum(1 for _, _, _, oid in self.click_points if oid == obj_id)
-
-                    metadata["objects"][obj_id] = {
-                        "name": self.object_names.get(obj_id, f"Object_{obj_id}"),
-                        "mask_count": mask_count,
-                        "point_count": point_count,
-                        "color": self.object_colors.get(obj_id, [255, 255, 255])
-                    }
-
-            # Click points grouped by object
-            for x, y, is_pos, obj_id, frame_idx in self.click_points:
-                if obj_id not in metadata["click_points_by_object"]:
-                    metadata["click_points_by_object"][obj_id] = []
-                metadata["click_points_by_object"][obj_id].append({
-                    "x": float(x),
-                    "y": float(y),
-                    "positive": bool(is_pos),
-                    "object_name": self.object_names.get(obj_id, f"Object_{obj_id}"),
-                    "frame": int(frame_idx)
-                })
-
-            metadata_path = os.path.join(export_dir, "segmentation_metadata.json")
-            with open(metadata_path, 'w') as f:
-                json.dump(metadata, f, indent=2)
-
-            # Also export object mapping CSV
-            csv_path = os.path.join(export_dir, "object_mapping.csv")
-            with open(csv_path, 'w', newline='', encoding='utf-8') as csvfile:
-                fieldnames = ['id', 'name', 'mask_count', 'point_count', 'color_hex']
-                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-                writer.writeheader()
-                
-                for obj_id, obj_info in metadata["objects"].items():
-                    color_hex = self._rgb_to_hex(obj_info["color"])
-                    writer.writerow({
-                        'id': obj_id,
-                        'name': obj_info['name'],
-                        'mask_count': obj_info['mask_count'],
-                        'point_count': obj_info['point_count'],
-                        'color_hex': color_hex
-                    })
-            
-            self.progress_var.set(100)
-            self.progress_bar.pack_forget()
-            # Calculate exported count
-            exported_count = sum(len(frame_masks) for frame_masks in self.masks.values())
-            self.status_label.config(text=f"Export complete: {exported_count} masks + metadata")
-            
-            # Show brief success message without dialog
-            messagebox.showinfo("Export Complete", 
-                              f"Successfully exported:\n"
-                              f"- {exported_count} mask images (PNG)\n"
-                              f"- 1 metadata file (JSON)\n"
-                              f"- 1 object mapping (CSV)\n\n"
-                              f"Location: {export_dir}")
-                
-        except Exception as e:
-            self.progress_bar.pack_forget()
-            self.status_label.config(text="Export failed")
-            messagebox.showerror("Export Error", f"Failed to export masks: {str(e)}")
-    
-    def _export_masks_background(self, export_task):
-        """Background mask export implementation"""
-        try:
-            folder_path = export_task['folder_path']
-            masks = export_task['masks']
-            object_names = export_task['object_names']
-            object_colors = export_task['object_colors']
-            click_points = export_task['click_points']
-            video_path = export_task['video_path']
-            frames_count = export_task['frames']
-            ann_frame_idx = export_task['ann_frame_idx']
-            sam2_info = export_task['sam2_info']
-            
-            exported_count = 0
-            total_masks = sum(len(fm) for fm in masks.values())
-            
-            # Export masks with object names in filename
-            for frame_idx, frame_masks in masks.items():
-                for obj_id in frame_masks.keys():
-                    # Load mask from disk (memory optimization)
-                    mask = self._load_mask(frame_idx, obj_id)
-                    if mask is None:
-                        continue
-                    obj_name = object_names.get(obj_id, f"Object_{obj_id}")
-                    # Use consolidated filename format from utils.py
-                    mask_filename = generate_mask_filename(frame_idx, obj_id, obj_name)
-                    mask_path = os.path.join(folder_path, mask_filename)
-                    cv2.imwrite(mask_path, mask)
-                    exported_count += 1
-            
-            # Enhanced metadata export
-            metadata = {
-                "video_path": video_path,
-                "total_frames": frames_count,
-                "objects": {},
-                "click_points_by_object": {},
-                "prompt_frame": ann_frame_idx,
-                "export_timestamp": str(__import__('datetime').datetime.now()),
-                "sam2_info": sam2_info,
-                "export_mode": "background"
-            }
-            
-            # Object information with names and colors
-            # Note: max_total_objects should be available in the export task context
-            # For background export, we'll iterate through actual objects used
-            used_obj_ids = set()
-            for frame_masks in masks.values():
-                used_obj_ids.update(frame_masks.keys())
-            for point in click_points:
-                if len(point) >= 4:
-                    used_obj_ids.add(point[3])  # obj_id is at index 3
-            
-            for obj_id in sorted(used_obj_ids):
-                if any(obj_id in frame_masks for frame_masks in masks.values()):
-                    mask_count = sum(1 for frame_masks in masks.values() if obj_id in frame_masks)
-                    point_count = sum(1 for point in click_points if len(point) >= 4 and point[3] == obj_id)
-                    
-                    metadata["objects"][obj_id] = {
-                        "name": object_names.get(obj_id, f"Object_{obj_id}"),
-                        "mask_count": mask_count,
-                        "point_count": point_count,
-                        "color": object_colors.get(obj_id, [255, 255, 255])
-                    }
-            
-            # Click points grouped by object
-            for x, y, is_pos, obj_id, frame_idx in click_points:
-                if obj_id not in metadata["click_points_by_object"]:
-                    metadata["click_points_by_object"][obj_id] = []
-                metadata["click_points_by_object"][obj_id].append({
-                    "x": float(x), 
-                    "y": float(y), 
-                    "positive": bool(is_pos),
-                    "object_name": object_names.get(obj_id, f"Object_{obj_id}"),
-                    "frame": int(frame_idx)
-                })
-            
-            metadata_path = os.path.join(folder_path, "segmentation_metadata.json")
-            with open(metadata_path, 'w') as f:
-                json.dump(metadata, f, indent=2)
-            
-            # Also export object mapping CSV
-            csv_path = os.path.join(folder_path, "object_mapping.csv")
-            with open(csv_path, 'w', newline='', encoding='utf-8') as csvfile:
-                fieldnames = ['id', 'name', 'mask_count', 'point_count', 'color_hex']
-                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-                writer.writeheader()
-                
-                for obj_id, obj_info in metadata["objects"].items():
-                    color_hex = self._rgb_to_hex(obj_info["color"])
-                    writer.writerow({
-                        'id': obj_id,
-                        'name': obj_info['name'],
-                        'mask_count': obj_info['mask_count'],
-                        'point_count': obj_info['point_count'],
-                        'color_hex': color_hex
-                    })
-            
-            return {
-                'success': True,
-                'exported_count': exported_count,
-                'folder_path': folder_path,
-                'export_type': 'masks'
-            }
-            
-        except Exception as e:
-            return {
-                'success': False,
-                'error': str(e),
-                'export_type': 'masks'
-            }
 
     def _start_background_video_export(self):
         """Start background video export"""
@@ -5514,252 +5238,6 @@ class SAM2VideoUI:
         """Convert RGB color list to hex string"""
         return f"#{rgb[0]:02x}{rgb[1]:02x}{rgb[2]:02x}"
     
-    def export_video(self):
-        """Export segmented video with various options"""
-        if not self.masks:
-            messagebox.showwarning("Warning", "No masks to export. Please segment the video first.")
-            return
-            
-        if not self.frames:
-            messagebox.showwarning("Warning", "No video frames available.")
-            return
-        
-        # Create export options dialog
-        export_dialog = tk.Toplevel(self.root)
-        export_dialog.title("Export Video Options")
-        export_dialog.geometry("450x500")
-        export_dialog.configure(bg='#2b2b2b')
-        export_dialog.transient(self.root)
-        export_dialog.grab_set()
-        
-        # Center the dialog
-        export_dialog.update_idletasks()
-        x = (export_dialog.winfo_screenwidth() // 2) - (export_dialog.winfo_width() // 2)
-        y = (export_dialog.winfo_screenheight() // 2) - (export_dialog.winfo_height() // 2)
-        export_dialog.geometry(f"+{x}+{y}")
-        
-        # Configure dialog style
-        dialog_style = ttk.Style()
-        dialog_style.theme_use('clam')
-        dialog_style.configure('Dialog.TFrame', background='#2b2b2b')
-        dialog_style.configure('Dialog.TLabel', background='#2b2b2b', foreground='white')
-        dialog_style.configure('Dialog.TButton', background='#404040', foreground='white')
-        
-        main_frame = ttk.Frame(export_dialog, style='Dialog.TFrame')
-        main_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
-        
-        # Title
-        ttk.Label(main_frame, text="Video Export Options", 
-                  font=('Arial', 14, 'bold'), style='Dialog.TLabel').pack(pady=(0, 20))
-        
-        # Export type selection
-        export_type_var = tk.StringVar(value="overlay")
-        
-        ttk.Label(main_frame, text="Export Type:", font=('Arial', 10, 'bold'), 
-                 style='Dialog.TLabel').pack(anchor=tk.W, pady=(0, 5))
-        
-        type_frame = ttk.Frame(main_frame, style='Dialog.TFrame')
-        type_frame.pack(fill=tk.X, pady=(0, 15))
-        
-        ttk.Radiobutton(type_frame, text="Original with mask overlay", 
-                       variable=export_type_var, value="overlay").pack(anchor=tk.W, pady=2)
-        ttk.Radiobutton(type_frame, text="Mask only (black background)", 
-                       variable=export_type_var, value="mask_only").pack(anchor=tk.W, pady=2)
-        ttk.Radiobutton(type_frame, text="Segmented object only", 
-                       variable=export_type_var, value="object_only").pack(anchor=tk.W, pady=2)
-        ttk.Radiobutton(type_frame, text="Side-by-side comparison", 
-                       variable=export_type_var, value="side_by_side").pack(anchor=tk.W, pady=2)
-        
-        # FPS setting
-        ttk.Label(main_frame, text="Video Quality:", font=('Arial', 10, 'bold'), 
-                 style='Dialog.TLabel').pack(anchor=tk.W, pady=(10, 5))
-        
-        quality_frame = ttk.Frame(main_frame, style='Dialog.TFrame')
-        quality_frame.pack(fill=tk.X, pady=(0, 15))
-        
-        fps_var = tk.DoubleVar(value=30.0)
-        ttk.Label(quality_frame, text="FPS:", style='Dialog.TLabel').pack(side=tk.LEFT)
-        tk.Spinbox(quality_frame, from_=1, to=60, textvariable=fps_var, 
-                  width=8, bg='#404040', fg='white', insertbackground='white').pack(side=tk.LEFT, padx=(5, 0))
-        
-        # Overlay transparency
-        ttk.Label(main_frame, text="Overlay Settings:", font=('Arial', 10, 'bold'), 
-                 style='Dialog.TLabel').pack(anchor=tk.W, pady=(10, 5))
-        
-        overlay_frame = ttk.Frame(main_frame, style='Dialog.TFrame')
-        overlay_frame.pack(fill=tk.X, pady=(0, 15))
-        
-        overlay_alpha_var = tk.DoubleVar(value=0.4)
-        ttk.Label(overlay_frame, text="Transparency:", style='Dialog.TLabel').pack(anchor=tk.W)
-        ttk.Scale(overlay_frame, from_=0.1, to=0.8, variable=overlay_alpha_var, 
-                 orient=tk.HORIZONTAL).pack(fill=tk.X, pady=5)
-        
-        # Object selection
-        ttk.Label(main_frame, text="Objects to Export:", font=('Arial', 10, 'bold'), 
-                 style='Dialog.TLabel').pack(anchor=tk.W, pady=(10, 5))
-        
-        objects_container = ttk.Frame(main_frame, style='Dialog.TFrame')
-        objects_container.pack(fill=tk.X, pady=(0, 20))
-        
-        # Get unique objects from masks
-        unique_objects = set()
-        for frame_masks in self.masks.values():
-            unique_objects.update(frame_masks.keys())
-        unique_objects = sorted(list(unique_objects))
-        
-        export_objects_vars = {}
-        if unique_objects:
-            for obj_id in unique_objects:
-                export_objects_vars[obj_id] = tk.BooleanVar(value=True)
-                color_hex = self._rgb_to_hex(self.object_colors.get(obj_id, [255, 255, 255]))
-                
-                obj_frame = ttk.Frame(objects_container, style='Dialog.TFrame')
-                obj_frame.pack(anchor=tk.W, pady=1)
-                
-                ttk.Checkbutton(obj_frame, text=f"Object {obj_id}", 
-                              variable=export_objects_vars[obj_id]).pack(side=tk.LEFT)
-                
-                ttk.Label(obj_frame, text="●", foreground=color_hex, 
-                         font=('Arial', 12), style='Dialog.TLabel').pack(side=tk.LEFT, padx=(5, 0))
-        
-        # Buttons
-        button_frame = ttk.Frame(main_frame, style='Dialog.TFrame')
-        button_frame.pack(fill=tk.X, pady=(20, 0))
-        
-        def start_export():
-            selected_objects = [obj_id for obj_id, var in export_objects_vars.items() if var.get()]
-            if not selected_objects and export_objects_vars:
-                messagebox.showwarning("Warning", "Please select at least one object to export.")
-                return
-            
-            export_dialog.destroy()
-            self._export_video_with_options(
-                export_type_var.get(),
-                fps_var.get(),
-                overlay_alpha_var.get(),
-                selected_objects if export_objects_vars else []
-            )
-        
-        ttk.Button(button_frame, text="Cancel", command=export_dialog.destroy, 
-                  width=12).pack(side=tk.RIGHT, padx=(5, 0))
-        ttk.Button(button_frame, text="Export Video", command=start_export, 
-                  width=15).pack(side=tk.RIGHT, padx=(5, 5))
-    
-    def _export_video_with_options(self, export_type, fps, overlay_alpha, selected_objects):
-        """Export video with specified options"""
-        output_path = filedialog.asksaveasfilename(
-            title="Save Video As",
-            defaultextension=".mp4",
-            filetypes=[
-                ("MP4 files", "*.mp4"),
-                ("AVI files", "*.avi"),
-                ("MOV files", "*.mov"),
-                ("All files", "*.*")
-            ]
-        )
-        
-        if not output_path:
-            return
-
-        # Check if video file already exists
-        if os.path.exists(output_path):
-            response = messagebox.askokcancel(
-                "File Exists",
-                f"Video file already exists:\n{os.path.basename(output_path)}\n\n"
-                "Click OK to overwrite or Cancel to abort.",
-                icon='warning'
-            )
-            if not response:
-                return
-
-        try:
-            self.status_label.config(text="Preparing video export...")
-            self.progress_bar.pack(fill=tk.X, pady=(5, 0))
-            self.progress_var.set(0)
-            self.root.update()
-            
-            # Get dimensions
-            height, width = self.frames[0].shape[:2]
-            
-            if export_type == "side_by_side":
-                output_width = width * 2
-                output_height = height
-            else:
-                output_width = width
-                output_height = height
-            
-            # Initialize video writer
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            out = cv2.VideoWriter(output_path, fourcc, fps, (output_width, output_height))
-            
-            if not out.isOpened():
-                raise ValueError("Could not open video writer. Try a different format.")
-            
-            total_frames = len(self.frames)
-            
-            for frame_idx, frame in enumerate(self.frames):
-                # Get masks for selected objects
-                masks_dict = {}
-                if frame_idx in self.masks:
-                    for obj_id in self.masks[frame_idx].keys():
-                        if obj_id in selected_objects:
-                            # Load mask from disk (memory optimization)
-                            mask = self._load_mask(frame_idx, obj_id)
-                            if mask is not None:
-                                masks_dict[obj_id] = mask
-                
-                # Create output frame based on type
-                if export_type == "overlay":
-                    output_frame = frame.copy()
-                    for obj_id, mask in masks_dict.items():
-                        color = self.object_colors.get(obj_id, [255, 255, 255])
-                        colored_mask = np.zeros_like(frame)
-                        colored_mask[mask > 0] = color
-                        output_frame = cv2.addWeighted(output_frame, 1, colored_mask, overlay_alpha, 0)
-                        
-                elif export_type == "mask_only":
-                    output_frame = np.zeros_like(frame)
-                    for obj_id, mask in masks_dict.items():
-                        color = self.object_colors.get(obj_id, [255, 255, 255])
-                        output_frame[mask > 0] = color
-                        
-                elif export_type == "object_only":
-                    output_frame = np.zeros_like(frame)
-                    for obj_id, mask in masks_dict.items():
-                        output_frame[mask > 0] = frame[mask > 0]
-                        
-                elif export_type == "side_by_side":
-                    left = frame.copy()
-                    for obj_id, mask in masks_dict.items():
-                        color = self.object_colors.get(obj_id, [255, 255, 255])
-                        colored_mask = np.zeros_like(frame)
-                        colored_mask[mask > 0] = color
-                        left = cv2.addWeighted(left, 1, colored_mask, overlay_alpha, 0)
-                    output_frame = np.hstack([left, frame])
-                else:
-                    output_frame = frame.copy()
-                
-                # Convert RGB to BGR for OpenCV
-                output_frame_bgr = cv2.cvtColor(output_frame, cv2.COLOR_RGB2BGR)
-                out.write(output_frame_bgr)
-                
-                # Update progress
-                progress = ((frame_idx + 1) / total_frames) * 100
-                self.progress_var.set(progress)
-                self.status_label.config(text=f"Exporting frame {frame_idx + 1}/{total_frames}")
-                self.root.update()
-            
-            out.release()
-            self.progress_bar.pack_forget()
-            self.status_label.config(text="Video export complete!")
-            
-            messagebox.showinfo("Export Complete", f"Video exported to:\n{output_path}")
-            
-        except Exception as e:
-            self.progress_bar.pack_forget()
-            self.status_label.config(text="Export failed")
-            messagebox.showerror("Export Error", f"Failed to export video: {str(e)}")
-
     def load_sam2_model(self):
         """Load SAM2 or SAM3 model with correct video predictor initialization"""
         try:

@@ -1060,7 +1060,7 @@ class SAM2Processor:
         print(f"OK: Verified {verified_count} mask files in {masks_dir}")
         return verified_count
 
-    def export_metadata(self, annotations_data, masks_by_frame, output_dir, num_frames=None, video_path=None):
+    def export_metadata(self, annotations_data, masks_by_frame, output_dir, num_frames=None, video_path=None, overlay_opacity=0.4):
         """Export processing metadata with file paths"""
         print("Exporting metadata...")
 
@@ -1075,7 +1075,8 @@ class SAM2Processor:
                 "objects_detected": list(set(
                     obj_id for masks in masks_by_frame.values()
                     for obj_id in masks.keys()
-                ))
+                )),
+                "overlay_opacity": overlay_opacity
             },
             "file_paths": {
                 "original_video_path": str(Path(video_path).resolve()) if video_path else None,
@@ -1336,7 +1337,7 @@ Examples:
         )
 
         processor.export_metadata(annotations_data, masks_by_frame, output_dir, num_frames,
-                                video_path=args.video_file)
+                                video_path=args.video_file, overlay_opacity=args.opacity)
 
         print("\n" + "=" * 60)
         print("PROCESSING COMPLETE!")
