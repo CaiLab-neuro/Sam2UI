@@ -16,6 +16,7 @@ import csv
 import time
 import threading
 import re
+from collections import deque
 
 # Import utility functions
 from utils import (
@@ -204,10 +205,14 @@ class SAM2VideoUI:
         self.object_names = {}  # Maps obj_id to custom name
         self.object_colors = {}  # Dynamic color assignment
         self.point_removal_mode = False
-        
+
         # Multi-frame annotation mode (always enabled)
         self.multi_frame_annotation_mode = True
         self.annotated_frames = set()  # Track which frames have been annotated
+
+        # Undo/Redo functionality for annotation points
+        self.undo_stack = deque(maxlen=10)  # Store removed points for undo (max 10)
+        self.redo_stack = deque(maxlen=10)  # Store points for redo (max 10)
 
         # Mask flash animation state
         self.flash_in_progress = False
@@ -323,13 +328,20 @@ class SAM2VideoUI:
         """Configure ttk styles"""
         style = ttk.Style()
         style.theme_use('clam')
-        
+
         # Configure colors
         style.configure('TFrame', background='#2b2b2b')
         style.configure('TLabel', background='#2b2b2b', foreground='white')
         style.configure('TButton', background='#404040', foreground='white')
-        style.map('TButton', 
+        style.map('TButton',
                  background=[('active', '#505050'), ('pressed', '#303030')])
+
+        # Highlighted button styles for selected zoom/speed
+        style.configure('Selected.TButton', background='#00AA88', foreground='white',
+                       font=('TkDefaultFont', 9, 'bold'))
+        style.map('Selected.TButton',
+                 background=[('active', '#00CC99'), ('pressed', '#008866')],
+                 foreground=[('active', 'white'), ('pressed', 'white')])
         
     def setup_ui(self):
         main_container = ttk.Frame(self.root)
@@ -487,8 +499,8 @@ class SAM2VideoUI:
         point_mgmt_frame = ttk.Frame(obj_frame)
         point_mgmt_frame.pack(fill=tk.X, pady=2)
 
-        self.remove_point_button = tk.Button(point_mgmt_frame, text="Remove Point",
-                  command=self.toggle_point_removal_mode, width=12,
+        self.remove_point_button = tk.Button(point_mgmt_frame, text="Remove Point (R)",
+                  command=self.toggle_point_removal_mode, width=14,
                   bg='#404040', fg='white', activebackground='#505050')
         self.remove_point_button.pack(side=tk.LEFT, padx=(0, 5))
 
@@ -664,8 +676,28 @@ class SAM2VideoUI:
         self.canvas.bind("<Button-3>", self.on_canvas_right_click)
         self.canvas.bind("<Configure>", self.on_canvas_resize)
 
-        # Keyboard shortcuts
+        # Keyboard shortcuts - cross-platform support
         self.root.bind('f', lambda e: self.flash_selected_object_mask())
+
+        # Undo: Ctrl+Z (Windows/Linux) or Cmd+Z (Mac)
+        self.root.bind('<Control-z>', self.undo_last_point)
+        self.root.bind('<Command-z>', self.undo_last_point)  # Mac support
+
+        # Redo: Ctrl+Y (Windows/Linux) or Cmd+Shift+Z (Mac primary) or Cmd+Y (Mac alternative)
+        self.root.bind('<Control-y>', self.redo_last_point)
+        self.root.bind('<Command-Shift-z>', self.redo_last_point)  # Mac primary
+        self.root.bind('<Command-y>', self.redo_last_point)  # Mac alternative
+
+        # Frame navigation: Left/Right arrows
+        self.root.bind('<Left>', lambda e: self.prev_frame())
+        self.root.bind('<Right>', lambda e: self.next_frame())
+
+        # Object navigation: Up/Down arrows
+        self.root.bind('<Up>', lambda e: self.prev_object())
+        self.root.bind('<Down>', lambda e: self.next_object())
+
+        # Toggle point removal mode: R key
+        self.root.bind('r', lambda e: self.toggle_point_removal_mode())
 
         # Video controls
         controls_frame = ttk.Frame(parent)
@@ -730,11 +762,17 @@ class SAM2VideoUI:
         )
         self.zoom_buttons[1].pack(side=tk.LEFT, padx=2)
 
-        self.zoom_buttons[10] = ttk.Button(
-            zoom_frame, text="10x",
-            command=lambda: self.set_slider_zoom(10), width=6
+        self.zoom_buttons[5] = ttk.Button(
+            zoom_frame, text="5x",
+            command=lambda: self.set_slider_zoom(5), width=6
         )
-        self.zoom_buttons[10].pack(side=tk.LEFT, padx=2)
+        self.zoom_buttons[5].pack(side=tk.LEFT, padx=2)
+
+        self.zoom_buttons[20] = ttk.Button(
+            zoom_frame, text="20x",
+            command=lambda: self.set_slider_zoom(20), width=6
+        )
+        self.zoom_buttons[20].pack(side=tk.LEFT, padx=2)
 
         self.zoom_buttons[100] = ttk.Button(
             zoom_frame, text="100x",
@@ -742,11 +780,11 @@ class SAM2VideoUI:
         )
         self.zoom_buttons[100].pack(side=tk.LEFT, padx=2)
 
-        self.zoom_buttons[1000] = ttk.Button(
-            zoom_frame, text="1000x",
-            command=lambda: self.set_slider_zoom(1000), width=6
+        self.zoom_buttons[500] = ttk.Button(
+            zoom_frame, text="500x",
+            command=lambda: self.set_slider_zoom(500), width=6
         )
-        self.zoom_buttons[1000].pack(side=tk.LEFT, padx=2)
+        self.zoom_buttons[500].pack(side=tk.LEFT, padx=2)
 
         self.zoom_info_label = ttk.Label(
             zoom_frame, text="(Full range)", foreground='gray'
@@ -883,9 +921,14 @@ class SAM2VideoUI:
                 self.object_name_var.set(self.object_names[self.current_object_id])
 
                 custom_count = self._count_custom_objects()
+
+                # Clear undo/redo history when importing (new data, no history)
+                self.undo_stack.clear()
+                self.redo_stack.clear()
+
                 messagebox.showinfo("Import Complete",
                                   f"Successfully imported {custom_count} custom objects ({imported_count} available)")
-                                  
+
         except Exception as e:
             messagebox.showerror("Import Error", f"Failed to import object list: {str(e)}")
             
@@ -1118,8 +1161,12 @@ class SAM2VideoUI:
             message += f"\nTotal annotations: {len(self.click_points)}\n" \
                     f"Objects: {custom_count} custom ({total_objects} total)"
 
+            # Clear undo/redo history when importing (new data, no history)
+            self.undo_stack.clear()
+            self.redo_stack.clear()
+
             messagebox.showinfo("Import Complete", message)
-            
+
         except Exception as e:
             messagebox.showerror("Import Error", f"Failed to import annotations: {str(e)}")
 
@@ -1246,6 +1293,10 @@ class SAM2VideoUI:
 
             # Enable Refine button if model is loaded
             self._update_refine_button_state()
+
+            # Clear undo/redo history when importing (new data, no history)
+            self.undo_stack.clear()
+            self.redo_stack.clear()
 
             messagebox.showinfo("Success",
                               f"Loaded segmentation results successfully!\n\n"
@@ -1400,6 +1451,123 @@ class SAM2VideoUI:
         # Start flashing
         flash_step()
 
+    def undo_last_point(self, event=None):
+        """Undo the most recent annotation operation (add or remove)"""
+        if not self.undo_stack:
+            self.status_label.config(text="No operations to undo")
+            return
+
+        # Get last operation
+        operation = self.undo_stack.pop()
+        action = operation['action']
+        point = operation['point']
+        x, y, is_positive, obj_id, frame_idx = point
+
+        if action == 'add':
+            # Undo addition: remove from end (LIFO)
+            if not self.click_points or self.click_points[-1] != point:
+                # Edge case: point not at end (shouldn't happen normally)
+                try:
+                    self.click_points.remove(point)
+                except ValueError:
+                    self.status_label.config(text="Cannot undo: point not found")
+                    return
+            else:
+                self.click_points.pop()
+
+            status_prefix = "Undid addition of"
+
+            # Update annotated frames if frame now empty
+            remaining_points_on_frame = [p for p in self.click_points if p[4] == frame_idx]
+            if not remaining_points_on_frame:
+                self.annotated_frames.discard(frame_idx)
+
+        elif action == 'remove':
+            # Undo removal: restore point at original index
+            index = operation['index']
+            self.click_points.insert(index, point)
+            self.annotated_frames.add(frame_idx)
+            status_prefix = "Undid removal of"
+
+        # Add operation to redo stack
+        self.redo_stack.append(operation)
+
+        # Switch to the object that the point belonged to
+        self.current_object_id = obj_id
+        self.object_var.set(obj_id)
+        self.object_name_var.set(self.object_names.get(obj_id, f"Object_{obj_id}"))
+        self.update_object_color_display()
+
+        # Jump to the frame where the point was
+        self.current_frame_idx = frame_idx
+        self.frame_var.set(frame_idx)
+
+        # Update UI
+        self.update_object_list()
+        self.update_points_display()
+        self.display_current_frame()
+
+        # Show status
+        point_type = "positive" if is_positive else "negative"
+        obj_name = self.object_names.get(obj_id, f"Object_{obj_id}")
+        self.status_label.config(text=f"{status_prefix} {point_type} point for {obj_name} at frame {frame_idx + 1}")
+
+    def redo_last_point(self, event=None):
+        """Redo the last undone operation (add or remove)"""
+        if not self.redo_stack:
+            self.status_label.config(text="No operations to redo")
+            return
+
+        # Get operation from redo stack
+        operation = self.redo_stack.pop()
+        action = operation['action']
+        point = operation['point']
+        x, y, is_positive, obj_id, frame_idx = point
+
+        if action == 'add':
+            # Redo addition: append to end
+            self.click_points.append(point)
+            self.annotated_frames.add(frame_idx)
+            status_prefix = "Redid addition of"
+
+        elif action == 'remove':
+            # Redo removal: find and remove point
+            try:
+                self.click_points.remove(point)
+            except ValueError:
+                self.status_label.config(text="Cannot redo: point not found")
+                return
+
+            status_prefix = "Redid removal of"
+
+            # Update annotated frames if frame now empty
+            remaining_points_on_frame = [p for p in self.click_points if p[4] == frame_idx]
+            if not remaining_points_on_frame:
+                self.annotated_frames.discard(frame_idx)
+
+        # Add operation back to undo stack
+        self.undo_stack.append(operation)
+
+        # Switch to the object that the point belongs to
+        self.current_object_id = obj_id
+        self.object_var.set(obj_id)
+        self.object_name_var.set(self.object_names.get(obj_id, f"Object_{obj_id}"))
+        self.update_object_color_display()
+
+        # Jump to the frame where the point is
+        self.current_frame_idx = frame_idx
+        self.frame_var.set(frame_idx)
+
+        # Update UI
+        self.update_object_list()
+        self.update_points_display()
+        self.display_current_frame()
+
+        # Show status
+        point_type = "positive" if is_positive else "negative"
+        obj_name = self.object_names.get(obj_id, f"Object_{obj_id}")
+        self.status_label.config(text=f"{status_prefix} {point_type} point for {obj_name} at frame {frame_idx + 1}")
+
     def _handle_annotation_frame_mismatch(self, annotation_data):
         """Handle frame count mismatch between saved annotations and current video"""
         dialog = tk.Toplevel(self.root)
@@ -1551,21 +1719,30 @@ class SAM2VideoUI:
         if closest_point_idx is not None and min_distance <= 20:
             removed_point = self.click_points.pop(closest_point_idx)
             px, py, is_pos, obj_id, f_idx = removed_point
-            
+
+            # Store removal operation for undo
+            operation = {
+                'action': 'remove',
+                'point': removed_point,
+                'index': closest_point_idx  # Original position in list
+            }
+            self.undo_stack.append(operation)
+            self.redo_stack.clear()
+
             # Update annotated frames if no more points on this frame
             remaining_points_on_frame = [p for p in self.click_points if p[4] == frame_idx]
             if not remaining_points_on_frame:
                 self.annotated_frames.discard(frame_idx)
-            
+
             # Update object list and display
             self.update_object_list()
             self.display_current_frame()
-            
+
             # Show confirmation (using ORIGINAL coordinates in the message)
             point_type = "positive" if is_pos else "negative"
             obj_name = self.object_names.get(obj_id, f"Object_{obj_id}")
             self.status_label.config(text=f"Removed {point_type} point for {obj_name} at ({px:.0f}, {py:.0f})")
-            
+
             return True
 
         return False
@@ -1586,6 +1763,18 @@ class SAM2VideoUI:
             self.update_object_list()
             if self.frames:
                 self.display_current_frame()
+
+    def prev_object(self):
+        """Go to previous object in the list"""
+        if self.current_object_id > 1:
+            self.object_var.set(self.current_object_id - 1)
+            self.on_object_change()  # Explicitly trigger the update
+
+    def next_object(self):
+        """Go to next object in the list"""
+        if self.current_object_id < self.max_total_objects:
+            self.object_var.set(self.current_object_id + 1)
+            self.on_object_change()  # Explicitly trigger the update
 
     def update_object_color_display(self):
         """Update the color indicator for the current object"""
@@ -2677,6 +2866,14 @@ class SAM2VideoUI:
             # Ensure coordinates are within current frame bounds
             img_height, img_width = self.current_frame.shape[:2]
             if 0 <= img_x < img_width and 0 <= img_y < img_height:
+                # Store addition operation for undo
+                operation = {
+                    'action': 'add',
+                    'point': (img_x, img_y, is_positive, self.current_object_id, self.current_frame_idx)
+                }
+                self.undo_stack.append(operation)
+                self.redo_stack.clear()
+
                 # Store frame-aware point
                 self.click_points.append((img_x, img_y, is_positive,
                                         self.current_object_id, self.current_frame_idx))
@@ -2722,11 +2919,15 @@ class SAM2VideoUI:
         """Clear all click points for the current object only"""
         # Filter out points for current object
         self.click_points = [p for p in self.click_points if p[3] != self.current_object_id]
-        
+
         # Update annotated frames set - remove frames that no longer have any points
         remaining_frames = {p[4] for p in self.click_points}
         self.annotated_frames = self.annotated_frames.intersection(remaining_frames)
-        
+
+        # Clear undo/redo history (bulk operation, not individually undoable)
+        self.undo_stack.clear()
+        self.redo_stack.clear()
+
         self.update_points_display()
         self.update_object_list()
         if self.frames:
@@ -2758,19 +2959,23 @@ class SAM2VideoUI:
             self.display_current_frame()
             
     def prev_frame(self):
-        """Go to previous frame"""
+        """Go to previous frame (or jump by zoom level)"""
         if self.frames and self.current_frame_idx > 0:
             # Reset flash state when changing frames
             self._reset_flash_state()
-            self.current_frame_idx -= 1
+            # Jump by the selected zoom level
+            jump_size = self.slider_zoom_level.get()
+            self.current_frame_idx = max(0, self.current_frame_idx - jump_size)
             self.display_current_frame()
 
     def next_frame(self):
-        """Go to next frame"""
+        """Go to next frame (or jump by zoom level)"""
         if self.frames and self.current_frame_idx < len(self.frames) - 1:
             # Reset flash state when changing frames
             self._reset_flash_state()
-            self.current_frame_idx += 1
+            # Jump by the selected zoom level
+            jump_size = self.slider_zoom_level.get()
+            self.current_frame_idx = min(len(self.frames) - 1, self.current_frame_idx + jump_size)
             self.display_current_frame()
 
     def _start_continuous_nav(self, direction):
@@ -2940,23 +3145,23 @@ class SAM2VideoUI:
         self._update_speed_button_highlight()
 
     def _update_zoom_button_highlight(self):
-        """Update zoom button styling to show current selection using ttk state"""
+        """Update zoom button styling to show current selection with prominent colors"""
         current_zoom = self.slider_zoom_level.get()
         for level, button in self.zoom_buttons.items():
             if level == current_zoom:
-                button.state(['pressed'])      # Makes it look sunken/selected
+                button.configure(style='Selected.TButton')  # Bright teal/green background
             else:
-                button.state(['!pressed'])     # Returns to normal appearance
+                button.configure(style='TButton')  # Normal dark gray background
 
 
     def _update_speed_button_highlight(self):
-        """Update speed button styling to show current selection using ttk state"""
+        """Update speed button styling to show current selection with prominent colors"""
         current_speed = self.playback_speed.get()
         for speed, button in self.speed_buttons.items():
             if speed == current_speed:
-                button.state(['pressed'])      # Selected → looks pressed/sunken
+                button.configure(style='Selected.TButton')  # Bright teal/green background
             else:
-                button.state(['!pressed'])     # Not selected → normal look
+                button.configure(style='TButton')  # Normal dark gray background
 
     def on_slider_change(self, value):
         """Handle frame slider change"""
