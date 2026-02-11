@@ -2708,14 +2708,12 @@ class SAM2VideoUI:
                 obj_color = self.object_colors.get(obj_id, [255, 255, 255])
                 color = tuple(obj_color) if is_positive else (255, 0, 0)
 
-                # Draw circle
-                cv2.circle(display_frame, (int(x), int(y)), 8, color, -1)
-                cv2.circle(display_frame, (int(x), int(y)), 10, (255, 255, 255), 2)
+                # Draw unfilled circle in object color
+                cv2.circle(display_frame, (int(x), int(y)), 7, color, 2)
 
-                # Draw symbol using lines instead of text for perfect alignment
-                line_length = 6
+                # Draw symbol using lines in object color
+                line_length = 5
                 line_thickness = 2
-                white = (255, 255, 255)
 
                 if is_positive:
                     # Draw + (vertical and horizontal lines)
@@ -2723,18 +2721,18 @@ class SAM2VideoUI:
                     cv2.line(display_frame,
                             (int(x), int(y - line_length)),
                             (int(x), int(y + line_length)),
-                            white, line_thickness)
+                            color, line_thickness)
                     # Horizontal line
                     cv2.line(display_frame,
                             (int(x - line_length), int(y)),
                             (int(x + line_length), int(y)),
-                            white, line_thickness)
+                            color, line_thickness)
                 else:
                     # Draw - (horizontal line only)
                     cv2.line(display_frame,
                             (int(x - line_length), int(y)),
                             (int(x + line_length), int(y)),
-                            white, line_thickness)
+                            color, line_thickness)
                 
                 # Draw object name
                 obj_name = self.object_names.get(obj_id, f"Obj{obj_id}")[:8]
@@ -2851,7 +2849,7 @@ class SAM2VideoUI:
             self._update_quality_visualizations()
 
     def on_mouse_wheel(self, event):
-        """Handle mouse wheel: frame navigation (no Ctrl) or zoom (with Ctrl/Command)"""
+        """Handle mouse wheel: frame navigation, annotated frame jump, or zoom"""
         if not self.frames:
             return
 
@@ -2861,15 +2859,28 @@ class SAM2VideoUI:
         else:  # Scroll up (event.num == 4 or event.delta > 0)
             delta = 1
 
-        # Check if Ctrl (Windows/Linux) or Command (Mac) is pressed
-        ctrl_pressed = (event.state & 0x4) != 0    # Control key
-        cmd_pressed = (event.state & 0x8) != 0     # Command key (Mac)
+        # Check modifier keys (use both event.state bits and hasattr for robustness)
+        # Control key detection (Ctrl on Windows/Linux, Control on Mac)
+        ctrl_pressed = (event.state & 0x4) != 0
+
+        # Command key detection (Mac) - try multiple methods
+        # On Mac, Command might be 0x8, 0x10, or available via other means
+        cmd_pressed = (event.state & 0x10) != 0  # More reliable for Mac Command
+
+        # Shift key detection
+        shift_pressed = (event.state & 0x1) != 0
 
         if ctrl_pressed or cmd_pressed:
             # Zoom mode: zoom in/out centered on cursor
             self._handle_zoom(event, delta)
+        elif shift_pressed:
+            # Annotated frame navigation mode
+            if delta > 0:
+                self.jump_to_prev_annotated_frame()
+            else:
+                self.jump_to_next_annotated_frame()
         else:
-            # Frame navigation mode: prev/next frame (respecting slider zoom)
+            # Normal frame navigation mode: prev/next frame (respecting slider zoom)
             if delta > 0:
                 self.prev_frame()
             else:
