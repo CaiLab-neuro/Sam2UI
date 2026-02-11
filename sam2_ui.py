@@ -192,6 +192,12 @@ class SAM2VideoUI:
         self.current_frame = None
         self.display_frame = None
         self.scale_factor = 1.0
+
+        # Display zoom (separate from fit-to-canvas scale)
+        self.display_zoom_level = 1.0  # 1.0 = fit to canvas, > 1.0 = zoomed in
+        self.zoom_center_img_x = 0.5  # Zoom center as fraction of image width (0.0-1.0)
+        self.zoom_center_img_y = 0.5  # Zoom center as fraction of image height (0.0-1.0)
+
         self.click_points = []  # Store click coordinates with object IDs
         self.masks = {}  # Store masks for each frame {frame_idx: {obj_id: mask}}
         self.has_segmentation = False  # Track if segmentation has been completed or loaded
@@ -676,6 +682,11 @@ class SAM2VideoUI:
         self.canvas.bind("<Button-3>", self.on_canvas_right_click)
         self.canvas.bind("<Configure>", self.on_canvas_resize)
 
+        # Mouse wheel: frame navigation (no Ctrl) or zoom (with Ctrl)
+        self.canvas.bind("<MouseWheel>", self.on_mouse_wheel)      # Windows/Mac
+        self.canvas.bind("<Button-4>", self.on_mouse_wheel)        # Linux scroll up
+        self.canvas.bind("<Button-5>", self.on_mouse_wheel)        # Linux scroll down
+
         # Keyboard shortcuts - cross-platform support
         self.root.bind('f', lambda e: self.flash_selected_object_mask())
 
@@ -826,6 +837,7 @@ class SAM2VideoUI:
         self.change_viz_canvas = tk.Canvas(viz_frame, height=15, bg='gray80')
         self.change_viz_canvas.pack(fill=tk.X, pady=(2, 5))
         self.change_viz_canvas.bind("<Button-1>", self._on_viz_canvas_click)
+        self.change_viz_canvas.bind("<Configure>", self._on_quality_viz_resize)
 
         # Background ratio visualization
         bg_label = ttk.Label(viz_frame, text="Background Ratio:")
@@ -834,6 +846,7 @@ class SAM2VideoUI:
         self.bg_viz_canvas = tk.Canvas(viz_frame, height=15, bg='gray80')
         self.bg_viz_canvas.pack(fill=tk.X, pady=(2, 0))
         self.bg_viz_canvas.bind("<Button-1>", self._on_viz_canvas_click)
+        self.bg_viz_canvas.bind("<Configure>", self._on_quality_viz_resize)
 
 
         # Info panel
@@ -1839,6 +1852,11 @@ class SAM2VideoUI:
             self.has_prerendered_masks = False
             self.original_video_path_for_resegment = None
 
+            # Reset display zoom when loading new video
+            self.display_zoom_level = 1.0
+            self.zoom_center_img_x = 0.5
+            self.zoom_center_img_y = 0.5
+
             self.load_video_frames()
         except Exception as e:
             messagebox.showerror("Error", f"Failed to load video: {str(e)}")
@@ -2725,32 +2743,45 @@ class SAM2VideoUI:
         
         # Convert to PIL and display
         pil_image = Image.fromarray(display_frame)
-        
-        # Scale image to fit canvas
+
+        # Scale image to fit canvas (with zoom support)
         canvas_width = self.canvas.winfo_width()
         canvas_height = self.canvas.winfo_height()
-        
+
         if canvas_width > 1 and canvas_height > 1:
             img_width, img_height = pil_image.size
-            
-            # Calculate scale to fit canvas while maintaining aspect ratio
+
+            # Calculate base scale to fit canvas while maintaining aspect ratio
             scale_w = (canvas_width - 20) / img_width
             scale_h = (canvas_height - 20) / img_height
-            self.scale_factor = min(scale_w, scale_h)  # Allow upscaling when window enlarged
-            
+            base_scale = min(scale_w, scale_h)
+
+            # Apply display zoom
+            self.scale_factor = base_scale * self.display_zoom_level
+
             new_width = int(img_width * self.scale_factor)
             new_height = int(img_height * self.scale_factor)
-            
+
             pil_image = pil_image.resize((new_width, new_height), Image.Resampling.LANCZOS)
-        
+
         # Convert to PhotoImage and display
         self.display_frame = ImageTk.PhotoImage(pil_image)
         self.canvas.delete("all")
-        
-        # Center the image on canvas
-        canvas_center_x = canvas_width // 2
-        canvas_center_y = canvas_height // 2
-        self.canvas.create_image(canvas_center_x, canvas_center_y, image=self.display_frame)
+
+        # Position image: center if not zoomed, otherwise keep zoom center at canvas center
+        if self.display_zoom_level <= 1.0:
+            # Center the image on canvas (normal mode)
+            canvas_center_x = canvas_width // 2
+            canvas_center_y = canvas_height // 2
+            self.canvas.create_image(canvas_center_x, canvas_center_y, image=self.display_frame)
+        else:
+            # Position image so zoom center point stays at canvas center (zoomed mode)
+            # The zoom center (as fraction of image) should be at canvas center
+            img_pos_x = canvas_width // 2 - int(self.zoom_center_img_x * new_width)
+            img_pos_y = canvas_height // 2 - int(self.zoom_center_img_y * new_height)
+
+            # Create image at calculated position (using NW anchor for absolute positioning)
+            self.canvas.create_image(img_pos_x, img_pos_y, anchor=tk.NW, image=self.display_frame)
         
         # Update scroll region
         self.canvas.configure(scrollregion=self.canvas.bbox("all"))
@@ -2792,6 +2823,132 @@ class SAM2VideoUI:
         if self.frames:
             self.display_current_frame()
 
+    def _on_quality_viz_resize(self, event):
+        """Handle quality visualization canvas resize events with debouncing"""
+        # Only respond to actual width changes (height is fixed at 15)
+        canvas_width = event.widget.winfo_width()
+
+        # Check if width actually changed
+        if hasattr(self, '_last_quality_viz_width'):
+            if canvas_width == self._last_quality_viz_width:
+                return  # Width didn't change, ignore this event
+
+        self._last_quality_viz_width = canvas_width
+
+        # Cancel any pending resize callback
+        if hasattr(self, '_quality_viz_resize_after_id'):
+            self.root.after_cancel(self._quality_viz_resize_after_id)
+
+        # Schedule update after 100ms delay (debounce)
+        # This prevents excessive updates during active resizing
+        self._quality_viz_resize_after_id = self.root.after(100, self._handle_quality_viz_resize)
+
+    def _handle_quality_viz_resize(self):
+        """Actually handle the quality viz resize after debounce delay"""
+        # Invalidate cached backgrounds and trigger re-render
+        if hasattr(self, 'inter_frame_changes') and self.inter_frame_changes:
+            self.quality_bg_rendered = False
+            self._update_quality_visualizations()
+
+    def on_mouse_wheel(self, event):
+        """Handle mouse wheel: frame navigation (no Ctrl) or zoom (with Ctrl/Command)"""
+        if not self.frames:
+            return
+
+        # Detect scroll direction (cross-platform)
+        if event.num == 5 or event.delta < 0:  # Scroll down
+            delta = -1
+        else:  # Scroll up (event.num == 4 or event.delta > 0)
+            delta = 1
+
+        # Check if Ctrl (Windows/Linux) or Command (Mac) is pressed
+        ctrl_pressed = (event.state & 0x4) != 0    # Control key
+        cmd_pressed = (event.state & 0x8) != 0     # Command key (Mac)
+
+        if ctrl_pressed or cmd_pressed:
+            # Zoom mode: zoom in/out centered on cursor
+            self._handle_zoom(event, delta)
+        else:
+            # Frame navigation mode: prev/next frame (respecting slider zoom)
+            if delta > 0:
+                self.prev_frame()
+            else:
+                self.next_frame()
+
+    def _handle_zoom(self, event, delta):
+        """Handle zoom in/out centered on cursor position"""
+        if not self.frames or not self.current_frame:
+            return
+
+        # Get cursor position in canvas coordinates
+        canvas_x = event.x
+        canvas_y = event.y
+
+        # Get current canvas and image dimensions
+        canvas_width = self.canvas.winfo_width()
+        canvas_height = self.canvas.winfo_height()
+
+        if canvas_width <= 1 or canvas_height <= 1:
+            return
+
+        # Get current image dimensions
+        img_height, img_width = self.current_frame.shape[:2]
+
+        # Calculate base scale (fit to canvas)
+        scale_w = (canvas_width - 20) / img_width
+        scale_h = (canvas_height - 20) / img_height
+        base_scale = min(scale_w, scale_h)
+
+        # Convert cursor position to image coordinates (fraction 0.0-1.0)
+        # Current display dimensions
+        current_display_width = img_width * base_scale * self.display_zoom_level
+        current_display_height = img_height * base_scale * self.display_zoom_level
+
+        # Current image position (centered if zoom=1, or offset if zoomed)
+        if self.display_zoom_level <= 1.0:
+            # Centered
+            img_left = (canvas_width - current_display_width) / 2
+            img_top = (canvas_height - current_display_height) / 2
+        else:
+            # Positioned to keep zoom center fixed
+            img_left = canvas_width / 2 - self.zoom_center_img_x * current_display_width
+            img_top = canvas_height / 2 - self.zoom_center_img_y * current_display_height
+
+        # Calculate cursor position relative to image (fraction)
+        cursor_img_x = (canvas_x - img_left) / current_display_width
+        cursor_img_y = (canvas_y - img_top) / current_display_height
+
+        # Clamp to image bounds
+        cursor_img_x = max(0.0, min(1.0, cursor_img_x))
+        cursor_img_y = max(0.0, min(1.0, cursor_img_y))
+
+        # Calculate new zoom level
+        zoom_factor = 1.15  # 15% zoom per scroll step
+        if delta > 0:  # Zoom in
+            new_zoom = self.display_zoom_level * zoom_factor
+        else:  # Zoom out
+            new_zoom = self.display_zoom_level / zoom_factor
+
+        # Enforce zoom limits
+        max_zoom = 10.0  # Maximum 10x zoom
+        new_zoom = max(0.1, min(max_zoom, new_zoom))
+
+        # Auto-reset when zooming out to fit-or-smaller
+        if new_zoom <= 1.0:
+            self.display_zoom_level = 1.0
+            self.zoom_center_img_x = 0.5
+            self.zoom_center_img_y = 0.5
+            self.display_current_frame()
+            return
+
+        # Update zoom level and center
+        self.display_zoom_level = new_zoom
+        self.zoom_center_img_x = cursor_img_x
+        self.zoom_center_img_y = cursor_img_y
+
+        # Redraw with new zoom
+        self.display_current_frame()
+
     def on_canvas_click(self, event):
         """Handle left mouse click (positive point or point removal)"""
         if self.point_removal_mode:
@@ -2819,17 +2976,23 @@ class SAM2VideoUI:
         if self.scale_factor > 0:
             canvas_width = self.canvas.winfo_width()
             canvas_height = self.canvas.winfo_height()
-            
-            # Account for centering
+
+            # Calculate image position (account for zoom and centering)
             img_display_width = int(self.current_frame.shape[1] * self.scale_factor)
             img_display_height = int(self.current_frame.shape[0] * self.scale_factor)
-            
-            offset_x = (canvas_width - img_display_width) // 2
-            offset_y = (canvas_height - img_display_height) // 2
-            
+
+            if self.display_zoom_level <= 1.0:
+                # Centered positioning (normal mode)
+                offset_x = (canvas_width - img_display_width) // 2
+                offset_y = (canvas_height - img_display_height) // 2
+            else:
+                # Zoomed positioning (keep zoom center at canvas center)
+                offset_x = canvas_width // 2 - int(self.zoom_center_img_x * img_display_width)
+                offset_y = canvas_height // 2 - int(self.zoom_center_img_y * img_display_height)
+
             img_x = (canvas_x - offset_x) / self.scale_factor
             img_y = (canvas_y - offset_y) / self.scale_factor
-            
+
             # Check if click is within image bounds
             if 0 <= img_x < self.current_frame.shape[1] and 0 <= img_y < self.current_frame.shape[0]:
                 # Try to remove a point at this location
@@ -2851,18 +3014,24 @@ class SAM2VideoUI:
         if self.scale_factor > 0:
             canvas_width = self.canvas.winfo_width()
             canvas_height = self.canvas.winfo_height()
-            
-            # Account for centering
+
+            # Calculate image position (account for zoom and centering)
             img_display_width = int(self.current_frame.shape[1] * self.scale_factor)
             img_display_height = int(self.current_frame.shape[0] * self.scale_factor)
-            
-            offset_x = (canvas_width - img_display_width) // 2
-            offset_y = (canvas_height - img_display_height) // 2
-            
+
+            if self.display_zoom_level <= 1.0:
+                # Centered positioning (normal mode)
+                offset_x = (canvas_width - img_display_width) // 2
+                offset_y = (canvas_height - img_display_height) // 2
+            else:
+                # Zoomed positioning (keep zoom center at canvas center)
+                offset_x = canvas_width // 2 - int(self.zoom_center_img_x * img_display_width)
+                offset_y = canvas_height // 2 - int(self.zoom_center_img_y * img_display_height)
+
             # Convert to current frame coordinates
             img_x = (canvas_x - offset_x) / self.scale_factor
             img_y = (canvas_y - offset_y) / self.scale_factor
-            
+
             # Ensure coordinates are within current frame bounds
             img_height, img_width = self.current_frame.shape[:2]
             if 0 <= img_x < img_width and 0 <= img_y < img_height:
