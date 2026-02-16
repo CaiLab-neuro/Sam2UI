@@ -1030,3 +1030,182 @@ class nullcontext:
         return None
     def __exit__(self, *args):
         return False
+
+
+# =============================================================================
+# Single-Frame Segmentation (Image Predictors)
+# =============================================================================
+
+def load_sam2_image_predictor(sam2_video_predictor, device="cuda"):
+    """
+    Initialize SAM2ImagePredictor from a SAM2 video predictor.
+
+    Args:
+        sam2_video_predictor: SAM2VideoPredictor instance
+        device: Device to run on ('cuda' or 'cpu')
+
+    Returns:
+        SAM2ImagePredictor instance
+
+    Raises:
+        RuntimeError: If initialization fails
+    """
+    try:
+        from sam2.sam2_image_predictor import SAM2ImagePredictor
+
+        # Extract base model from video predictor
+        base_model = sam2_video_predictor.model if hasattr(sam2_video_predictor, 'model') else sam2_video_predictor
+
+        image_predictor = SAM2ImagePredictor(
+            sam_model=base_model,
+            mask_threshold=0.0,
+            max_hole_area=0.0,
+            max_sprinkle_area=0.0,
+        )
+
+        return image_predictor
+
+    except Exception as e:
+        raise RuntimeError(f"Failed to load SAM2 image predictor: {e}")
+
+
+def load_sam3_image_predictor(checkpoint_path=None, bpe_path=None, device="cuda"):
+    """
+    Initialize SAM3 image model and processor for single-frame segmentation.
+
+    Args:
+        checkpoint_path: Path to SAM3 checkpoint (optional, loads from HF if None)
+        bpe_path: Path to BPE tokenizer vocab file
+        device: Device to run on ('cuda' or 'cpu')
+
+    Returns:
+        Tuple of (Sam3Image model, Sam3Processor)
+
+    Raises:
+        RuntimeError: If initialization fails
+    """
+    try:
+        from sam3.model_builder import build_sam3_image_model
+        from sam3.model.sam3_image_processor import Sam3Processor
+
+        # Build SAM3 image model with instance interactivity enabled
+        model = build_sam3_image_model(
+            bpe_path=bpe_path,
+            device=device,
+            enable_inst_interactivity=True,  # Enable point-based prompting
+            checkpoint_path=checkpoint_path,
+            load_from_HF=checkpoint_path is None,  # Load from HuggingFace if no local checkpoint
+        )
+
+        processor = Sam3Processor(model, device=device)
+
+        return model, processor
+
+    except Exception as e:
+        raise RuntimeError(f"Failed to load SAM3 image predictor: {e}")
+
+
+def segment_frame_sam2(image_predictor, frame_rgb, frame_points):
+    """
+    Segment a single frame using SAM2ImagePredictor.
+
+    Args:
+        image_predictor: SAM2ImagePredictor instance
+        frame_rgb: Frame as RGB numpy array (H, W, 3)
+        frame_points: Dict[obj_id, (points_array, labels_array)]
+                     points_array: np.array([[x1,y1], [x2,y2], ...], dtype=float32)
+                     labels_array: np.array([1, 0, ...], dtype=int32)
+
+    Returns:
+        Dict[obj_id, mask_uint8] where mask_uint8 is (H, W) uint8 array
+
+    Raises:
+        RuntimeError: If segmentation fails
+    """
+    try:
+        # Set image and compute embeddings
+        image_predictor.set_image(frame_rgb)
+
+        # Segment each object separately
+        masks_by_obj = {}
+
+        for obj_id, (point_coords, point_labels) in frame_points.items():
+            # Predict mask
+            masks, scores, logits = image_predictor.predict(
+                point_coords=point_coords,
+                point_labels=point_labels,
+                multimask_output=len(point_coords) == 1,  # Multi-mask for single point
+                return_logits=False
+            )
+
+            # Select best mask (highest score)
+            if len(masks) > 1:
+                best_idx = np.argmax(scores)
+                mask = masks[best_idx]
+            else:
+                mask = masks[0]
+
+            # Convert boolean mask to uint8
+            mask_uint8 = (mask * 255).astype(np.uint8)
+
+            masks_by_obj[obj_id] = mask_uint8
+
+        return masks_by_obj
+
+    except Exception as e:
+        raise RuntimeError(f"SAM2 segmentation failed: {e}")
+
+
+def segment_frame_sam3(model, processor, frame_rgb, frame_points):
+    """
+    Segment a single frame using SAM3 image model.
+
+    Args:
+        model: Sam3Image model instance
+        processor: Sam3Processor instance
+        frame_rgb: Frame as RGB numpy array (H, W, 3)
+        frame_points: Dict[obj_id, (points_array, labels_array)]
+
+    Returns:
+        Dict[obj_id, mask_uint8] where mask_uint8 is (H, W) uint8 array
+
+    Raises:
+        RuntimeError: If segmentation fails
+    """
+    try:
+        from PIL import Image
+
+        # Convert to PIL Image (required by Sam3Processor)
+        pil_image = Image.fromarray(frame_rgb)
+
+        # Set image and get inference state
+        inference_state = processor.set_image(pil_image)
+
+        # Segment each object separately
+        masks_by_obj = {}
+
+        for obj_id, (point_coords, point_labels) in frame_points.items():
+            # Predict mask using SAM3's predict_inst method
+            masks, scores, logits = model.predict_inst(
+                inference_state,
+                point_coords=point_coords,
+                point_labels=point_labels,
+                multimask_output=len(point_coords) == 1,
+            )
+
+            # Select best mask (highest score)
+            if len(masks) > 1:
+                best_idx = np.argmax(scores)
+                mask = masks[best_idx]
+            else:
+                mask = masks[0]
+
+            # Convert boolean mask to uint8
+            mask_uint8 = (mask * 255).astype(np.uint8)
+
+            masks_by_obj[obj_id] = mask_uint8
+
+        return masks_by_obj
+
+    except Exception as e:
+        raise RuntimeError(f"SAM3 segmentation failed: {e}")

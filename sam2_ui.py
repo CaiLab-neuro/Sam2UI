@@ -306,6 +306,13 @@ class SAM2VideoUI:
         # Initialize default colors and names
         self._initialize_objects()
         
+        # Temporary single-frame segmentation (added for quick frame preview)
+        self.temp_masks = {}  # {frame_idx: {obj_id: mask_array}} - memory-only masks
+        self.temp_mask_frames = set()  # Track which frames have temp masks
+        self.sam2_image_predictor = None  # Lazy-loaded SAM2ImagePredictor (SAM2 only)
+        self.sam3_image_model = None  # Lazy-loaded SAM3 image model (SAM3 only)
+        self.sam3_processor = None  # Lazy-loaded Sam3Processor (SAM3 only)
+
         # SAM2 model
         self.sam2_model = None
         self.model_loaded = False
@@ -738,6 +745,10 @@ class SAM2VideoUI:
         ttk.Button(playback_frame, text="◄ Ann", command=self.jump_to_prev_annotated_frame).pack(side=tk.LEFT, padx=(10, 5))
         ttk.Button(playback_frame, text="Ann ►", command=self.jump_to_next_annotated_frame).pack(side=tk.LEFT, padx=(0, 5))
 
+        # Single-frame segmentation button
+        ttk.Button(playback_frame, text="Segment Frame",
+                   command=self.segment_current_frame_only).pack(side=tk.LEFT, padx=(10, 5))
+
         # Frame slider
         slider_frame = ttk.Frame(controls_frame)
         slider_frame.pack(fill=tk.X, pady=(0, 5))
@@ -1078,7 +1089,10 @@ class SAM2VideoUI:
             if not self.frames:
                 messagebox.showwarning("No Video", "Please load a video first before importing annotations.")
                 return
-            
+
+            # Clear temporary masks when importing new annotations
+            self._clear_temporary_masks()
+
             # ADDED: Check for coordinate system compatibility
             saved_metadata = annotation_data.get("video_metadata", {})
             # Check for frame count mismatch
@@ -1417,22 +1431,36 @@ class SAM2VideoUI:
             return
 
         # Try to load mask if not in memory or if it's a placeholder None value
-        # After propagation, self.masks contains placeholder None values that need to be loaded from disk
-        mask_exists = (self.current_frame_idx in self.masks and
-                      current_obj_id in self.masks.get(self.current_frame_idx, {}) and
-                      self.masks[self.current_frame_idx].get(current_obj_id) is not None)
+        # Check BOTH temporary and permanent masks
+        mask_exists = False
+        mask = None
+
+        # Priority 1: Check temporary masks (in-memory)
+        if (self.current_frame_idx in self.temp_masks and
+            current_obj_id in self.temp_masks.get(self.current_frame_idx, {})):
+            mask = self.temp_masks[self.current_frame_idx][current_obj_id]
+            mask_exists = (mask is not None)
+
+        # Priority 2: Check permanent masks
+        if not mask_exists:
+            mask_exists = (self.current_frame_idx in self.masks and
+                          current_obj_id in self.masks.get(self.current_frame_idx, {}) and
+                          self.masks[self.current_frame_idx].get(current_obj_id) is not None)
 
         if not mask_exists:
-            # Try loading from disk
-            mask = self._load_mask(self.current_frame_idx, current_obj_id)
-            if mask is None:
-                messagebox.showinfo("Info", "No mask found for selected object on current frame")
-                return
+            # Try loading from disk (for permanent masks only)
+            if self.current_frame_idx in self.masks:
+                mask = self._load_mask(self.current_frame_idx, current_obj_id)
+                if mask is not None:
+                    # Temporarily add to self.masks for flash animation
+                    if self.current_frame_idx not in self.masks:
+                        self.masks[self.current_frame_idx] = {}
+                    self.masks[self.current_frame_idx][current_obj_id] = mask
+                    mask_exists = True
 
-            # Temporarily add to self.masks for flash animation
-            if self.current_frame_idx not in self.masks:
-                self.masks[self.current_frame_idx] = {}
-            self.masks[self.current_frame_idx][current_obj_id] = mask
+        if not mask_exists:
+            messagebox.showinfo("Info", "No mask found for selected object on current frame")
+            return
 
         # Initialize flash state
         self.flash_in_progress = True
@@ -1851,6 +1879,9 @@ class SAM2VideoUI:
             self.segmented_video_displayed = False
             self.has_prerendered_masks = False
             self.original_video_path_for_resegment = None
+
+            # Clear temporary masks when loading new video
+            self._clear_temporary_masks()
 
             # Reset display zoom when loading new video
             self.display_zoom_level = 1.0
@@ -2609,7 +2640,20 @@ class SAM2VideoUI:
                          (0, 165, 255), 8)
         
         # Apply mask overlay if enabled and masks exist
-        if self.current_frame_idx in self.masks:
+        # Check for masks to display (temp masks have priority over permanent)
+        masks_to_display = None
+        use_disk_cache = False
+
+        if self.current_frame_idx in self.temp_masks:
+            # Use temporary masks (from single-frame segmentation)
+            masks_to_display = self.temp_masks[self.current_frame_idx]
+            use_disk_cache = False  # Temp masks are in memory
+        elif self.current_frame_idx in self.masks:
+            # Use permanent masks (from full video segmentation)
+            masks_to_display = self.masks[self.current_frame_idx]
+            use_disk_cache = not self.has_prerendered_masks
+
+        if masks_to_display:
             # OPTIMIZATION: If displaying pre-rendered segmented video, skip mask loading
             # The frames already have masks baked in from the segmented video
             if self.has_prerendered_masks:
@@ -2639,14 +2683,16 @@ class SAM2VideoUI:
                             display_frame = cv2.addWeighted(display_frame, 1-alpha, white_overlay, alpha, 0)
                 pass
             else:
-                # Original video mode: load masks from disk and overlay
-                frame_masks = self.masks[self.current_frame_idx]
-
+                # Original video mode: load masks from disk/memory and overlay
                 # Collect all mask data first (to avoid cumulative blending bug)
                 mask_data_list = []
-                for obj_id in frame_masks.keys():
-                    # Load mask from disk (memory optimization)
-                    mask = self._load_mask(self.current_frame_idx, obj_id)
+                for obj_id in masks_to_display.keys():
+                    # Load mask from disk OR memory depending on source
+                    if use_disk_cache:
+                        mask = self._load_mask(self.current_frame_idx, obj_id)
+                    else:
+                        # Temp masks are already in memory
+                        mask = masks_to_display[obj_id]
                     if mask is None:
                         continue
                     # If flash is in progress, only show the flashing object
@@ -4094,6 +4140,9 @@ class SAM2VideoUI:
                             f"Please reload the video with the same settings used when creating annotations, "
                             f"or create new annotations for the current video.")
             return
+
+        # Clear any temporary single-frame masks before full segmentation
+        self._clear_temporary_masks()
 
         # Ask for output directory for results
         initial_dir = os.path.dirname(self.last_export_dir) if self.last_export_dir else os.path.expanduser("~")
@@ -5808,6 +5857,197 @@ class SAM2VideoUI:
                 error_msg += "4. Try a different model from the dropdown"
 
             messagebox.showerror("Model Load Error", error_msg)
+
+    # =========================================================================
+    # Single-Frame Segmentation Methods
+    # =========================================================================
+
+    def _clear_temporary_masks(self):
+        """Clear all temporary single-frame segmentation masks."""
+        self.temp_masks.clear()
+        self.temp_mask_frames.clear()
+
+    def _load_sam2_image_predictor(self):
+        """
+        Lazily load SAM2ImagePredictor (cached in instance variable).
+
+        Returns:
+            SAM2ImagePredictor instance or None if failed
+        """
+        if self.sam2_image_predictor is not None:
+            return self.sam2_image_predictor
+
+        if not self.model_loaded or not self.sam2_model:
+            return None
+
+        try:
+            from segment import load_sam2_image_predictor
+
+            self.sam2_image_predictor = load_sam2_image_predictor(
+                self.sam2_model,
+                device=self.device
+            )
+
+            return self.sam2_image_predictor
+
+        except Exception as e:
+            print(f"Failed to load SAM2 image predictor: {e}")
+            traceback.print_exc()
+            return None
+
+    def _load_sam3_image_predictor(self):
+        """
+        Lazily load SAM3 image model and processor (cached in instance variables).
+
+        Returns:
+            Tuple of (model, processor) or (None, None) if failed
+        """
+        if self.sam3_image_model is not None and self.sam3_processor is not None:
+            return self.sam3_image_model, self.sam3_processor
+
+        if not self.model_loaded or not self.using_sam3:
+            return None, None
+
+        try:
+            from segment import load_sam3_image_predictor
+
+            # Get checkpoint path if available
+            checkpoint_path = getattr(self, 'sam3_checkpoint_path', None)
+
+            # BPE tokenizer path
+            bpe_path = os.path.join(get_project_root(), "sam_models/sam3/assets/bpe_simple_vocab_16e6.txt.gz")
+
+            self.sam3_image_model, self.sam3_processor = load_sam3_image_predictor(
+                checkpoint_path=checkpoint_path,
+                bpe_path=bpe_path,
+                device=self.device
+            )
+
+            return self.sam3_image_model, self.sam3_processor
+
+        except Exception as e:
+            print(f"Failed to load SAM3 image predictor: {e}")
+            traceback.print_exc()
+            return None, None
+
+    def _get_current_frame_points(self):
+        """
+        Extract annotation points for current frame from UI state.
+
+        Returns:
+            Dict[obj_id, (points_array, labels_array)] or None if no points
+        """
+        frame_points_by_obj = {}
+
+        for x, y, is_positive, obj_id, frame_idx in self.click_points:
+            if frame_idx != self.current_frame_idx:
+                continue
+
+            if obj_id not in frame_points_by_obj:
+                frame_points_by_obj[obj_id] = {'coords': [], 'labels': []}
+
+            frame_points_by_obj[obj_id]['coords'].append([x, y])
+            frame_points_by_obj[obj_id]['labels'].append(1 if is_positive else 0)
+
+        if not frame_points_by_obj:
+            return None
+
+        # Convert to numpy arrays
+        result = {}
+        for obj_id, data in frame_points_by_obj.items():
+            result[obj_id] = (
+                np.array(data['coords'], dtype=np.float32),
+                np.array(data['labels'], dtype=np.int32)
+            )
+
+        return result
+
+    def segment_current_frame_only(self):
+        """
+        Segment only the current frame using SAM2ImagePredictor or SAM3 image model.
+
+        Creates temporary in-memory masks that:
+        - Appear when viewing the frame
+        - Persist across frame navigation
+        - Are cleared when running full video segmentation
+        - Do NOT save to disk
+
+        NOTE: Results may differ from full video propagation due to lack of temporal context.
+        This is for quick annotation quality evaluation, not final mask generation.
+        """
+        # Validation checks
+        if not self.frames:
+            messagebox.showwarning("No Video", "Please load a video first")
+            return
+
+        if not self.model_loaded or not self.sam2_model:
+            messagebox.showwarning("No Model", "Please load a SAM model first")
+            return
+
+        # Get annotation points for current frame
+        frame_points = self._get_current_frame_points()
+        if not frame_points:
+            messagebox.showinfo("No Points",
+                f"No annotation points on frame {self.current_frame_idx + 1}.\n\n"
+                f"Please add annotation points first.")
+            return
+
+        try:
+            # Show appropriate status message (SAM3 first load may take 5-10s)
+            if self.using_sam3 and self.sam3_image_model is None:
+                self.status_label.config(text="Loading SAM3 image model (first time, may take 5-10s)...")
+            else:
+                self.status_label.config(text="Segmenting current frame...")
+            self.root.update()
+
+            # Get current frame (handle both lazy and eager loading)
+            if self.lazy_load_var.get() and hasattr(self, 'video_props'):
+                current_frame_bgr = self._load_frame_lazy(self.current_frame_idx)
+            else:
+                current_frame_bgr = self.frames[self.current_frame_idx]
+
+            if current_frame_bgr is None:
+                raise RuntimeError("Failed to load current frame")
+
+            # Convert BGR to RGB
+            current_frame_rgb = cv2.cvtColor(current_frame_bgr, cv2.COLOR_BGR2RGB)
+
+            # Branch based on model type
+            if self.using_sam3:
+                # SAM3: Load image predictor and segment
+                model, processor = self._load_sam3_image_predictor()
+                if model is None or processor is None:
+                    raise RuntimeError("Failed to initialize SAM3 image predictor")
+
+                from segment import segment_frame_sam3
+                temp_masks_this_frame = segment_frame_sam3(model, processor, current_frame_rgb, frame_points)
+            else:
+                # SAM2: Load image predictor and segment
+                image_predictor = self._load_sam2_image_predictor()
+                if image_predictor is None:
+                    raise RuntimeError("Failed to initialize SAM2 image predictor")
+
+                from segment import segment_frame_sam2
+                temp_masks_this_frame = segment_frame_sam2(image_predictor, current_frame_rgb, frame_points)
+
+            # Store temporary masks in memory
+            self.temp_masks[self.current_frame_idx] = temp_masks_this_frame
+            self.temp_mask_frames.add(self.current_frame_idx)
+
+            # Refresh display to show new masks
+            self.display_current_frame()
+
+            self.status_label.config(
+                text=f"Segmented frame {self.current_frame_idx + 1} "
+                     f"({len(temp_masks_this_frame)} object(s))"
+            )
+
+        except Exception as e:
+            messagebox.showerror("Segmentation Failed",
+                f"Failed to segment current frame:\n\n{str(e)}")
+            print(f"Error in segment_current_frame_only: {e}")
+            traceback.print_exc()
+            self.status_label.config(text="Segmentation failed")
 
     def _monitor_memory(self, frame_idx, total_frames):
         """Monitor and log GPU/RAM memory usage (every 100 frames)"""
