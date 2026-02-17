@@ -5914,8 +5914,8 @@ class SAM2VideoUI:
             # Get checkpoint path if available
             checkpoint_path = getattr(self, 'sam3_checkpoint_path', None)
 
-            # BPE tokenizer path
-            bpe_path = os.path.join(get_project_root(), "sam_models/sam3/assets/bpe_simple_vocab_16e6.txt.gz")
+            # BPE tokenizer path (note: sam3/sam3/assets - package is nested in repo)
+            bpe_path = os.path.join(get_project_root(), "sam_models/sam3/sam3/assets/bpe_simple_vocab_16e6.txt.gz")
 
             self.sam3_image_model, self.sam3_processor = load_sam3_image_predictor(
                 checkpoint_path=checkpoint_path,

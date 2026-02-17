@@ -382,24 +382,209 @@ def download_checkpoints(selected_models):
 
     return True
 
+def detect_environment_info():
+    """Detect current Python environment type and activation method"""
+    env_info = {
+        'type': 'system',  # 'conda', 'venv', 'uv', or 'system'
+        'python_path': sys.executable,
+        'conda_path': None,
+        'conda_env_name': None,
+        'venv_path': None,
+    }
+
+    # Check for conda
+    conda_prefix = os.environ.get('CONDA_PREFIX')
+    conda_default_env = os.environ.get('CONDA_DEFAULT_ENV')
+
+    if conda_prefix and conda_default_env:
+        env_info['type'] = 'conda'
+        env_info['conda_env_name'] = conda_default_env
+        # Find conda.sh or conda installation root
+        # CONDA_PREFIX points to the environment, go up to find conda installation
+        conda_exe = shutil.which('conda')
+        if conda_exe:
+            # Get conda base from conda info
+            try:
+                result = subprocess.run(
+                    ['conda', 'info', '--base'],
+                    capture_output=True, text=True, timeout=5
+                )
+                if result.returncode == 0:
+                    env_info['conda_path'] = result.stdout.strip()
+            except:
+                # Fallback: try to infer from CONDA_PREFIX
+                # Typically envs are in <conda_base>/envs/<env_name>
+                if '/envs/' in conda_prefix:
+                    env_info['conda_path'] = conda_prefix.split('/envs/')[0]
+                elif '\\envs\\' in conda_prefix:
+                    env_info['conda_path'] = conda_prefix.split('\\envs\\')[0]
+
+    # Check for venv (including uv-managed venvs)
+    elif hasattr(sys, 'real_prefix') or (hasattr(sys, 'base_prefix') and sys.base_prefix != sys.prefix):
+        # Check if it's uv-managed
+        if os.path.exists(os.path.join(sys.prefix, 'pyvenv.cfg')):
+            with open(os.path.join(sys.prefix, 'pyvenv.cfg'), 'r') as f:
+                content = f.read()
+                if 'uv' in content.lower():
+                    env_info['type'] = 'uv'
+                else:
+                    env_info['type'] = 'venv'
+        else:
+            env_info['type'] = 'venv'
+        env_info['venv_path'] = sys.prefix
+
+    return env_info
+
 def create_launcher():
-    """Create launcher script"""
+    """Create launcher script that activates the detected environment"""
     print("\nCreating launcher...")
-    
+
+    # Detect current environment
+    env_info = detect_environment_info()
+    print(f"Detected environment type: {env_info['type']}")
+    if env_info['type'] == 'conda':
+        print(f"  Conda base: {env_info['conda_path']}")
+        print(f"  Environment: {env_info['conda_env_name']}")
+    elif env_info['type'] in ['venv', 'uv']:
+        print(f"  Virtual environment: {env_info['venv_path']}")
+
     if platform.system() == "Windows":
-        launcher_content = """@echo off
+        # Generate Windows batch file
+        if env_info['type'] == 'conda':
+            launcher_content = f"""@echo off
 echo Starting SAM2 Video UI...
+echo.
+
+:: Activate conda environment (detected during setup)
+set CONDA_BASE={env_info['conda_path'] or 'NOT_DETECTED'}
+set CONDA_ENV={env_info['conda_env_name'] or 'sam'}
+
+if exist "%CONDA_BASE%\\Scripts\\activate.bat" (
+    echo Activating conda environment '%CONDA_ENV%' from %CONDA_BASE%...
+    call "%CONDA_BASE%\\Scripts\\activate.bat" %CONDA_ENV%
+    python sam2_ui.py
+    pause
+    exit /b
+)
+
+:: Fallback: try conda run
+where conda >nul 2>&1
+if %ERRORLEVEL% EQU 0 (
+    echo Using 'conda run' to launch with environment '%CONDA_ENV%'...
+    conda run -n %CONDA_ENV% python sam2_ui.py
+    pause
+    exit /b
+)
+
+:: Final fallback
+echo.
+echo WARNING: Could not activate conda environment '%CONDA_ENV%'
+echo Please activate manually with: conda activate %CONDA_ENV%
+echo.
+pause
 python sam2_ui.py
 pause
 """
+        elif env_info['type'] in ['venv', 'uv']:
+            venv_activate = f"{env_info['venv_path']}\\Scripts\\activate.bat"
+            launcher_content = f"""@echo off
+echo Starting SAM2 Video UI...
+echo.
+
+:: Activate virtual environment (detected during setup)
+set VENV_PATH={env_info['venv_path']}
+
+if exist "%VENV_PATH%\\Scripts\\activate.bat" (
+    echo Activating virtual environment from %VENV_PATH%...
+    call "%VENV_PATH%\\Scripts\\activate.bat"
+    python sam2_ui.py
+    pause
+    exit /b
+)
+
+:: Fallback: use absolute python path
+echo Using detected Python: {env_info['python_path']}
+"{env_info['python_path']}" sam2_ui.py
+pause
+"""
+        else:
+            # System Python
+            launcher_content = f"""@echo off
+echo Starting SAM2 Video UI...
+echo.
+echo Using system Python: {env_info['python_path']}
+"{env_info['python_path']}" sam2_ui.py
+pause
+"""
+
         with open("run.bat", "w") as f:
             f.write(launcher_content)
         print("OK: run.bat created")
-    else:
-        launcher_content = """#!/bin/bash
+
+    else:  # Linux/Mac
+        if env_info['type'] == 'conda':
+            conda_base = env_info['conda_path'] or '/opt/miniconda3'
+            conda_env = env_info['conda_env_name'] or 'sam'
+            launcher_content = f"""#!/bin/bash
 echo "Starting SAM2 Video UI..."
+echo ""
+
+# Activate conda environment (detected during setup)
+CONDA_BASE="{conda_base}"
+CONDA_ENV="{conda_env}"
+
+if [ -f "$CONDA_BASE/etc/profile.d/conda.sh" ]; then
+    echo "Activating conda environment '$CONDA_ENV' from $CONDA_BASE..."
+    source "$CONDA_BASE/etc/profile.d/conda.sh"
+    conda activate "$CONDA_ENV"
+    python3 sam2_ui.py
+    exit $?
+fi
+
+# Fallback: try conda run if conda is in PATH
+if command -v conda &> /dev/null; then
+    echo "Using 'conda run' to launch with environment '$CONDA_ENV'..."
+    conda run -n "$CONDA_ENV" python3 sam2_ui.py
+    exit $?
+fi
+
+# Final fallback
+echo ""
+echo "WARNING: Could not activate conda environment '$CONDA_ENV'"
+echo "Please activate manually with: conda activate $CONDA_ENV"
+echo ""
+read -p "Press Enter to try anyway..."
 python3 sam2_ui.py
 """
+        elif env_info['type'] in ['venv', 'uv']:
+            venv_activate = f"{env_info['venv_path']}/bin/activate"
+            launcher_content = f"""#!/bin/bash
+echo "Starting SAM2 Video UI..."
+echo ""
+
+# Activate virtual environment (detected during setup)
+VENV_PATH="{env_info['venv_path']}"
+
+if [ -f "$VENV_PATH/bin/activate" ]; then
+    echo "Activating virtual environment from $VENV_PATH..."
+    source "$VENV_PATH/bin/activate"
+    python3 sam2_ui.py
+    exit $?
+fi
+
+# Fallback: use absolute python path
+echo "Using detected Python: {env_info['python_path']}"
+"{env_info['python_path']}" sam2_ui.py
+"""
+        else:
+            # System Python
+            launcher_content = f"""#!/bin/bash
+echo "Starting SAM2 Video UI..."
+echo ""
+echo "Using system Python: {env_info['python_path']}"
+"{env_info['python_path']}" sam2_ui.py
+"""
+
         with open("run.sh", "w") as f:
             f.write(launcher_content)
         os.chmod("run.sh", 0o755)
@@ -675,11 +860,12 @@ def main():
     print("=" * 50)
     print("\nTo run the SAM2 Video UI:")
     if platform.system() == "Windows":
-        print("  Double-click run.bat")
-        print("  OR run: python sam2_ui.py")
+        print("  1. Double-click run.bat (environment auto-activates)")
+        print("  2. OR manually: conda activate sam && python sam2_ui.py")
     else:
-        print("  Run: ./run.sh")
-        print("  OR run: python3 sam2_ui.py")
+        print("  1. Double-click or run: ./run.sh (environment auto-activates)")
+        print("  2. OR manually: conda activate sam && python3 sam2_ui.py")
+    print("\nThe launcher script will automatically activate your Python environment.")
     print()
 
     return True
