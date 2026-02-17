@@ -1108,6 +1108,7 @@ class SAM2VideoUI:
                 )
             
             # Ask user if they want to clear existing annotations
+            replace_mode = False  # Track whether to replace or add
             if self.click_points:
                 result = self._show_three_button_dialog(
                     "Existing Annotations",
@@ -1125,7 +1126,30 @@ class SAM2VideoUI:
                     self.object_names.clear()
                     self.object_colors.clear()
                     self.annotated_frames.clear()
-            
+                    replace_mode = True
+            else:
+                # No existing annotations, treat as replace mode
+                replace_mode = True
+
+            # Load top-level object names and colors from annotation file
+            if "object_names" in annotation_data:
+                object_names_raw = annotation_data["object_names"]
+                for obj_id_str, name in object_names_raw.items():
+                    obj_id = int(obj_id_str)
+                    # In replace mode, always use imported names
+                    # In add mode, only add names for new object IDs
+                    if replace_mode or obj_id not in self.object_names:
+                        self.object_names[obj_id] = name
+
+            if "object_colors" in annotation_data:
+                object_colors_raw = annotation_data["object_colors"]
+                for obj_id_str, color in object_colors_raw.items():
+                    obj_id = int(obj_id_str)
+                    # In replace mode, always use imported colors
+                    # In add mode, only add colors for new object IDs
+                    if replace_mode or obj_id not in self.object_colors:
+                        self.object_colors[obj_id] = color
+
             # Import annotations with frame validation
             imported_count = 0
             skipped_count = 0
