@@ -1065,6 +1065,7 @@ class IncrementalQualityMetricsCalculator:
         # Initialize arrays with zeros (will be filled during propagation)
         self.inter_frame_changes: List[float] = [0.0] * num_frames
         self.background_ratios: List[float] = [0.0] * num_frames
+        self.overlap_ratios: List[float] = [0.0] * num_frames
 
         # State for forward pass
         self._forward_prev_mask: Optional[np.ndarray] = None
@@ -1114,6 +1115,49 @@ class IncrementalQualityMetricsCalculator:
         changed_pixels = np.count_nonzero(mask1 != mask2)
         return changed_pixels / self.total_pixels
 
+    def _calculate_overlap_ratio(self, object_masks: Dict[int, np.ndarray]) -> float:
+        """
+        Calculate the ratio of overlapping category assignments.
+
+        For each pixel, count how many objects claim it. For pixels claimed by
+        multiple objects, count the excess assignments (count - 1). For example:
+        - Pixel in 1 object: contributes 0
+        - Pixel in 2 objects: contributes 1
+        - Pixel in 3 objects: contributes 2
+
+        Args:
+            object_masks: Dictionary mapping obj_id -> mask array (H, W)
+
+        Returns:
+            Ratio of excess category assignments (0.0 = no overlap, higher = more overlap)
+        """
+        # Create a count map: how many objects claim each pixel
+        overlap_count = np.zeros((self.height, self.width), dtype=np.int32)
+
+        for obj_id, mask in object_masks.items():
+            if mask is None:
+                continue
+
+            # Ensure mask matches frame dimensions
+            if mask.shape != (self.height, self.width):
+                from PIL import Image as PILImage
+                mask_pil = PILImage.fromarray(mask.astype(np.uint8))
+                mask_pil = mask_pil.resize((self.width, self.height), PILImage.NEAREST)
+                mask = np.array(mask_pil)
+
+            # Increment count for each pixel claimed by this object
+            overlap_count[mask > 0] += 1
+
+        # For pixels with count > 0, subtract 1 to get the excess overlap count
+        # (pixels in only 1 category don't count as overlap)
+        excess_overlaps = np.where(overlap_count > 0, overlap_count - 1, 0)
+
+        # Total excess assignments across all pixels
+        total_excess = np.sum(excess_overlaps)
+
+        # Return as ratio of total pixels
+        return total_excess / self.total_pixels
+
     def update_forward(self, frame_idx: int, object_masks: Dict[int, np.ndarray]) -> None:
         """
         Update metrics during forward propagation (frames 0 to N-1).
@@ -1131,6 +1175,9 @@ class IncrementalQualityMetricsCalculator:
 
         # Calculate background ratio
         self.background_ratios[frame_idx] = self._calculate_background_ratio(combined_mask)
+
+        # Calculate overlap ratio
+        self.overlap_ratios[frame_idx] = self._calculate_overlap_ratio(object_masks)
 
         # Calculate inter-frame change
         if self._forward_prev_mask is None:
@@ -1162,6 +1209,9 @@ class IncrementalQualityMetricsCalculator:
 
         # Update background ratio with final mask
         self.background_ratios[frame_idx] = self._calculate_background_ratio(combined_mask)
+
+        # Update overlap ratio with final mask
+        self.overlap_ratios[frame_idx] = self._calculate_overlap_ratio(object_masks)
 
         # Update inter-frame change for the NEXT frame (in forward order)
         # When processing frame i in backward order, we have:
@@ -1197,14 +1247,14 @@ class IncrementalQualityMetricsCalculator:
         else:
             self.update_forward(frame_idx, object_masks)
 
-    def get_results(self) -> Tuple[List[float], List[float]]:
+    def get_results(self) -> Tuple[List[float], List[float], List[float]]:
         """
         Get the calculated quality metrics.
 
         Returns:
-            Tuple of (inter_frame_changes, background_ratios)
+            Tuple of (inter_frame_changes, background_ratios, overlap_ratios)
         """
-        return self.inter_frame_changes, self.background_ratios
+        return self.inter_frame_changes, self.background_ratios, self.overlap_ratios
 
     def print_summary(self) -> None:
         """Print a summary of the calculated metrics."""
@@ -1214,6 +1264,7 @@ class IncrementalQualityMetricsCalculator:
             mean_change = np.mean(self.inter_frame_changes[1:])
             print(f"  Mean inter-frame change: {mean_change:.3f}")
         print(f"  Mean background ratio: {np.mean(self.background_ratios):.3f}")
+        print(f"  Mean overlap ratio: {np.mean(self.overlap_ratios):.3f}")
 
 
 class QualityMetricsCalculator:
@@ -1237,12 +1288,13 @@ class QualityMetricsCalculator:
 
         self.inter_frame_changes: List[float] = []
         self.background_ratios: List[float] = []
+        self.overlap_ratios: List[float] = []
 
     def calculate(
         self,
         masks: Dict[int, Dict[int, Any]],
         load_mask_func: Callable[[int, int], Optional[np.ndarray]]
-    ) -> Tuple[List[float], List[float]]:
+    ) -> Tuple[List[float], List[float], List[float]]:
         """
         Calculate quality metrics for all frames.
 
@@ -1251,18 +1303,22 @@ class QualityMetricsCalculator:
             load_mask_func: Function(frame_idx, obj_id) -> numpy array mask or None
 
         Returns:
-            Tuple of (inter_frame_changes, background_ratios)
+            Tuple of (inter_frame_changes, background_ratios, overlap_ratios)
         """
         print("Calculating segmentation quality metrics...")
 
         self.inter_frame_changes = []
         self.background_ratios = []
+        self.overlap_ratios = []
 
         prev_combined_mask = None
 
         for frame_idx in range(self.num_frames):
             # Create combined mask for this frame (all objects)
             combined_mask = np.zeros((self.height, self.width), dtype=np.uint8)
+
+            # Track overlap count for this frame
+            overlap_count = np.zeros((self.height, self.width), dtype=np.int32)
 
             if frame_idx in masks:
                 for obj_id in masks[frame_idx]:
@@ -1278,10 +1334,18 @@ class QualityMetricsCalculator:
                         # Mark object pixels (any non-zero value)
                         combined_mask[mask > 0] = obj_id
 
+                        # Count overlaps
+                        overlap_count[mask > 0] += 1
+
             # Calculate background ratio
             object_pixels = np.count_nonzero(combined_mask)
             bg_ratio = 1.0 - (object_pixels / self.total_pixels)
             self.background_ratios.append(bg_ratio)
+
+            # Calculate overlap ratio (excess assignments: count - 1 for pixels with count > 0)
+            excess_overlaps = np.where(overlap_count > 0, overlap_count - 1, 0)
+            overlap_ratio = np.sum(excess_overlaps) / self.total_pixels
+            self.overlap_ratios.append(overlap_ratio)
 
             # Calculate inter-frame change
             if prev_combined_mask is None:
@@ -1299,8 +1363,9 @@ class QualityMetricsCalculator:
         if len(self.inter_frame_changes) > 1:
             print(f"  Mean inter-frame change: {np.mean(self.inter_frame_changes[1:]):.3f}")
         print(f"  Mean background ratio: {np.mean(self.background_ratios):.3f}")
+        print(f"  Mean overlap ratio: {np.mean(self.overlap_ratios):.3f}")
 
-        return self.inter_frame_changes, self.background_ratios
+        return self.inter_frame_changes, self.background_ratios, self.overlap_ratios
 
 
 def calculate_quality_metrics(
@@ -1308,7 +1373,7 @@ def calculate_quality_metrics(
     load_mask_func: Callable[[int, int], Optional[np.ndarray]],
     frame_dimensions: Tuple[int, int],
     num_frames: int
-) -> Tuple[List[float], List[float]]:
+) -> Tuple[List[float], List[float], List[float]]:
     """
     Convenience function to calculate quality metrics without instantiating a class.
 
@@ -1319,7 +1384,7 @@ def calculate_quality_metrics(
         num_frames: Total number of frames
 
     Returns:
-        Tuple of (inter_frame_changes, background_ratios)
+        Tuple of (inter_frame_changes, background_ratios, overlap_ratios)
     """
     calculator = QualityMetricsCalculator(frame_dimensions, num_frames)
     return calculator.calculate(masks, load_mask_func)
@@ -1328,7 +1393,8 @@ def calculate_quality_metrics(
 def save_quality_metrics(
     output_dir: str,
     inter_frame_changes: List[float],
-    background_ratios: List[float]
+    background_ratios: List[float],
+    overlap_ratios: Optional[List[float]] = None
 ) -> bool:
     """
     Save quality metrics to quality_metrics.npz in output directory.
@@ -1337,6 +1403,7 @@ def save_quality_metrics(
         output_dir: Directory to save the metrics file
         inter_frame_changes: List of inter-frame change ratios
         background_ratios: List of background ratios
+        overlap_ratios: List of overlap ratios (optional, for backward compatibility)
 
     Returns:
         True if saved successfully, False otherwise
@@ -1348,12 +1415,17 @@ def save_quality_metrics(
     try:
         metrics_path = os.path.join(output_dir, "quality_metrics.npz")
 
-        np.savez_compressed(
-            metrics_path,
-            inter_frame_changes=np.array(inter_frame_changes),
-            background_ratios=np.array(background_ratios),
-            frame_count=len(inter_frame_changes)
-        )
+        save_dict = {
+            'inter_frame_changes': np.array(inter_frame_changes),
+            'background_ratios': np.array(background_ratios),
+            'frame_count': len(inter_frame_changes)
+        }
+
+        # Add overlap ratios if provided
+        if overlap_ratios is not None:
+            save_dict['overlap_ratios'] = np.array(overlap_ratios)
+
+        np.savez_compressed(metrics_path, **save_dict)
 
         print(f"Saved quality metrics to {metrics_path}")
         return True
@@ -1477,7 +1549,7 @@ def compress_video_with_ffmpeg(
         return False
 
 
-def load_quality_metrics(output_dir: str) -> Tuple[Optional[List[float]], Optional[List[float]]]:
+def load_quality_metrics(output_dir: str) -> Tuple[Optional[List[float]], Optional[List[float]], Optional[List[float]]]:
     """
     Load quality metrics from quality_metrics.npz if available.
 
@@ -1485,13 +1557,14 @@ def load_quality_metrics(output_dir: str) -> Tuple[Optional[List[float]], Option
         output_dir: Directory containing the metrics file
 
     Returns:
-        Tuple of (inter_frame_changes, background_ratios), or (None, None) if not found/failed
+        Tuple of (inter_frame_changes, background_ratios, overlap_ratios), or (None, None, None) if not found/failed
+        For backward compatibility, overlap_ratios may be None if not present in the file.
     """
     metrics_path = os.path.join(output_dir, "quality_metrics.npz")
 
     if not os.path.exists(metrics_path):
         print("No quality metrics file found (OK for older results)")
-        return None, None
+        return None, None, None
 
     try:
         data = np.load(metrics_path)
@@ -1499,11 +1572,18 @@ def load_quality_metrics(output_dir: str) -> Tuple[Optional[List[float]], Option
         inter_frame_changes = data['inter_frame_changes'].tolist()
         background_ratios = data['background_ratios'].tolist()
 
+        # Load overlap ratios if available (backward compatibility)
+        overlap_ratios = None
+        if 'overlap_ratios' in data:
+            overlap_ratios = data['overlap_ratios'].tolist()
+
         print(f"Loaded quality metrics: {len(inter_frame_changes)} values")
-        return inter_frame_changes, background_ratios
+        if overlap_ratios is not None:
+            print(f"  (including overlap ratios)")
+        return inter_frame_changes, background_ratios, overlap_ratios
     except Exception as e:
         print(f"WARNING: Failed to load quality metrics: {e}")
-        return None, None
+        return None, None, None
 
 
 # =============================================================================

@@ -275,6 +275,10 @@ class SAM2VideoUI:
         self.has_prerendered_masks = False  # Track if frames have masks baked in (performance optimization)
         self.results_output_dir = None  # Store output directory
         self.saved_opacity = 0.4  # Persisted overlay opacity (read from metadata on import)
+        self.original_frame_source = None  # Frame source for original video (used when segmented video is displayed)
+
+        # Display text for canvas overlays (top left corner)
+        self.video_display_text = ""  # Video filename or results path to display on canvas
 
         # Session-based frame cache (cleaned up when app closes)
         self.session_cache_dir = None  # Current temp directory for extracted frames
@@ -287,11 +291,14 @@ class SAM2VideoUI:
         # Segmentation quality visualization
         self.inter_frame_changes = []  # Ratio of pixels changing category between frames
         self.background_ratios = []     # Ratio of background pixels per frame
+        self.overlap_ratios = []        # Ratio of pixels with multiple category assignments
         self.change_viz_canvas = None   # Canvas for inter-frame change visualization
         self.quality_bg_rendered = False  # Track if background colorbars are cached
         self.change_viz_image = None    # Cached PhotoImage for change visualization
         self.bg_viz_image = None        # Cached PhotoImage for background visualization
+        self.overlap_viz_image = None   # Cached PhotoImage for overlap visualization
         self.bg_viz_canvas = None       # Canvas for background ratio visualization
+        self.overlap_viz_canvas = None  # Canvas for overlap ratio visualization
 
         # Quality visualization zoom tracking
         self.quality_viz_range_start = 0    # Start frame of rendered range
@@ -368,15 +375,23 @@ class SAM2VideoUI:
         # Create panels
         left_panel = ttk.Frame(self.paned)
         right_panel = ttk.Frame(self.paned)
-        
+
+        # Store panel references for focus management
+        self.left_panel = left_panel
+        self.right_panel = right_panel
+
         # Add panels
         self.paned.add(left_panel, width=280)  # Set initial width to 280px
         self.paned.add(right_panel)
-        
+
         # Setup panels
         self.setup_left_panel(left_panel)
         self.setup_right_panel(right_panel)
-        
+
+        # Bind clicks on panels to remove entry focus
+        left_panel.bind('<Button-1>', self._on_panel_click)
+        right_panel.bind('<Button-1>', self._on_panel_click)
+
         # Force sash position after window renders
         self.root.after(100, lambda: self.paned.sash_place(0, 280, 1))
         
@@ -418,6 +433,7 @@ class SAM2VideoUI:
         # File operations
         file_frame = ttk.LabelFrame(scrollable_frame, text="File Operations", padding=10)
         file_frame.pack(fill=tk.X, pady=(0, 10))
+        file_frame.bind('<Button-1>', self._on_panel_click)
 
         ttk.Button(file_frame, text="Load Video",
                   command=self.load_video, width=15).pack(fill=tk.X, pady=2)
@@ -435,6 +451,7 @@ class SAM2VideoUI:
         # Object Annotation
         obj_frame = ttk.LabelFrame(scrollable_frame, text="Object Annotation", padding=10)
         obj_frame.pack(fill=tk.X, pady=(0, 10))
+        obj_frame.bind('<Button-1>', self._on_panel_click)
 
         # Current object selection with more space
         current_obj_frame = ttk.Frame(obj_frame)
@@ -464,6 +481,7 @@ class SAM2VideoUI:
                                          bg='#404040', fg='white', insertbackground='white')
         self.object_name_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(5, 5))
         self.object_name_entry.bind('<Return>', self.update_object_name)
+        self.object_name_entry.bind('<Escape>', self.cancel_object_name_edit)
 
         ttk.Button(name_frame, text="Save", command=self.update_object_name, width=5).pack(side=tk.RIGHT)
 
@@ -529,6 +547,7 @@ class SAM2VideoUI:
         # Model Configuration (Model selection + GPU selection merged)
         model_frame = ttk.LabelFrame(scrollable_frame, text="Model Configuration", padding=10)
         model_frame.pack(fill=tk.X, pady=(0, 10))
+        model_frame.bind('<Button-1>', self._on_panel_click)
 
         # Model Type Selection (SAM2/SAM3) - only show if SAM3 is available
         if self.sam3_available:
@@ -598,6 +617,7 @@ class SAM2VideoUI:
         # Segmentation controls
         seg_frame = ttk.LabelFrame(scrollable_frame, text="Segmentation", padding=10)
         seg_frame.pack(fill=tk.X, pady=(0, 10))
+        seg_frame.bind('<Button-1>', self._on_panel_click)
 
         ttk.Button(seg_frame, text="Segment Video",
                   command=self.segment_video, width=15).pack(fill=tk.X, pady=2)
@@ -650,7 +670,8 @@ class SAM2VideoUI:
         # Status info
         status_frame = ttk.LabelFrame(scrollable_frame, text="Status", padding=10)
         status_frame.pack(fill=tk.X)
-        
+        status_frame.bind('<Button-1>', self._on_panel_click)
+
         self.status_label = ttk.Label(status_frame, text="Ready", wraplength=250)
         self.status_label.pack(fill=tk.X)
         
@@ -660,10 +681,6 @@ class SAM2VideoUI:
         
     def setup_right_panel(self, parent):
         """Setup the right video display panel"""
-        # Video filename display (truncated if path is long)
-        self.video_filename_label = ttk.Label(parent, text="", foreground='#aaaaaa', font=('Arial', 9))
-        self.video_filename_label.pack(fill=tk.X, pady=(0, 4))
-
         # Video display area
         display_frame = ttk.Frame(parent)
         display_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
@@ -695,7 +712,7 @@ class SAM2VideoUI:
         self.canvas.bind("<Button-5>", self.on_mouse_wheel)        # Linux scroll down
 
         # Keyboard shortcuts - cross-platform support
-        self.root.bind('f', lambda e: self.flash_selected_object_mask())
+        self.root.bind('f', lambda e: self._handle_flash_shortcut())
 
         # Undo: Ctrl+Z (Windows/Linux) or Cmd+Z (Mac)
         self.root.bind('<Control-z>', self.undo_last_point)
@@ -707,19 +724,20 @@ class SAM2VideoUI:
         self.root.bind('<Command-y>', self.redo_last_point)  # Mac alternative
 
         # Frame navigation: Left/Right arrows
-        self.root.bind('<Left>', lambda e: self.prev_frame())
-        self.root.bind('<Right>', lambda e: self.next_frame())
+        self.root.bind('<Left>', lambda e: self._handle_prev_frame_shortcut())
+        self.root.bind('<Right>', lambda e: self._handle_next_frame_shortcut())
 
         # Object navigation: Up/Down arrows
-        self.root.bind('<Up>', lambda e: self.prev_object())
-        self.root.bind('<Down>', lambda e: self.next_object())
+        self.root.bind('<Up>', lambda e: self._handle_prev_object_shortcut())
+        self.root.bind('<Down>', lambda e: self._handle_next_object_shortcut())
 
         # Toggle point removal mode: R key
-        self.root.bind('r', lambda e: self.toggle_point_removal_mode())
+        self.root.bind('r', lambda e: self._handle_toggle_removal_shortcut())
 
         # Video controls
         controls_frame = ttk.Frame(parent)
         controls_frame.pack(fill=tk.X)
+        controls_frame.bind('<Button-1>', self._on_panel_click)
         
         # Playback controls
         playback_frame = ttk.Frame(controls_frame)
@@ -855,9 +873,18 @@ class SAM2VideoUI:
         bg_label.pack(anchor=tk.W)
 
         self.bg_viz_canvas = tk.Canvas(viz_frame, height=15, bg='gray80')
-        self.bg_viz_canvas.pack(fill=tk.X, pady=(2, 0))
+        self.bg_viz_canvas.pack(fill=tk.X, pady=(2, 5))
         self.bg_viz_canvas.bind("<Button-1>", self._on_viz_canvas_click)
         self.bg_viz_canvas.bind("<Configure>", self._on_quality_viz_resize)
+
+        # Overlap ratio visualization
+        overlap_label = ttk.Label(viz_frame, text="Overlap Ratio:")
+        overlap_label.pack(anchor=tk.W)
+
+        self.overlap_viz_canvas = tk.Canvas(viz_frame, height=15, bg='gray80')
+        self.overlap_viz_canvas.pack(fill=tk.X, pady=(2, 0))
+        self.overlap_viz_canvas.bind("<Button-1>", self._on_viz_canvas_click)
+        self.overlap_viz_canvas.bind("<Configure>", self._on_quality_viz_resize)
 
 
         # Info panel
@@ -905,6 +932,9 @@ class SAM2VideoUI:
                 
     def on_object_tree_select(self, event):
         """Handle object tree selection"""
+        # Remove focus from any text entry widgets
+        self.canvas.focus_set()
+
         selection = self.object_tree.selection()
         if selection:
             item = selection[0]
@@ -1283,7 +1313,14 @@ class SAM2VideoUI:
             self.segmented_video_displayed = True
             self.has_prerendered_masks = True  # Frames have masks baked in
             self.results_output_dir = output_dir
+
+            # Store result folder path for display on canvas
+            self.video_display_text = f"Results: {self._truncate_path(output_dir)}"
+
             self.load_video_frames()
+
+            # Initialize original frame source for segment_current_frame_only
+            self._initialize_original_frame_source()
 
             # Set mask export directory for flash functionality
             masks_dir = os.path.join(output_dir, "masks")
@@ -1421,6 +1458,26 @@ class SAM2VideoUI:
 
         return original_video_path if original_video_path else None
 
+    def _initialize_original_frame_source(self):
+        """
+        Initialize frame source for the original video when displaying segmented results.
+
+        This allows segment_current_frame_only to load clean frames from the original video
+        instead of from the pre-segmented video (which would cause double overlay).
+        """
+        if not self.original_video_path_for_resegment or not os.path.exists(self.original_video_path_for_resegment):
+            return
+
+        try:
+            self.original_frame_source = HybridFrameSource(
+                self.original_video_path_for_resegment,
+                None  # Could pass frame_dir if we have extracted frames
+            )
+            print(f"  Initialized original frame source for segment_current_frame_only: {self.original_video_path_for_resegment}")
+        except Exception as e:
+            print(f"  Warning: Could not initialize original frame source: {e}")
+            self.original_frame_source = None
+
     def _count_custom_objects(self):
         """Count objects with custom names (not default Object_N format)"""
         return sum(1 for obj_id, name in self.object_names.items()
@@ -1437,6 +1494,47 @@ class SAM2VideoUI:
         self.has_segmentation = True
         if hasattr(self, 'flash_mask_button'):
             self.flash_mask_button.config(state='normal')
+
+    def _should_ignore_keyboard_shortcut(self):
+        """Check if keyboard shortcuts should be ignored (e.g., when typing in Entry widgets)"""
+        focused_widget = self.root.focus_get()
+        # Ignore shortcuts when an Entry widget has focus
+        return isinstance(focused_widget, tk.Entry)
+
+    def _on_panel_click(self, event):
+        """Handle clicks on main panels to remove focus from entry widgets"""
+        if hasattr(self, 'canvas'):
+            self.canvas.focus_set()
+
+    def _handle_flash_shortcut(self):
+        """Handle 'f' key shortcut for flashing mask (only if not typing in text field)"""
+        if not self._should_ignore_keyboard_shortcut():
+            self.flash_selected_object_mask()
+
+    def _handle_toggle_removal_shortcut(self):
+        """Handle 'r' key shortcut for toggling removal mode (only if not typing in text field)"""
+        if not self._should_ignore_keyboard_shortcut():
+            self.toggle_point_removal_mode()
+
+    def _handle_prev_frame_shortcut(self):
+        """Handle Left arrow key for previous frame (only if not typing in text field)"""
+        if not self._should_ignore_keyboard_shortcut():
+            self.prev_frame()
+
+    def _handle_next_frame_shortcut(self):
+        """Handle Right arrow key for next frame (only if not typing in text field)"""
+        if not self._should_ignore_keyboard_shortcut():
+            self.next_frame()
+
+    def _handle_prev_object_shortcut(self):
+        """Handle Up arrow key for previous object (only if not typing in text field)"""
+        if not self._should_ignore_keyboard_shortcut():
+            self.prev_object()
+
+    def _handle_next_object_shortcut(self):
+        """Handle Down arrow key for next object (only if not typing in text field)"""
+        if not self._should_ignore_keyboard_shortcut():
+            self.next_object()
 
     def flash_selected_object_mask(self):
         """Flash the mask for the currently selected object with white color"""
@@ -1818,7 +1916,16 @@ class SAM2VideoUI:
         if new_name:
             self.object_names[self.current_object_id] = new_name
             self.update_object_list()
-   
+        # Remove focus from entry after updating
+        self.canvas.focus_set()
+
+    def cancel_object_name_edit(self, event=None):
+        """Cancel object name editing and restore original name"""
+        # Reset to current object's name (cancel any unsaved changes)
+        self.object_name_var.set(self.object_names.get(self.current_object_id, f"Object_{self.current_object_id}"))
+        # Remove focus from entry
+        self.canvas.focus_set()
+
     def on_object_change(self, event=None):
         obj_id = self.object_var.get()
         if 1 <= obj_id <= self.max_total_objects:
@@ -1896,13 +2003,22 @@ class SAM2VideoUI:
             
         try:
             self.video_path = file_path
-            self.video_filename_label.config(text=self._truncate_path(file_path))
+            # Store video path for display on canvas
+            self.video_display_text = self._truncate_path(file_path)
 
             # CRITICAL FIX: Reset prerendered flags when loading new original video
             # This ensures flash works after previously viewing a segmented video
             self.segmented_video_displayed = False
             self.has_prerendered_masks = False
             self.original_video_path_for_resegment = None
+
+            # Clean up original frame source when loading new video
+            if hasattr(self, 'original_frame_source') and self.original_frame_source is not None:
+                try:
+                    self.original_frame_source.close()
+                except:
+                    pass
+                self.original_frame_source = None
 
             # Clear temporary masks when loading new video
             self._clear_temporary_masks()
@@ -2251,7 +2367,7 @@ class SAM2VideoUI:
         num_frames = len(self.frames)
 
         # Use the utility function from utils.py
-        self.inter_frame_changes, self.background_ratios = calculate_quality_metrics(
+        self.inter_frame_changes, self.background_ratios, self.overlap_ratios = calculate_quality_metrics(
             masks=self.masks,
             load_mask_func=self._load_mask,
             frame_dimensions=dims,
@@ -2267,7 +2383,7 @@ class SAM2VideoUI:
         In zoom mode, only renders frames in the visible slider window.
         This is much faster than creating hundreds of rectangles on every update.
         """
-        if not self.change_viz_canvas or not self.bg_viz_canvas:
+        if not self.change_viz_canvas or not self.bg_viz_canvas or not self.overlap_viz_canvas:
             return False
 
         if not self.inter_frame_changes or not self.background_ratios:
@@ -2344,6 +2460,30 @@ class SAM2VideoUI:
 
             self.bg_viz_image = ImageTk.PhotoImage(bg_img)
 
+            # Create image for overlap ratios
+            overlap_img = Image.new('RGB', (canvas_width, canvas_height))
+            overlap_draw = ImageDraw.Draw(overlap_img)
+
+            if self.overlap_ratios:
+                for i, frame_idx in enumerate(range(range_start, range_end + 1)):
+                    x0 = int(i * pixels_per_frame)
+                    x1 = int((i + 1) * pixels_per_frame)
+
+                    overlap_ratio = self.overlap_ratios[frame_idx]
+                    # Color: white (no overlap) to blue (high overlap)
+                    # Scale the ratio for better visibility (assume max useful overlap is ~0.5)
+                    scaled_ratio = min(overlap_ratio * 2, 1.0)
+                    intensity = int(255 * (1 - scaled_ratio))
+                    color = (intensity, intensity, 255)
+
+                    overlap_draw.rectangle([x0, 0, x1, canvas_height], fill=color)
+            else:
+                # No overlap data available (backward compatibility for old results)
+                # Show light gray to indicate metric not calculated - no expensive recalculation
+                overlap_draw.rectangle([0, 0, canvas_width, canvas_height], fill=(220, 220, 220))
+
+            self.overlap_viz_image = ImageTk.PhotoImage(overlap_img)
+
             # Store the rendered range
             self.quality_viz_range_start = range_start
             self.quality_viz_range_end = range_end
@@ -2364,7 +2504,7 @@ class SAM2VideoUI:
         If the visible range has changed (due to zoom or pan), triggers a full
         re-render instead. Otherwise, just repositions the blue indicator line.
         """
-        if not self.change_viz_canvas or not self.bg_viz_canvas:
+        if not self.change_viz_canvas or not self.bg_viz_canvas or not self.overlap_viz_canvas:
             return
 
         if not self.quality_bg_rendered:
@@ -2393,10 +2533,13 @@ class SAM2VideoUI:
         # Clear and redraw backgrounds
         self.change_viz_canvas.delete("all")
         self.bg_viz_canvas.delete("all")
+        self.overlap_viz_canvas.delete("all")
 
         # Draw cached background images
         self.change_viz_canvas.create_image(0, 0, anchor='nw', image=self.change_viz_image)
         self.bg_viz_canvas.create_image(0, 0, anchor='nw', image=self.bg_viz_image)
+        if self.overlap_viz_image:
+            self.overlap_viz_canvas.create_image(0, 0, anchor='nw', image=self.overlap_viz_image)
 
         # Draw current frame indicator (positioned relative to visible range)
         if hasattr(self, 'current_frame_idx'):
@@ -2412,6 +2555,10 @@ class SAM2VideoUI:
                     fill='blue', width=2
                 )
                 self.bg_viz_canvas.create_line(
+                    x_pos, 0, x_pos, canvas_height,
+                    fill='blue', width=2
+                )
+                self.overlap_viz_canvas.create_line(
                     x_pos, 0, x_pos, canvas_height,
                     fill='blue', width=2
                 )
@@ -2482,12 +2629,13 @@ class SAM2VideoUI:
         """
         Fallback method using canvas rectangles (slower but always works).
         """
-        if not self.change_viz_canvas or not self.bg_viz_canvas:
+        if not self.change_viz_canvas or not self.bg_viz_canvas or not self.overlap_viz_canvas:
             return
 
         # Clear canvases
         self.change_viz_canvas.delete("all")
         self.bg_viz_canvas.delete("all")
+        self.overlap_viz_canvas.delete("all")
 
         if not self.inter_frame_changes or not self.background_ratios:
             return
@@ -2545,6 +2693,29 @@ class SAM2VideoUI:
                 fill=color, outline=''
             )
 
+        # Render overlap ratios (if available)
+        if self.overlap_ratios:
+            for i, overlap_ratio in enumerate(self.overlap_ratios):
+                x0 = i * pixels_per_frame
+                x1 = (i + 1) * pixels_per_frame
+
+                # Color: white (no overlap) to blue (high overlap)
+                # Scale the ratio for better visibility
+                scaled_ratio = min(overlap_ratio * 2, 1.0)
+                intensity = int(255 * (1 - scaled_ratio))
+                color = f'#{intensity:02x}{intensity:02x}{255:02x}'
+
+                self.overlap_viz_canvas.create_rectangle(
+                    x0, 0, x1, canvas_height,
+                    fill=color, outline=''
+                )
+        else:
+            # No data available (backward compatibility) - show light gray
+            self.overlap_viz_canvas.create_rectangle(
+                0, 0, canvas_width, canvas_height,
+                fill='#dcdcdc', outline=''
+            )
+
         # Draw current frame indicator
         if hasattr(self, 'current_frame_idx'):
             x_pos = self.current_frame_idx * pixels_per_frame
@@ -2556,6 +2727,11 @@ class SAM2VideoUI:
                 x_pos, 0, x_pos, canvas_height,
                 fill='blue', width=2
             )
+            if self.overlap_ratios:
+                self.overlap_viz_canvas.create_line(
+                    x_pos, 0, x_pos, canvas_height,
+                    fill='blue', width=2
+                )
 
     def _save_quality_metrics(self, output_dir):
         """Save quality metrics to quality_metrics.npz in output directory.
@@ -2563,21 +2739,26 @@ class SAM2VideoUI:
         return save_quality_metrics(
             output_dir=output_dir,
             inter_frame_changes=self.inter_frame_changes,
-            background_ratios=self.background_ratios
+            background_ratios=self.background_ratios,
+            overlap_ratios=self.overlap_ratios if self.overlap_ratios else None
         )
 
     def _load_quality_metrics(self, output_dir):
         """Load quality metrics from quality_metrics.npz if available.
         Uses the load_quality_metrics utility from utils.py."""
-        inter_frame_changes, background_ratios = load_quality_metrics(output_dir)
+        inter_frame_changes, background_ratios, overlap_ratios = load_quality_metrics(output_dir)
 
         if inter_frame_changes is None or background_ratios is None:
             self.inter_frame_changes = []
             self.background_ratios = []
+            self.overlap_ratios = []
             return False
 
         self.inter_frame_changes = inter_frame_changes
         self.background_ratios = background_ratios
+        # Handle backward compatibility: old files may not have overlap_ratios
+        # If missing, set to empty list (canvas will show gray, no recalculation)
+        self.overlap_ratios = overlap_ratios if overlap_ratios is not None else []
         self._update_quality_visualizations()  # Refresh color bars
         return True
 
@@ -2642,19 +2823,39 @@ class SAM2VideoUI:
         """Display current video frame with overlays"""
         if not self.frames:
             return
-        
-        # Handle lazy loading (works for both original and segmented videos)
-        if self.lazy_load_var.get() and hasattr(self, 'video_props'):
-            # Load frame on demand
-            frame = self._load_frame_lazy(self.current_frame_idx)
+
+        # Special case: If we have prerendered masks AND a temp mask for this frame,
+        # load the original frame so we can display the temp mask cleanly
+        if (self.has_prerendered_masks and
+            self.current_frame_idx in self.temp_mask_frames and
+            self.original_frame_source is not None):
+            # Load from original video to avoid showing prerendered masks
+            frame = self.original_frame_source.get_frame(self.current_frame_idx)
+            if frame is None:
+                # Fallback to prerendered if original load fails
+                print(f"Warning: Could not load frame {self.current_frame_idx} from original video, using prerendered")
+                if self.lazy_load_var.get() and hasattr(self, 'video_props'):
+                    frame = self._load_frame_lazy(self.current_frame_idx)
+                else:
+                    if self.current_frame_idx >= len(self.frames):
+                        return
+                    frame = self.frames[self.current_frame_idx]
             if frame is None:
                 return
             self.current_frame = frame.copy()
         else:
-            # Regular loading
-            if self.current_frame_idx >= len(self.frames) or self.frames[self.current_frame_idx] is None:
-                return
-            self.current_frame = self.frames[self.current_frame_idx].copy()
+            # Normal case: Handle lazy loading (works for both original and segmented videos)
+            if self.lazy_load_var.get() and hasattr(self, 'video_props'):
+                # Load frame on demand
+                frame = self._load_frame_lazy(self.current_frame_idx)
+                if frame is None:
+                    return
+                self.current_frame = frame.copy()
+            else:
+                # Regular loading
+                if self.current_frame_idx >= len(self.frames) or self.frames[self.current_frame_idx] is None:
+                    return
+                self.current_frame = self.frames[self.current_frame_idx].copy()
         display_frame = self.current_frame.copy()
 
         # Add annotation indicator for multi-frame annotation mode
@@ -2680,7 +2881,8 @@ class SAM2VideoUI:
         if masks_to_display:
             # OPTIMIZATION: If displaying pre-rendered segmented video, skip mask loading
             # The frames already have masks baked in from the segmented video
-            if self.has_prerendered_masks:
+            # EXCEPT: If we have temp masks for this frame (from segment_current_frame_only)
+            if self.has_prerendered_masks and self.current_frame_idx not in self.temp_mask_frames:
                 # Frames already contain mask overlay - normally nothing to do
                 # But if flash is in progress, we need to apply white overlay
                 if self.flash_in_progress and self.flash_white_on and self.flash_obj_id is not None:
@@ -2806,9 +3008,61 @@ class SAM2VideoUI:
                 
                 # Draw object name
                 obj_name = self.object_names.get(obj_id, f"Obj{obj_id}")[:8]
-                cv2.putText(display_frame, obj_name, (int(x)+15, int(y)-10), 
+                cv2.putText(display_frame, obj_name, (int(x)+15, int(y)-10),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2)
-        
+
+        # Display currently active object at top right corner
+        current_obj_name = self.object_names.get(self.current_object_id, f"Object_{self.current_object_id}")
+        current_obj_text = f"{current_obj_name}, (ID: {self.current_object_id})"
+        current_obj_color = self.object_colors.get(self.current_object_id, [255, 255, 255])
+
+        # Get text size to position at top right
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.7
+        font_thickness = 2
+        (text_width, text_height), baseline = cv2.getTextSize(current_obj_text, font, font_scale, font_thickness)
+
+        # Position at top right with padding
+        padding = 10
+        text_x = display_frame.shape[1] - text_width - padding
+        text_y = text_height + padding
+
+        # Draw semi-transparent background for better readability
+        bg_pt1 = (text_x - 5, text_y - text_height - 5)
+        bg_pt2 = (text_x + text_width + 5, text_y + baseline + 5)
+        overlay = display_frame.copy()
+        cv2.rectangle(overlay, bg_pt1, bg_pt2, (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.6, display_frame, 0.4, 0, display_frame)
+
+        # Draw text in object color
+        cv2.putText(display_frame, current_obj_text, (text_x, text_y),
+                   font, font_scale, tuple(current_obj_color), font_thickness)
+
+        # Display video/results path at top left corner
+        if self.video_display_text:
+            info_font = cv2.FONT_HERSHEY_SIMPLEX
+            info_font_scale = 0.5
+            info_font_thickness = 1
+            (info_text_width, info_text_height), info_baseline = cv2.getTextSize(
+                self.video_display_text, info_font, info_font_scale, info_font_thickness
+            )
+
+            # Position at top left with padding
+            info_padding = 10
+            info_text_x = info_padding
+            info_text_y = info_text_height + info_padding
+
+            # Draw semi-transparent background for better readability
+            info_bg_pt1 = (info_text_x - 5, info_text_y - info_text_height - 5)
+            info_bg_pt2 = (info_text_x + info_text_width + 5, info_text_y + info_baseline + 5)
+            info_overlay = display_frame.copy()
+            cv2.rectangle(info_overlay, info_bg_pt1, info_bg_pt2, (0, 0, 0), -1)
+            cv2.addWeighted(info_overlay, 0.6, display_frame, 0.4, 0, display_frame)
+
+            # Draw text in light gray
+            cv2.putText(display_frame, self.video_display_text, (info_text_x, info_text_y),
+                       info_font, info_font_scale, (200, 200, 200), info_font_thickness)
+
         # Convert to PIL and display
         pil_image = Image.fromarray(display_frame)
 
@@ -3032,13 +3286,19 @@ class SAM2VideoUI:
 
     def on_canvas_click(self, event):
         """Handle left mouse click (positive point or point removal)"""
+        # Remove focus from any text entry widgets
+        self.canvas.focus_set()
+
         if self.point_removal_mode:
             self.handle_point_removal_click(event)
         else:
             self.add_click_point(event, is_positive=True)
-        
+
     def on_canvas_right_click(self, event):
         """Handle right mouse click (negative point or point removal)"""
+        # Remove focus from any text entry widgets
+        self.canvas.focus_set()
+
         if self.point_removal_mode:
             self.handle_point_removal_click(event)
         else:
@@ -3415,6 +3675,10 @@ class SAM2VideoUI:
 
     def on_slider_change(self, value):
         """Handle frame slider change"""
+        # Remove focus from any text entry widgets
+        if hasattr(self, 'canvas'):
+            self.canvas.focus_set()
+
         if self.frames and not self.playing:
             # Reset flash state when manually changing frames
             self._reset_flash_state()
@@ -4462,6 +4726,9 @@ class SAM2VideoUI:
                                 # - Updating frame_slider, current_frame_idx
                                 # - Calling display_current_frame()
                                 self.load_video_frames()
+
+                                # Initialize original frame source for segment_current_frame_only
+                                self._initialize_original_frame_source()
                             else:
                                 print("WARNING: Segmented video not found, keeping current frames")
 
@@ -4472,7 +4739,13 @@ class SAM2VideoUI:
 
                         # Get quality metrics from segmentation result
                         if quality_metrics is not None:
-                            self.inter_frame_changes, self.background_ratios = quality_metrics
+                            # Handle both old (2-value) and new (3-value) format
+                            if len(quality_metrics) == 3:
+                                self.inter_frame_changes, self.background_ratios, self.overlap_ratios = quality_metrics
+                            else:
+                                # Backward compatibility: old format without overlap_ratios
+                                self.inter_frame_changes, self.background_ratios = quality_metrics
+                                self.overlap_ratios = []
                             self._update_quality_visualizations()
                         else:
                             # Fallback to disk-based calculation if metrics weren't calculated
@@ -4847,6 +5120,9 @@ class SAM2VideoUI:
                         # Reload video frames from the new segmented video
                         self.load_video_frames()
 
+                        # Initialize original frame source for segment_current_frame_only
+                        self._initialize_original_frame_source()
+
                         # Restore frame position
                         if 0 <= saved_frame_idx < len(self.frames):
                             self.current_frame_idx = saved_frame_idx
@@ -4917,12 +5193,16 @@ class SAM2VideoUI:
                     self.inter_frame_changes = [0.0] * (total_frames - 1)
                 if not self.background_ratios or len(self.background_ratios) != total_frames:
                     self.background_ratios = [0.0] * total_frames
+                if not self.overlap_ratios or len(self.overlap_ratios) != total_frames:
+                    self.overlap_ratios = [0.0] * total_frames
         else:
             # No output dir, ensure arrays exist
             if not self.inter_frame_changes or len(self.inter_frame_changes) != total_frames - 1:
                 self.inter_frame_changes = [0.0] * (total_frames - 1)
             if not self.background_ratios or len(self.background_ratios) != total_frames:
                 self.background_ratios = [0.0] * total_frames
+            if not self.overlap_ratios or len(self.overlap_ratios) != total_frames:
+                self.overlap_ratios = [0.0] * total_frames
 
         # Load masks for the extended range and recalculate metrics
         masks_path = Path(masks_dir)
@@ -4931,6 +5211,7 @@ class SAM2VideoUI:
         for frame_idx in range(metrics_start, metrics_end + 1):
             # Load all object masks for this frame and combine them
             combined_mask = None
+            overlap_count = None
             frame_pattern = f"mask_f{frame_idx:06d}_*.png"
             mask_files = list(masks_path.glob(frame_pattern))
 
@@ -4940,8 +5221,10 @@ class SAM2VideoUI:
                     if mask is not None:
                         if combined_mask is None:
                             combined_mask = (mask > 0).astype(np.uint8)
+                            overlap_count = (mask > 0).astype(np.int32)
                         else:
                             combined_mask = np.logical_or(combined_mask, mask > 0).astype(np.uint8)
+                            overlap_count += (mask > 0).astype(np.int32)
 
             # Calculate background ratio for this frame
             if combined_mask is not None:
@@ -4949,6 +5232,11 @@ class SAM2VideoUI:
                 foreground_pixels = np.sum(combined_mask > 0)
                 background_ratio = 1.0 - (foreground_pixels / total_pixels)
                 self.background_ratios[frame_idx] = background_ratio
+
+                # Calculate overlap ratio (excess assignments beyond first)
+                excess_overlaps = np.where(overlap_count > 0, overlap_count - 1, 0)
+                overlap_ratio = np.sum(excess_overlaps) / total_pixels
+                self.overlap_ratios[frame_idx] = overlap_ratio
 
             # Calculate inter-frame change (comparing to previous frame)
             if prev_combined_mask is not None and combined_mask is not None and frame_idx > 0:
@@ -6024,14 +6312,22 @@ class SAM2VideoUI:
                 self.status_label.config(text="Segmenting current frame...")
             self.root.update()
 
-            # Get current frame (handle both lazy and eager loading)
-            if self.lazy_load_var.get() and hasattr(self, 'video_props'):
-                current_frame_bgr = self._load_frame_lazy(self.current_frame_idx)
+            # Get current frame
+            # If we have a prerendered segmented video loaded, use the original video source
+            # to avoid double-overlaying masks
+            if self.has_prerendered_masks and self.original_frame_source is not None:
+                current_frame_bgr = self.original_frame_source.get_frame(self.current_frame_idx)
+                if current_frame_bgr is None:
+                    raise RuntimeError(f"Failed to load frame {self.current_frame_idx} from original video")
             else:
-                current_frame_bgr = self.frames[self.current_frame_idx]
+                # Regular case: load from current video (handle both lazy and eager loading)
+                if self.lazy_load_var.get() and hasattr(self, 'video_props'):
+                    current_frame_bgr = self._load_frame_lazy(self.current_frame_idx)
+                else:
+                    current_frame_bgr = self.frames[self.current_frame_idx]
 
-            if current_frame_bgr is None:
-                raise RuntimeError("Failed to load current frame")
+                if current_frame_bgr is None:
+                    raise RuntimeError("Failed to load current frame")
 
             # Convert BGR to RGB
             current_frame_rgb = cv2.cvtColor(current_frame_bgr, cv2.COLOR_BGR2RGB)

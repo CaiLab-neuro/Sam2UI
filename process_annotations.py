@@ -1019,9 +1019,9 @@ class SAM2Processor:
             print(f"OK: Cleaned {model_type} memory")
 
             # Save quality metrics calculated during propagation
-            inter_frame_changes, background_ratios = quality_calculator.get_results()
+            inter_frame_changes, background_ratios, overlap_ratios = quality_calculator.get_results()
             quality_calculator.print_summary()
-            save_quality_metrics(str(output_dir), inter_frame_changes, background_ratios)
+            save_quality_metrics(str(output_dir), inter_frame_changes, background_ratios, overlap_ratios)
 
             print(f"\nOK: Generated masks for {len(masks_metadata)} frames")
             # Return frame_dir to allow reuse during export, defer cleanup to caller

@@ -149,7 +149,7 @@ class SegmentationResult:
         object_colors: Dict mapping object_id -> (R, G, B) tuple
         num_frames_processed: Total number of frames processed
         frame_dimensions: (height, width) of processed frames
-        quality_metrics: Optional tuple of (inter_frame_changes, background_ratios)
+        quality_metrics: Optional tuple of (inter_frame_changes, background_ratios, overlap_ratios)
         inference_state: Optional reference to SAM inference state (for UI reuse)
     """
     masks_metadata: Dict[int, Dict[int, Any]]
@@ -157,7 +157,7 @@ class SegmentationResult:
     object_colors: Dict[int, Tuple[int, int, int]]
     num_frames_processed: int
     frame_dimensions: Tuple[int, int]
-    quality_metrics: Optional[Tuple[List[float], List[float]]] = None
+    quality_metrics: Optional[Tuple[List[float], List[float], List[float]]] = None
     inference_state: Optional[Any] = None
 
 
@@ -977,12 +977,12 @@ class VideoSegmenter:
             # Get quality metrics
             quality_metrics = None
             if quality_calculator is not None:
-                inter_frame_changes, background_ratios = quality_calculator.get_results()
-                quality_metrics = (inter_frame_changes, background_ratios)
+                inter_frame_changes, background_ratios, overlap_ratios = quality_calculator.get_results()
+                quality_metrics = (inter_frame_changes, background_ratios, overlap_ratios)
                 quality_calculator.print_summary()
 
                 # Save quality metrics to disk
-                save_quality_metrics(config.output_dir, inter_frame_changes, background_ratios)
+                save_quality_metrics(config.output_dir, inter_frame_changes, background_ratios, overlap_ratios)
 
             # Clean up inference state memory
             if isinstance(inference_state, dict) and "output_dict_per_obj" in inference_state:
