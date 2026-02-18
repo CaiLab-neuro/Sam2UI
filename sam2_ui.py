@@ -320,6 +320,11 @@ class SAM2VideoUI:
         self.sam3_image_model = None  # Lazy-loaded SAM3 image model (SAM3 only)
         self.sam3_processor = None  # Lazy-loaded Sam3Processor (SAM3 only)
 
+        # Responsive sizing state
+        self._resize_job = None  # Debounce job for window resize
+        self._left_panel_frac = 0.18  # Fraction of window width for left panel (updated on sash drag)
+        self._initial_left_w = 280  # Computed in setup_ui(); used by setup_left_panel()
+
         # SAM2 model
         self.sam2_model = None
         self.model_loaded = False
@@ -366,12 +371,19 @@ class SAM2VideoUI:
     def setup_ui(self):
         main_container = ttk.Frame(self.root)
         main_container.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-        
+
+        # Compute screen-relative initial left panel width
+        # 1920 px → 300 | 1440 px → 259 | 1280 px → 230 | 1024 px → 200
+        screen_w = self.root.winfo_screenwidth()
+        initial_left_w = max(200, min(300, screen_w * 18 // 100))
+        self._initial_left_w = initial_left_w
+        self._left_panel_frac = initial_left_w / max(1, screen_w)
+
         # Create paned window - use tk.PanedWindow instead of ttk.PanedWindow
-        self.paned = tk.PanedWindow(main_container, orient=tk.HORIZONTAL, 
+        self.paned = tk.PanedWindow(main_container, orient=tk.HORIZONTAL,
                                     sashwidth=5, bg='#2b2b2b')
         self.paned.pack(fill=tk.BOTH, expand=True)
-        
+
         # Create panels
         left_panel = ttk.Frame(self.paned)
         right_panel = ttk.Frame(self.paned)
@@ -381,8 +393,11 @@ class SAM2VideoUI:
         self.right_panel = right_panel
 
         # Add panels
-        self.paned.add(left_panel, width=280)  # Set initial width to 280px
+        self.paned.add(left_panel, width=initial_left_w)
         self.paned.add(right_panel)
+
+        # Track user sash drags so we can restore the fraction on resize
+        self.paned.bind('<ButtonRelease-1>', self._on_sash_moved)
 
         # Setup panels
         self.setup_left_panel(left_panel)
@@ -393,7 +408,7 @@ class SAM2VideoUI:
         right_panel.bind('<Button-1>', self._on_panel_click)
 
         # Force sash position after window renders
-        self.root.after(100, lambda: self.paned.sash_place(0, 280, 1))
+        self.root.after(100, lambda w=initial_left_w: self.paned.sash_place(0, w, 1))
         
     def setup_left_panel(self, parent):
         canvas = tk.Canvas(parent, bg='#2b2b2b', highlightthickness=0)
@@ -672,7 +687,8 @@ class SAM2VideoUI:
         status_frame.pack(fill=tk.X)
         status_frame.bind('<Button-1>', self._on_panel_click)
 
-        self.status_label = ttk.Label(status_frame, text="Ready", wraplength=250)
+        self.status_label = ttk.Label(status_frame, text="Ready",
+                                      wraplength=max(150, self._initial_left_w - 30))
         self.status_label.pack(fill=tk.X)
         
         # Progress bar
@@ -886,6 +902,8 @@ class SAM2VideoUI:
         self.overlap_viz_canvas.bind("<Button-1>", self._on_viz_canvas_click)
         self.overlap_viz_canvas.bind("<Configure>", self._on_quality_viz_resize)
 
+        # Bind root Configure for responsive resizing (debounced)
+        self.root.bind('<Configure>', self._on_root_resize)
 
         # Info panel
         info_frame = ttk.Frame(controls_frame)
@@ -894,6 +912,43 @@ class SAM2VideoUI:
         self.points_label = ttk.Label(info_frame, text="No points (Left: +, Right: -)")
         self.points_label.pack(fill=tk.X)
         
+    def _on_sash_moved(self, event):
+        """Update stored left-panel fraction when the user drags the sash."""
+        try:
+            sash_x = self.paned.sash_coord(0)[0]
+            w = self.root.winfo_width()
+            if w > 0:
+                self._left_panel_frac = sash_x / w
+        except Exception:
+            pass
+
+    def _on_root_resize(self, event):
+        """Debounced handler for root window Configure events."""
+        if event.widget is not self.root:
+            return
+        if self._resize_job:
+            self.root.after_cancel(self._resize_job)
+        self._resize_job = self.root.after(150, self._apply_responsive_sizes)
+
+    def _apply_responsive_sizes(self):
+        """Apply screen-relative sizes after a window resize."""
+        self._resize_job = None
+        h = self.root.winfo_height()
+        w = self.root.winfo_width()
+
+        # Quality canvas height: ~1.5 % of window height, bounded 8–20 px
+        canvas_h = max(8, min(20, h // 65))
+        for c in (self.change_viz_canvas, self.bg_viz_canvas, self.overlap_viz_canvas):
+            if c:
+                c.configure(height=canvas_h)
+
+        # Re-apply sash position using stored fraction
+        new_left_w = max(180, min(320, int(w * self._left_panel_frac)))
+        try:
+            self.paned.sash_place(0, new_left_w, 1)
+        except Exception:
+            pass
+
     def update_object_list(self):
         """Update the object list display"""
         # Clear current items
