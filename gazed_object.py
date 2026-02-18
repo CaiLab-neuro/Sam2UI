@@ -124,22 +124,18 @@ class GazeObjectAligner:
 
         return masks
 
-    def load_gaze_data(self, subj, camera):
+    def load_gaze_data(self, gaze_path, world_cam_path):
         """Load gaze data from a CSV file.
         Select gaze data within the cut video duration.
         Label each gaze with the corresponding frame id in the cut video. 
 
         Args:
-            subj (str): The subject identifier.
-            camera (str): The camera identifier.
             gaze_path (str): The file path to the gaze data CSV file.
+            world_cam_path (str): The file path to the world camera timestamps CSV file.
         Returns:
             pd.DataFrame: A DataFrame containing the gaze data within the cut video duration.
         """
-        gaze_path = self.gaze_world_dir + "/" + subj + "_" + camera + "_gaze.csv"
         gaze_dic = pd.read_csv(gaze_path)
-        print(gaze_dic)
-        world_cam_path = self.gaze_world_dir + "/" + subj + "_" + camera + "_world_timestamps.csv"
         world_cam_dic = pd.read_csv(world_cam_path)
     
 
@@ -244,17 +240,25 @@ class GazeObjectAligner:
 
         out_dir = Path(self.output_dir+f'/{subject_id_temp}_gazed_object/')
         out_dir.mkdir(parents=True, exist_ok=True)
-        gaze= self.load_gaze_data(subject_id_temp, camera_temp)
-        if len(gaze) == 0:
+        gaze_path = self.gaze_world_dir + "/" + subject_id_temp + "_" + camera_temp + "_gaze.csv"
+        if not os.path.exists(gaze_path):
             self.logger.warning(f"No gaze data found for subject {subject_id_temp} and camera {camera_temp}. Skipping.")
             return
-        else:
-            self.logger.info(f"Loaded {len(gaze)} gaze points for subject {subject_id_temp} and camera {camera_temp}.")
-
+        
+        world_cam_path = self.gaze_world_dir + "/" + subject_id_temp + "_" + camera_temp + "_world_timestamps.csv"
+        if not os.path.exists(world_cam_path):
+            self.logger.warning(f"No world camera timestamp data found for subject {subject_id_temp} and camera {camera_temp}. Skipping.")
+            return
+        gaze= self.load_gaze_data(gaze_path, world_cam_path)
+    
         if self.blink_dir is None:
             self.logger.info("No blink directory provided, skipping blink labeling.")
             gaze_blink_removed = gaze
         else:
+            if not os.path.exists(os.path.join(self.blink_dir, f"{subject_id_temp}_{camera_temp}_blinks.csv")):
+                self.logger.warning(f"No blink data found for subject {subject_id_temp} and camera {camera_temp}. Skipping blink labeling.")
+                gaze_blink_removed = gaze
+                return
             blink_data = pd.read_csv(os.path.join(self.blink_dir, f"{subject_id_temp}_{camera_temp}_blinks.csv"))
             gaze_blink_labeled= self.label_blinks(blink_data, gaze)
             gaze_blink_labeled.to_csv(os.path.join(out_dir, f"{subject_id_temp}_{camera_temp}_gaze_blink_labeled.csv"), index= False)
@@ -266,13 +270,13 @@ class GazeObjectAligner:
 
         subject_gaze_probabilities= {}
         mask_subject= self.mask_dir + f'/{subject_id_temp}_{camera_temp}/masks/'
+        if not os.path.exists(mask_subject):
+            self.logger.warning(f"Mask directory {mask_subject} does not exist. Skipping subject {subject_id_temp} and camera {camera_temp}.")
+            return
         self.logger.info(f"Loading masks from {mask_subject} for subject {subject_id_temp} and camera {camera_temp}.")
 
         for frame_idx, gdf in gaze_blink_removed.groupby('frame_idx', sort=False):
             masks_one_frame = self.load_mask(int(frame_idx), mask_subject)  # ONE disk read per frame
-            if len(masks_one_frame) == 0:
-                self.logger.warning(f"No masks found for frame {int(frame_idx)}.")
-                continue
             # now score each gaze in that group against those masks
             for i, row in gdf.iterrows():
                 subject_gaze_probabilities[i]= {}
@@ -336,8 +340,16 @@ def main():
     parser.add_argument('output_dir', help='Directory to save output files')
     parser.add_argument('--blink-dir', help='If remove gaze during blinks', required=False)
     parser.add_argument('--log-path', help='Path to the log file', required=False)
-
     args = parser.parse_args()
+
+    if os.path.exists(args.gaze_world_dir) is False:
+        raise FileNotFoundError(f"Gaze and world directory {args.gaze_world_dir} does not exist.")
+    if os.path.exists(args.mask_dir) is False:
+        raise FileNotFoundError(f"Mask directory {args.mask_dir} does not exist.")
+    if args.blink_dir is not None and os.path.exists(args.blink_dir) is False:
+        raise FileNotFoundError(f"Blink directory {args.blink_dir} does not exist.")
+    if os.path.exists(args.log_path) is False and args.log_path is not None:
+        raise FileNotFoundError(f"Log path directory {args.log_path} does not exist.")
 
     # Setup logging
     if args.log_path is None:

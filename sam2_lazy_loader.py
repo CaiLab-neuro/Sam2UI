@@ -49,8 +49,18 @@ class LazyVideoFrameLoader:
         self.img_paths = img_paths
         self.image_size = image_size
         self.offload_video_to_cpu = offload_video_to_cpu
-        self.img_mean = img_mean
-        self.img_std = img_std
+
+        # Ensure img_mean and img_std are on the correct device
+        # This prevents device mismatch errors during normalization
+        if offload_video_to_cpu:
+            # Keep on CPU for offloading mode
+            self.img_mean = img_mean.cpu() if hasattr(img_mean, 'cpu') else img_mean
+            self.img_std = img_std.cpu() if hasattr(img_std, 'cpu') else img_std
+        else:
+            # Move to compute device (CUDA) for non-offloading mode
+            self.img_mean = img_mean.to(compute_device)
+            self.img_std = img_std.to(compute_device)
+
         self.compute_device = compute_device
         self.cache_size = cache_size
 
@@ -103,13 +113,14 @@ class LazyVideoFrameLoader:
 
     def _normalize_frame(self, img):
         """Normalize frame and move to appropriate device"""
-        # Normalize by mean and std
-        img = img - self.img_mean
-        img = img / self.img_std
-
-        # Move to device if not offloading to CPU
+        # IMPORTANT: Move img to correct device FIRST (before arithmetic)
+        # This ensures img and img_mean/img_std are on same device
         if not self.offload_video_to_cpu:
             img = img.to(self.compute_device)
+
+        # Now normalize (both tensors guaranteed on same device)
+        img = img - self.img_mean
+        img = img / self.img_std
 
         return img
 
@@ -132,16 +143,17 @@ class LazyVideoFrameLoader:
         return self.compute_device if not self.offload_video_to_cpu else torch.device('cpu')
 
 
-def enable_lazy_loading(cache_size=20):
+def enable_lazy_loading(cache_size=20, enable_sam3=True):
     """
-    Monkey-patch SAM2 to use lazy loading.
-    Call this BEFORE creating SAM2VideoPredictor.
+    Monkey-patch SAM2 and SAM3 to use lazy loading.
+    Call this BEFORE creating SAM2VideoPredictor or SAM3 model.
 
     Args:
         cache_size: Number of frames to cache (default 20)
                    - Minimum: 10 (6 for lookback + buffer)
                    - Recommended: 20 (~2GB)
                    - Maximum: 50 (~5GB)
+        enable_sam3: Also patch SAM3 if available (default True)
 
     Example:
         enable_lazy_loading(cache_size=20)
@@ -164,7 +176,7 @@ def enable_lazy_loading(cache_size=20):
         compute_device=torch.device("cuda"),
     ):
         """
-        Lazy loading replacement for SAM2's eager loading.
+        Lazy loading replacement for SAM's eager loading.
         Returns a LazyVideoFrameLoader instead of a pre-loaded tensor.
         """
         if isinstance(video_path, str) and os.path.isdir(video_path):
@@ -207,9 +219,32 @@ def enable_lazy_loading(cache_size=20):
     # Monkey-patch SAM2
     sam2_misc.load_video_frames_from_jpg_images = lazy_load_video_frames_from_jpg_images
 
-    print("=" * 60)
-    print("SAM2 LAZY LOADING ENABLED")
-    print("=" * 60)
+    # Also patch SAM3 if available
+    if enable_sam3:
+        try:
+            import sam3.model.utils.sam2_utils as sam3_utils
+
+            # Save original function for potential restoration
+            if not hasattr(sam3_utils, '_original_load_video_frames_from_jpg_images'):
+                sam3_utils._original_load_video_frames_from_jpg_images = \
+                    sam3_utils.load_video_frames_from_jpg_images
+
+            # Monkey-patch SAM3 (note: SAM3 uses different default mean/std)
+            sam3_utils.load_video_frames_from_jpg_images = lazy_load_video_frames_from_jpg_images
+
+            print("=" * 60)
+            print("SAM2 & SAM3 LAZY LOADING ENABLED")
+            print("=" * 60)
+        except ImportError:
+            # SAM3 not available, only patch SAM2
+            print("=" * 60)
+            print("SAM2 LAZY LOADING ENABLED (SAM3 not available)")
+            print("=" * 60)
+    else:
+        print("=" * 60)
+        print("SAM2 LAZY LOADING ENABLED")
+        print("=" * 60)
+
     print(f"Frame cache size: {cache_size}")
     print(f"Expected memory usage: ~{cache_size * 0.1:.1f}GB (vs ~178GB eager)")
     print()
@@ -224,7 +259,7 @@ def disable_lazy_loading():
     if hasattr(sam2_misc, '_original_load_video_frames_from_jpg_images'):
         sam2_misc.load_video_frames_from_jpg_images = \
             sam2_misc._original_load_video_frames_from_jpg_images
-        print("SAM2 lazy loading disabled - using eager loading")
+        print("SAM lazy loading disabled - using eager loading")
     else:
         print("WARNING: Original function not found, lazy loading may not be disabled")
 
