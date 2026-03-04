@@ -257,6 +257,7 @@ class SAM2VideoUI:
         # Button references for highlighting selected options
         self.zoom_buttons = {}  # Map zoom level -> button widget
         self.speed_buttons = {}  # Map speed -> button widget
+        self.step_buttons = {}  # Map step size -> button widget
 
         # Export folder memory (persists across sessions)
         self.last_export_dir = self._load_last_export_dir()
@@ -267,6 +268,9 @@ class SAM2VideoUI:
         self.zoom_jump_scheduled = None  # Timer ID for delayed jump
         self.last_jump_notification = 0  # Timestamp of last notification
         self.slider_manual_change = False  # Track if slider change is from user dragging
+
+        # Navigation step size (frames per left/right/scroll/play tick, independent of slider zoom)
+        self.nav_step_size = tk.IntVar(value=1)
 
         # Playback speed control
         self.playback_speed = tk.DoubleVar(value=1.0)  # 1.0 = normal speed
@@ -911,9 +915,29 @@ class SAM2VideoUI:
         )
         self.speed_info_label.pack(side=tk.LEFT, padx=(10, 0))
 
+        # ---- Step Size ----
+        step_row = ttk.Frame(controls_frame)
+        step_row.pack(fill=tk.X, pady=(0, 5))
+
+        step_frame = ttk.Frame(step_row)
+        step_frame.pack(side=tk.LEFT)
+
+        ttk.Label(step_frame, text="Step Size:").pack(side=tk.LEFT)
+
+        for step in (1, 5, 20):
+            self.step_buttons[step] = ttk.Button(
+                step_frame, text=str(step),
+                command=lambda s=step: self.set_nav_step_size(s),
+                width=6
+            )
+            self.step_buttons[step].pack(side=tk.LEFT, padx=2)
+
+        ttk.Label(step_frame, text="(frames per arrow/scroll/play tick)", foreground='gray').pack(side=tk.LEFT, padx=(10, 0))
+
         # Initialize button highlighting
         self._update_zoom_button_highlight()
         self._update_speed_button_highlight()
+        self._update_step_button_highlight()
 
         # Segmentation quality indicators
         viz_frame = ttk.LabelFrame(controls_frame, text="Segmentation Quality Indicators", padding=5)
@@ -1760,10 +1784,10 @@ class SAM2VideoUI:
             messagebox.showinfo("Info", "No mask found for selected object on current frame")
             return
 
-        # Initialize flash state
+        # Initialize flash state; start False so first toggle → ON (mask visible first)
         self.flash_in_progress = True
         self.flash_obj_id = current_obj_id
-        self.flash_white_on = True
+        self.flash_white_on = False
 
         # Flash 3 times: white for 0.3s, normal for 0.3s
         flash_count = [0]  # Use list to make it mutable in nested function
@@ -1830,6 +1854,32 @@ class SAM2VideoUI:
         # Get last operation
         operation = self.undo_stack.pop()
         action = operation['action']
+
+        if action == 'clear_frame':
+            # Undo clear_frame: restore all removed points at their original indices
+            points = operation['points']
+            indices = operation['indices']
+            obj_id = operation['obj_id']
+            frame_idx = operation['frame_idx']
+            # Insert in ascending index order so each insertion lands at the correct position
+            for idx, point in sorted(zip(indices, points), key=lambda t: t[0]):
+                self.click_points.insert(idx, point)
+            self.annotated_frames.add(frame_idx)
+            self.redo_stack.append(operation)
+            self.annotations_dirty = True
+            self.current_object_id = obj_id
+            self.object_var.set(obj_id)
+            self.object_name_var.set(self.object_names.get(obj_id, f"Object_{obj_id}"))
+            self.update_object_color_display()
+            self.current_frame_idx = frame_idx
+            self.frame_var.set(frame_idx)
+            self.update_object_list()
+            self.update_points_display()
+            self.display_current_frame()
+            obj_name = self.object_names.get(obj_id, f"Object_{obj_id}")
+            self.status_label.config(text=f"Undid clear frame for {obj_name} at frame {frame_idx + 1} ({len(points)} points restored)")
+            return
+
         point = operation['point']
         x, y, is_positive, obj_id, frame_idx = point
 
@@ -1892,6 +1942,34 @@ class SAM2VideoUI:
         # Get operation from redo stack
         operation = self.redo_stack.pop()
         action = operation['action']
+
+        if action == 'clear_frame':
+            # Redo clear_frame: remove all points again
+            points = operation['points']
+            obj_id = operation['obj_id']
+            frame_idx = operation['frame_idx']
+            for point in points:
+                try:
+                    self.click_points.remove(point)
+                except ValueError:
+                    pass
+            remaining_frames = {p[4] for p in self.click_points}
+            self.annotated_frames = self.annotated_frames.intersection(remaining_frames)
+            self.undo_stack.append(operation)
+            self.annotations_dirty = True
+            self.current_object_id = obj_id
+            self.object_var.set(obj_id)
+            self.object_name_var.set(self.object_names.get(obj_id, f"Object_{obj_id}"))
+            self.update_object_color_display()
+            self.current_frame_idx = frame_idx
+            self.frame_var.set(frame_idx)
+            self.update_object_list()
+            self.update_points_display()
+            self.display_current_frame()
+            obj_name = self.object_names.get(obj_id, f"Object_{obj_id}")
+            self.status_label.config(text=f"Redid clear frame for {obj_name} at frame {frame_idx + 1} ({len(points)} points removed)")
+            return
+
         point = operation['point']
         x, y, is_positive, obj_id, frame_idx = point
 
@@ -3239,8 +3317,8 @@ class SAM2VideoUI:
                             (int(x + line_length), int(y)),
                             color, line_thickness)
                 else:
-                    # Draw filled black circle with white minus line
-                    cv2.circle(display_frame, (int(x), int(y)), radius, (0, 0, 0), -1)
+                    # Draw unfilled black circle with white minus line
+                    cv2.circle(display_frame, (int(x), int(y)), radius, (0, 0, 0), line_thickness)
                     cv2.line(display_frame,
                             (int(x - line_length), int(y)),
                             (int(x + line_length), int(y)),
@@ -3641,8 +3719,14 @@ class SAM2VideoUI:
             
     def clear_current_frame_points(self):
         """Clear all click points for the current object on the current frame only"""
-        had_points = any(p[3] == self.current_object_id and p[4] == self.current_frame_idx
-                         for p in self.click_points)
+        removed = [p for p in self.click_points
+                   if p[3] == self.current_object_id and p[4] == self.current_frame_idx]
+        if not removed:
+            return
+
+        # Record original indices for undo restoration
+        indices = [self.click_points.index(p) for p in removed]
+
         self.click_points = [p for p in self.click_points
                              if not (p[3] == self.current_object_id and p[4] == self.current_frame_idx)]
 
@@ -3650,9 +3734,16 @@ class SAM2VideoUI:
         remaining_frames = {p[4] for p in self.click_points}
         self.annotated_frames = self.annotated_frames.intersection(remaining_frames)
 
-        if had_points:
-            self.annotations_dirty = True
-        self.undo_stack.clear()
+        self.annotations_dirty = True
+
+        # Push bulk operation to undo stack so it can be undone with Ctrl+Z
+        self.undo_stack.append({
+            'action': 'clear_frame',
+            'points': removed,
+            'indices': indices,
+            'obj_id': self.current_object_id,
+            'frame_idx': self.current_frame_idx,
+        })
         self.redo_stack.clear()
 
         self.update_points_display()
@@ -3710,23 +3801,17 @@ class SAM2VideoUI:
             self.display_current_frame()
             
     def prev_frame(self):
-        """Go to previous frame (or jump by zoom level)"""
+        """Go to previous frame (jump by nav step size)"""
         if self.frames and self.current_frame_idx > 0:
-            # Reset flash state when changing frames
             self._reset_flash_state()
-            # Jump by the selected zoom level
-            jump_size = self.slider_zoom_level.get()
-            self.current_frame_idx = max(0, self.current_frame_idx - jump_size)
+            self.current_frame_idx = max(0, self.current_frame_idx - self.nav_step_size.get())
             self.display_current_frame()
 
     def next_frame(self):
-        """Go to next frame (or jump by zoom level)"""
+        """Go to next frame (jump by nav step size)"""
         if self.frames and self.current_frame_idx < len(self.frames) - 1:
-            # Reset flash state when changing frames
             self._reset_flash_state()
-            # Jump by the selected zoom level
-            jump_size = self.slider_zoom_level.get()
-            self.current_frame_idx = min(len(self.frames) - 1, self.current_frame_idx + jump_size)
+            self.current_frame_idx = min(len(self.frames) - 1, self.current_frame_idx + self.nav_step_size.get())
             self.display_current_frame()
 
     def _start_continuous_nav(self, direction):
@@ -3919,6 +4004,20 @@ class SAM2VideoUI:
             else:
                 button.configure(style='TButton')  # Normal dark gray background
 
+    def set_nav_step_size(self, step):
+        """Set navigation step size (frames per arrow/scroll/play tick)"""
+        self.nav_step_size.set(step)
+        self._update_step_button_highlight()
+
+    def _update_step_button_highlight(self):
+        """Update step size button styling to show current selection"""
+        current_step = self.nav_step_size.get()
+        for step, button in self.step_buttons.items():
+            if step == current_step:
+                button.configure(style='Selected.TButton')
+            else:
+                button.configure(style='TButton')
+
     def on_slider_change(self, value):
         """Handle frame slider change"""
         # Remove focus from any text entry widgets
@@ -4047,17 +4146,16 @@ class SAM2VideoUI:
             
     def play_video(self):
         """Play video in separate thread"""
-        # Calculate frame step and delay based on video FPS and speed multiplier.
-        # For speed >= 1x: skip frames (step > 1) to achieve speedup, since the
-        # per-frame display overhead dominates and shrinking the delay has no effect.
-        # For speed < 1x: stretch delay to slow down, no skipping.
+        # Frame step = nav_step_size * speed (for speed >= 1x, skip frames to achieve speedup).
+        # For speed < 1x: use nav_step_size with a longer delay to slow down.
         speed = self.playback_speed.get()
+        step_size = self.nav_step_size.get()
         base_delay = 1.0 / self.video_fps  # Delay for original FPS
         if speed >= 1.0:
-            frame_step = max(1, round(speed))
+            frame_step = max(1, round(speed)) * step_size
             adjusted_delay = base_delay
         else:
-            frame_step = 1
+            frame_step = step_size
             adjusted_delay = base_delay / speed
 
         while self.playing and self.frames:
@@ -4099,12 +4197,13 @@ class SAM2VideoUI:
     def play_video_backward(self):
         """Play video in reverse in a separate thread"""
         speed = self.playback_speed.get()
+        step_size = self.nav_step_size.get()
         base_delay = 1.0 / self.video_fps
         if speed >= 1.0:
-            frame_step = max(1, round(speed))
+            frame_step = max(1, round(speed)) * step_size
             adjusted_delay = base_delay
         else:
-            frame_step = 1
+            frame_step = step_size
             adjusted_delay = base_delay / speed
 
         while self.playing_backward and self.frames:
