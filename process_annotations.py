@@ -89,20 +89,23 @@ def _check_sam3_available():
 SAM3_AVAILABLE = _check_sam3_available()
 
 # Model configuration mappings
-# NOTE: Config paths are relative to the sam2 package (Hydra search path: pkg://sam2)
-# Checkpoint paths are absolute/relative to the script directory
+# NOTE: Config paths are absolute filesystem paths to sam_models/sam2/sam2/configs/
+# (matching sam2_ui.py approach; Hydra requires a leading '//' workaround on Linux — see load_model())
+# Checkpoint paths are relative to the script directory
+_SCRIPT_DIR = Path(__file__).parent
+_SAM2_CONFIG_DIR = _SCRIPT_DIR / "sam_models" / "sam2" / "sam2" / "configs"
 MODEL_CONFIGS = {
     # SAM2.1 models (recommended)
-    "sam2.1-tiny": ("configs/sam2.1/sam2.1_hiera_t.yaml", "sam_models/sam2/checkpoints/sam2.1_hiera_tiny.pt"),
-    "sam2.1-small": ("configs/sam2.1/sam2.1_hiera_s.yaml", "sam_models/sam2/checkpoints/sam2.1_hiera_small.pt"),
-    "sam2.1-base+": ("configs/sam2.1/sam2.1_hiera_b+.yaml", "sam_models/sam2/checkpoints/sam2.1_hiera_base_plus.pt"),
-    "sam2.1-large": ("configs/sam2.1/sam2.1_hiera_l.yaml", "sam_models/sam2/checkpoints/sam2.1_hiera_large.pt"),
+    "sam2.1-tiny": (str(_SAM2_CONFIG_DIR / "sam2.1" / "sam2.1_hiera_t.yaml"), "sam_models/sam2/checkpoints/sam2.1_hiera_tiny.pt"),
+    "sam2.1-small": (str(_SAM2_CONFIG_DIR / "sam2.1" / "sam2.1_hiera_s.yaml"), "sam_models/sam2/checkpoints/sam2.1_hiera_small.pt"),
+    "sam2.1-base+": (str(_SAM2_CONFIG_DIR / "sam2.1" / "sam2.1_hiera_b+.yaml"), "sam_models/sam2/checkpoints/sam2.1_hiera_base_plus.pt"),
+    "sam2.1-large": (str(_SAM2_CONFIG_DIR / "sam2.1" / "sam2.1_hiera_l.yaml"), "sam_models/sam2/checkpoints/sam2.1_hiera_large.pt"),
 
     # SAM2 models (legacy)
-    "sam2-tiny": ("configs/sam2/sam2_hiera_t.yaml", "sam_models/sam2/checkpoints/sam2_hiera_tiny.pt"),
-    "sam2-small": ("configs/sam2/sam2_hiera_s.yaml", "sam_models/sam2/checkpoints/sam2_hiera_small.pt"),
-    "sam2-base+": ("configs/sam2/sam2_hiera_b+.yaml", "sam_models/sam2/checkpoints/sam2_hiera_base_plus.pt"),
-    "sam2-large": ("configs/sam2/sam2_hiera_l.yaml", "sam_models/sam2/checkpoints/sam2_hiera_large.pt"),
+    "sam2-tiny": (str(_SAM2_CONFIG_DIR / "sam2" / "sam2_hiera_t.yaml"), "sam_models/sam2/checkpoints/sam2_hiera_tiny.pt"),
+    "sam2-small": (str(_SAM2_CONFIG_DIR / "sam2" / "sam2_hiera_s.yaml"), "sam_models/sam2/checkpoints/sam2_hiera_small.pt"),
+    "sam2-base+": (str(_SAM2_CONFIG_DIR / "sam2" / "sam2_hiera_b+.yaml"), "sam_models/sam2/checkpoints/sam2_hiera_base_plus.pt"),
+    "sam2-large": (str(_SAM2_CONFIG_DIR / "sam2" / "sam2_hiera_l.yaml"), "sam_models/sam2/checkpoints/sam2_hiera_large.pt"),
 
     # SAM3 model
     "sam3": (None, "sam_models/sam3/checkpoints/sam3.pt"),  # Config loaded automatically
@@ -391,16 +394,22 @@ class SAM2Processor:
 
             else:
                 # SAM2 loading
+                # Hydra on Linux strips the leading '/' from absolute paths, so prepend
+                # an extra '/' (matching sam2_ui.py behavior at line ~6472)
+                config_for_hydra = self.config_file
+                if config_for_hydra and config_for_hydra.startswith('/'):
+                    config_for_hydra = '/' + config_for_hydra
+
                 if should_disable_cuda_for_device(device):
                     with DisableCUDADuringInit():
                         self.video_predictor = build_sam2_video_predictor(
-                            config_file=self.config_file,
+                            config_file=config_for_hydra,
                             ckpt_path=self.checkpoint_file,  # Optional parameter
                             device=device
                         )
                 else:
                     self.video_predictor = build_sam2_video_predictor(
-                        config_file=self.config_file,
+                        config_file=config_for_hydra,
                         ckpt_path=self.checkpoint_file,  # Optional parameter
                         device=device
                     )
