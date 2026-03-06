@@ -1018,7 +1018,7 @@ class SAM2Processor:
 
             # Handle SAM2 structure (per-object dict access)
             elif isinstance(inference_state, dict) and "output_dict_per_obj" in inference_state:
-                for obj_idx in range(len(objects_with_annotations)):
+                for obj_idx in range(len(inference_state.get("obj_ids", []))):
                     obj_output_dict = inference_state["output_dict_per_obj"][obj_idx]
                     # Clear non-conditioning frames (keep conditioning for potential refinement)
                     non_cond = obj_output_dict.get("non_cond_frame_outputs", {})
