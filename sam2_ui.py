@@ -35,6 +35,9 @@ from utils import (
     HybridFrameSource,
 )
 
+# Import lazy loader to prevent SAM2 from loading all frames into RAM at inference time
+from sam2_lazy_loader import enable_lazy_loading
+
 # Import shared segmentation module
 from segment import (
     PointAnnotation,
@@ -6476,6 +6479,12 @@ class SAM2VideoUI:
                     raise FileNotFoundError(f"Checkpoint not found: {sam2_checkpoint}\n\nPlease run setup.py to download models.")
                 if not os.path.exists(model_cfg):
                     raise FileNotFoundError(f"Config not found: {model_cfg}\n\nPlease ensure SAM2 is properly installed.")
+
+                # Enable lazy loading BEFORE building the predictor.
+                # This monkey-patches SAM2's load_video_frames_from_jpg_images() so
+                # that init_state() loads frames on-demand (LRU cache) instead of
+                # eagerly loading all frames into RAM (~178GB for 36K frames → ~2GB).
+                enable_lazy_loading(cache_size=20, enable_sam3=True)
 
                 # Import the correct builder for VIDEO segmentation
                 from sam2.build_sam import build_sam2_video_predictor
