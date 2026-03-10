@@ -90,11 +90,22 @@ def setup_logging(log_path: Path):
 
 
 class GazeObjectAligner:
-    def __init__(self, gaze_world_dir: str, mask_dir: str, output_dir: str, blink_dir: Optional[str] = None, logger: Optional[logging.Logger] = None):
+    def __init__(
+        self,
+        gaze_world_dir: str,
+        mask_dir: str,
+        output_dir: str,
+        blink_dir: Optional[str] = None,
+        start_plot_time: Optional[float] = None,
+        end_plot_time: Optional[float] = None,
+        logger: Optional[logging.Logger] = None,
+    ):
         self.gaze_world_dir = gaze_world_dir
         self.mask_dir = mask_dir
         self.output_dir = output_dir
         self.blink_dir = blink_dir
+        self.start_plot_time = start_plot_time
+        self.end_plot_time = end_plot_time
         self.logger = logger or logging.getLogger(__name__)
 
     def load_mask(self, frame_id: int, mask_dir: str) -> dict[str, np.ndarray]:
@@ -174,7 +185,7 @@ class GazeObjectAligner:
         subject_gaze_probabilities: dict[int, dict[str, float]],
         out_dir: Path,
     ) -> None:
-        """Create method figures: trajectory bars and confidence heatmap."""
+        """Create method figures: trajectory trace and confidence heatmap."""
         if gaze_df.empty:
             self.logger.warning(
                 "No gaze rows available for plotting for subject=%s camera=%s",
@@ -203,7 +214,69 @@ class GazeObjectAligner:
             return
         plot_df = plot_df.loc[valid_time].copy()
         timestamp_ns = timestamp_ns[valid_time]
-        time_s = (timestamp_ns - timestamp_ns[0]) / 1e9
+        full_time_s = (timestamp_ns - timestamp_ns[0]) / 1e9
+
+        requested_start_s = 0.0 if self.start_plot_time is None else float(self.start_plot_time)
+        requested_end_s = float(full_time_s[-1]) if self.end_plot_time is None else float(self.end_plot_time)
+
+        if requested_start_s < 0.0:
+            self.logger.warning(
+                "start_plot_time=%.3f is negative for subject=%s camera=%s. Clamping to 0.0.",
+                requested_start_s,
+                subject_id_temp,
+                camera_temp,
+            )
+            requested_start_s = 0.0
+        if requested_end_s < 0.0:
+            self.logger.warning(
+                "end_plot_time=%.3f is negative for subject=%s camera=%s. Clamping to 0.0.",
+                requested_end_s,
+                subject_id_temp,
+                camera_temp,
+            )
+            requested_end_s = 0.0
+        if requested_end_s < requested_start_s:
+            self.logger.warning(
+                (
+                    "Cannot create method figures for subject=%s camera=%s because "
+                    "start_plot_time (%.3f) is greater than end_plot_time (%.3f)."
+                ),
+                subject_id_temp,
+                camera_temp,
+                requested_start_s,
+                requested_end_s,
+            )
+            return
+
+        segment_mask = (full_time_s >= requested_start_s) & (full_time_s <= requested_end_s)
+        if not segment_mask.any():
+            self.logger.warning(
+                (
+                    "No gaze samples in requested plot window [%.3f, %.3f] s for subject=%s camera=%s "
+                    "(available range [0.000, %.3f] s)."
+                ),
+                requested_start_s,
+                requested_end_s,
+                subject_id_temp,
+                camera_temp,
+                float(full_time_s[-1]),
+            )
+            return
+
+        plot_df = plot_df.loc[segment_mask].copy()
+        time_s = full_time_s[segment_mask]
+        self.logger.info(
+            (
+                "Plotting method figures for subject=%s camera=%s using time window [%.3f, %.3f] s "
+                "(available [0.000, %.3f] s, points=%d)."
+            ),
+            subject_id_temp,
+            camera_temp,
+            requested_start_s,
+            requested_end_s,
+            float(full_time_s[-1]),
+            len(plot_df),
+        )
         time_edges = self._build_time_edges(time_s)
 
         if "gazed_object" in plot_df.columns:
@@ -601,8 +674,30 @@ def main():
     parser.add_argument('--camera-id', help='Camera ID e.g. child or child,parent')
     parser.add_argument('--blink-dir', help='If remove gaze during blinks', required=False)
     parser.add_argument('--log-path', help='Path to the log file', required=False)
+    parser.add_argument(
+        '--start-plot-time',
+        type=float,
+        default=None,
+        help='Optional start time in seconds (from recording start) for method-figure plotting.',
+    )
+    parser.add_argument(
+        '--end-plot-time',
+        type=float,
+        default=None,
+        help='Optional end time in seconds (from recording start) for method-figure plotting.',
+    )
 
     args = parser.parse_args()
+    if args.start_plot_time is not None and args.start_plot_time < 0:
+        parser.error("--start-plot-time must be >= 0.")
+    if args.end_plot_time is not None and args.end_plot_time < 0:
+        parser.error("--end-plot-time must be >= 0.")
+    if (
+        args.start_plot_time is not None
+        and args.end_plot_time is not None
+        and args.start_plot_time > args.end_plot_time
+    ):
+        parser.error("--start-plot-time must be <= --end-plot-time.")
 
     # Setup logging
     if args.log_path is None:
@@ -637,6 +732,8 @@ def main():
         args.mask_dir,
         args.output_dir,
         blink_dir=args.blink_dir,
+        start_plot_time=args.start_plot_time,
+        end_plot_time=args.end_plot_time,
         logger=logger,
         )
         logger.info("------- Loaded Files and Directories -------")
@@ -646,12 +743,16 @@ def main():
         logger.info(f"Mask Directory: {args.mask_dir}")
         logger.info(f"Output Directory: {args.output_dir}")
         logger.info(f"Blink Directory: {args.blink_dir}")
+        logger.info(f"Plot Start Time (s): {args.start_plot_time}")
+        logger.info(f"Plot End Time (s): {args.end_plot_time}")
 
     else:
         gaze_aligner = GazeObjectAligner(
         args.gaze_world_dir,
         args.mask_dir,
         args.output_dir,
+        start_plot_time=args.start_plot_time,
+        end_plot_time=args.end_plot_time,
         logger=logger,
         )
         logger.info("------- Loaded Files and Directories -------")
@@ -659,6 +760,8 @@ def main():
         logger.info(f"Gaze Directory: {args.gaze_world_dir}")
         logger.info(f"Mask Directory: {args.mask_dir}")
         logger.info(f"Output Directory: {args.output_dir}")
+        logger.info(f"Plot Start Time (s): {args.start_plot_time}")
+        logger.info(f"Plot End Time (s): {args.end_plot_time}")
         logger.info(f"No blink directory provided, skipping blink labeling.")
 
 
