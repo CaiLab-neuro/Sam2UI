@@ -1156,7 +1156,7 @@ Examples:
 
     parser.add_argument("annotation_file", help="Path to annotation JSON file from SAM2 Video UI")
     parser.add_argument("video_file", help="Path to input video file")
-    parser.add_argument("--output_dir", default="sam2_output", help="Output directory (default: sam2_output)")
+    parser.add_argument("--output-dir", default="sam2_output", help="Output directory (default: sam2_output)")
 
     # Model selection (mutually exclusive)
     model_group = parser.add_mutually_exclusive_group()
