@@ -217,7 +217,7 @@ def clone_sam2_repository():
         return False
 
 def install_sam2_package():
-    """Install SAM2 as editable package"""
+    """Install SAM2 as editable package and compile CUDA extension"""
     print("\nInstalling SAM2 package...")
 
     sam2_dir = Path("sam_models/sam2")
@@ -226,15 +226,57 @@ def install_sam2_package():
         return False
 
     try:
-        # Install SAM2 in editable mode
-        subprocess.run([
-            sys.executable, "-m", "pip", "install", "-e", "./sam_models/sam2"
-        ], check=True, capture_output=True)
+        # Install SAM2 in editable mode (verbose so CUDA build errors are visible)
+        result = subprocess.run([
+            sys.executable, "-m", "pip", "install", "-v", "-e", "./sam_models/sam2"
+        ], capture_output=True, text=True)
+        if result.returncode != 0:
+            print(f"FAILED: Could not install SAM2 package")
+            print(result.stderr[-2000:] if len(result.stderr) > 2000 else result.stderr)
+            return False
         print("OK: SAM2 package installed")
-        return True
-    except subprocess.CalledProcessError as e:
+    except subprocess.CalledProcessError:
         print(f"FAILED: Could not install SAM2 package")
         return False
+
+    # Verify that the CUDA extension (_C) was compiled
+    check = subprocess.run([
+        sys.executable, "-c",
+        "from sam2 import _C; print('OK')"
+    ], capture_output=True, text=True, cwd=str(sam2_dir))
+
+    if check.returncode == 0:
+        print("OK: SAM2 CUDA extension (_C) compiled successfully")
+    else:
+        print("WARNING: SAM2 CUDA extension (_C) was not compiled.")
+        print("  This is non-fatal — segmentation still works, but some post-processing")
+        print("  refinements will be skipped.")
+        print("  To compile manually later:")
+        print(f"    cd {sam2_dir.resolve()} && SAM2_BUILD_CUDA=1 python setup.py build_ext --inplace")
+        print()
+        # Attempt explicit build
+        print("Attempting explicit build of CUDA extension...")
+        build_result = subprocess.run(
+            [sys.executable, "setup.py", "build_ext", "--inplace"],
+            capture_output=True, text=True, cwd=str(sam2_dir.resolve()),
+            env={**os.environ, "SAM2_BUILD_CUDA": "1"}
+        )
+        if build_result.returncode == 0:
+            # Verify again
+            recheck = subprocess.run([
+                sys.executable, "-c", "from sam2 import _C; print('OK')"
+            ], capture_output=True, text=True, cwd=str(sam2_dir))
+            if recheck.returncode == 0:
+                print("OK: CUDA extension compiled on retry")
+            else:
+                print("WARNING: Extension still unavailable after build attempt.")
+                print(build_result.stderr[-1000:] if build_result.stderr else "")
+        else:
+            print("WARNING: Explicit build failed. Check CUDA toolkit installation.")
+            if build_result.stderr:
+                print(build_result.stderr[-1000:])
+
+    return True
 
 def select_models_to_download():
     """Interactive model selection for download"""
@@ -762,6 +804,16 @@ def verify_setup():
         else:
             print(f"ERROR: Could not import SAM2: {sam2_check.stderr.strip()}")
             return False
+
+        # Check CUDA extension
+        c_ext_check = subprocess.run([
+            sys.executable, "-c", "from sam2 import _C; print('OK')"
+        ], capture_output=True, text=True, timeout=10)
+        if c_ext_check.returncode == 0:
+            print("OK: SAM2 CUDA extension (_C) compiled and available")
+        else:
+            print("WARNING: SAM2 CUDA extension (_C) not compiled (non-fatal)")
+            print("         Recompile if needed: cd sam_models/sam2 && python setup.py build_ext --inplace")
 
         if torch.cuda.is_available():
             print(f"OK: CUDA available: {torch.cuda.get_device_name(0)}")

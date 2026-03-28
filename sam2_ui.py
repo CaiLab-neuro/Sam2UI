@@ -220,6 +220,7 @@ class SAM2VideoUI:
         self.multi_frame_annotation_mode = True
         self.annotated_frames = set()  # Track which frames have been annotated
         self.annotations_dirty = False  # True when annotations changed since last export/import
+        self.updated_objects: set = set()  # Object IDs with changed annotations since last segmentation
 
         # Undo/Redo functionality for annotation points
         self.undo_stack = deque(maxlen=10)  # Store removed points for undo (max 10)
@@ -1020,6 +1021,11 @@ class SAM2VideoUI:
         except Exception:
             pass
 
+    def _mark_object_dirty(self, obj_id: int):
+        """Record that this object's annotations have changed since last segmentation"""
+        self.updated_objects.add(obj_id)
+        self.annotations_dirty = True
+
     def update_object_list(self):
         """Update the object list display"""
         # Clear current items
@@ -1048,9 +1054,12 @@ class SAM2VideoUI:
             # Count points for this object
             point_count = sum(1 for _, _, _, oid, _ in self.click_points if oid == obj_id)
 
-            # Insert into tree
+            # Insert into tree (show * for objects with changed annotations)
+            display_name = self.object_names[obj_id]
+            if obj_id in self.updated_objects:
+                display_name += " *"
             item = self.object_tree.insert("", "end", text=str(obj_id),
-                                          values=(self.object_names[obj_id], point_count))
+                                          values=(display_name, point_count))
             
             # Highlight current object
             if obj_id == self.current_object_id:
@@ -1173,6 +1182,7 @@ class SAM2VideoUI:
                 "annotated_frames": sorted(self.annotated_frames),
                 "object_names": self.object_names,
                 "object_colors": {str(k): v for k, v in self.object_colors.items()},
+                "updated_objects": sorted(self.updated_objects),
                 "annotations": []
             }
 
@@ -1207,6 +1217,7 @@ class SAM2VideoUI:
             
             # Show success message (auto-dismisses after 4s)
             self.annotations_dirty = False
+            self.updated_objects.clear()
             self._show_auto_dismiss("Export Complete",
                               f"Annotations exported successfully!\n\n"
                               f"File: {file_path}\n"
@@ -1372,6 +1383,7 @@ class SAM2VideoUI:
             self.undo_stack.clear()
             self.redo_stack.clear()
             self.annotations_dirty = False
+            self.updated_objects.clear()
 
             self._show_auto_dismiss("Import Complete", message, timeout_ms=4000)
 
@@ -1513,6 +1525,7 @@ class SAM2VideoUI:
             self.undo_stack.clear()
             self.redo_stack.clear()
             self.annotations_dirty = False
+            self.updated_objects.clear()
 
             self._show_auto_dismiss("Success",
                               f"Loaded segmentation results successfully!\n\n"
@@ -1869,7 +1882,7 @@ class SAM2VideoUI:
                 self.click_points.insert(idx, point)
             self.annotated_frames.add(frame_idx)
             self.redo_stack.append(operation)
-            self.annotations_dirty = True
+            self._mark_object_dirty(obj_id)
             self.current_object_id = obj_id
             self.object_var.set(obj_id)
             self.object_name_var.set(self.object_names.get(obj_id, f"Object_{obj_id}"))
@@ -1914,7 +1927,7 @@ class SAM2VideoUI:
 
         # Add operation to redo stack
         self.redo_stack.append(operation)
-        self.annotations_dirty = True
+        self._mark_object_dirty(obj_id)
 
         # Switch to the object that the point belonged to
         self.current_object_id = obj_id
@@ -1959,7 +1972,7 @@ class SAM2VideoUI:
             remaining_frames = {p[4] for p in self.click_points}
             self.annotated_frames = self.annotated_frames.intersection(remaining_frames)
             self.undo_stack.append(operation)
-            self.annotations_dirty = True
+            self._mark_object_dirty(obj_id)
             self.current_object_id = obj_id
             self.object_var.set(obj_id)
             self.object_name_var.set(self.object_names.get(obj_id, f"Object_{obj_id}"))
@@ -1999,7 +2012,7 @@ class SAM2VideoUI:
 
         # Add operation back to undo stack
         self.undo_stack.append(operation)
-        self.annotations_dirty = True
+        self._mark_object_dirty(obj_id)
 
         # Switch to the object that the point belongs to
         self.current_object_id = obj_id
@@ -2133,6 +2146,7 @@ class SAM2VideoUI:
         self.display_current_frame()
         
         self.annotations_dirty = False
+        self.updated_objects.clear()
         self._show_auto_dismiss("Import Complete",
                         f"Imported {imported_count} annotations\n"
                         f"Skipped {skipped_count} annotations with invalid frame indices",
@@ -2194,7 +2208,7 @@ class SAM2VideoUI:
         if closest_point_idx is not None and min_distance <= 20:
             removed_point = self.click_points.pop(closest_point_idx)
             px, py, is_pos, obj_id, f_idx = removed_point
-            self.annotations_dirty = True
+            self._mark_object_dirty(obj_id)
 
             # Store removal operation for undo
             operation = {
@@ -3681,7 +3695,7 @@ class SAM2VideoUI:
                 # Store frame-aware point
                 self.click_points.append((img_x, img_y, is_positive,
                                         self.current_object_id, self.current_frame_idx))
-                self.annotations_dirty = True
+                self._mark_object_dirty(self.current_object_id)
 
                 # Track annotated frames in multi-frame annotation mode
                 if self.multi_frame_annotation_mode:
@@ -3737,7 +3751,7 @@ class SAM2VideoUI:
         remaining_frames = {p[4] for p in self.click_points}
         self.annotated_frames = self.annotated_frames.intersection(remaining_frames)
 
-        self.annotations_dirty = True
+        self._mark_object_dirty(self.current_object_id)
 
         # Push bulk operation to undo stack so it can be undone with Ctrl+Z
         self.undo_stack.append({
@@ -3766,7 +3780,7 @@ class SAM2VideoUI:
 
         # Clear undo/redo history (bulk operation, not individually undoable)
         if had_points:
-            self.annotations_dirty = True
+            self._mark_object_dirty(self.current_object_id)
         self.undo_stack.clear()
         self.redo_stack.clear()
 
@@ -3781,7 +3795,7 @@ class SAM2VideoUI:
         # Remove points for current object
         self.click_points = [p for p in self.click_points if p[3] != self.current_object_id]
         if had_points:
-            self.annotations_dirty = True
+            self._mark_object_dirty(self.current_object_id)
         
         # Remove masks for current object
         for frame_idx in self.masks:
@@ -4852,6 +4866,37 @@ class SAM2VideoUI:
             messagebox.showerror("Directory Error", f"Failed to create output directories: {e}")
             return
 
+        # Check if only-updated mode is applicable
+        only_updated = False
+        unchanged_ids: set = set()
+        prev_masks_dir = None
+        if (self.updated_objects
+                and hasattr(self, 'mask_export_dir')
+                and self.mask_export_dir
+                and os.path.isdir(self.mask_export_dir)):
+            all_obj_ids = set(self.object_names.keys())
+            candidates_for_reuse = all_obj_ids - self.updated_objects
+            if candidates_for_reuse:
+                answer = messagebox.askyesnocancel(
+                    "Partial Re-segmentation",
+                    f"{len(self.updated_objects)} object(s) have updated annotations "
+                    f"(IDs: {', '.join(str(i) for i in sorted(self.updated_objects))}).\n\n"
+                    f"Re-segment only updated objects and reuse existing masks for "
+                    f"unchanged object(s) (IDs: {', '.join(str(i) for i in sorted(candidates_for_reuse))})"
+                    f"?\n\n"
+                    f"[Yes] Re-segment updated objects only\n"
+                    f"[No] Re-segment all objects\n"
+                    f"[Cancel] Abort"
+                )
+                if answer is None:  # Cancel
+                    return
+                if answer:  # Yes
+                    only_updated = True
+                    unchanged_ids = candidates_for_reuse
+                    prev_masks_dir = self.mask_export_dir
+                    print(f"Partial re-segmentation: updating {sorted(self.updated_objects)}, "
+                          f"reusing masks for {sorted(unchanged_ids)}")
+
         try:
             self.status_label.config(text="Preparing for segmentation...")
             self.progress_bar.pack(fill=tk.X, pady=(5, 0))
@@ -4897,6 +4942,8 @@ class SAM2VideoUI:
                 annotations = []
                 for x, y, is_pos, obj_id, frame_idx in self.click_points:
                     if frame_idx not in frames_to_process:
+                        continue
+                    if only_updated and obj_id not in self.updated_objects:
                         continue
 
                     # Get sequential index for SAM
@@ -4976,11 +5023,49 @@ class SAM2VideoUI:
                             self.masks[frame_idx] = {}
                         self.masks[frame_idx][obj_id] = None  # Placeholder
 
+                # Merge unchanged masks from previous directory (only-updated mode)
+                if only_updated and unchanged_ids and prev_masks_dir:
+                    import re as _re
+                    import shutil as _shutil
+                    _mask_pattern = _re.compile(r"^mask_f(\d{6})_(.+)_id(\d+)\.png$")
+                    _prev_path = Path(prev_masks_dir)
+                    _new_path = Path(export_dir)
+                    _merged = 0
+                    for _fp in sorted(_prev_path.glob("mask_f*.png")):
+                        _m = _mask_pattern.match(_fp.name)
+                        if not _m:
+                            continue
+                        _oid = int(_m.group(3))
+                        if _oid not in unchanged_ids:
+                            continue
+                        _fidx = int(_m.group(1))
+                        _obj_name = _m.group(2)
+                        # Copy file if target dir differs
+                        if _prev_path.resolve() != _new_path.resolve():
+                            _dst = _new_path / _fp.name
+                            if not _dst.exists():
+                                _shutil.copy2(str(_fp), str(_dst))
+                        # Merge into metadata and self.masks
+                        mask_metadata.append({
+                            'frame_idx': _fidx,
+                            'obj_id': _oid,
+                            'mask_file': _fp.name,
+                            'object_name': self.object_names.get(_oid, _obj_name),
+                            'color': self.object_colors.get(_oid, (255, 0, 0))
+                        })
+                        if _fidx not in self.masks:
+                            self.masks[_fidx] = {}
+                        self.masks[_fidx][_oid] = None
+                        _merged += 1
+                    print(f"Reused {_merged} masks for unchanged objects {sorted(unchanged_ids)} from {_prev_path}")
+
                 # Store export directory
                 self.mask_export_dir = export_dir
 
-                # Get quality metrics from result
-                quality_metrics = result.quality_metrics
+                # Get quality metrics from result.
+                # If only-updated mode was used, result.quality_metrics only covers the updated
+                # objects; force recalculation from the full merged self.masks instead.
+                quality_metrics = None if only_updated else result.quality_metrics
                 propagation_success = len(mask_metadata) > 0
 
                 # Save metadata and temporary directory
@@ -5032,6 +5117,7 @@ class SAM2VideoUI:
                 if propagation_success and total_masks > 0:
                     self.status_label.config(text=f"Segmentation complete! Generated {total_masks} masks for {len(unique_objects)} objects")
                     # Multi-frame annotation mode stays active for continued annotation
+                    self.updated_objects.clear()  # All objects are now up to date
 
                     # Enable Flash Mask button now that segmentation is complete
                     self._enable_flash_mask_button()
