@@ -35,6 +35,9 @@ from utils import (
     HybridFrameSource,
 )
 
+# Import lazy loader to prevent SAM2 from loading all frames into RAM at inference time
+from sam2_lazy_loader import enable_lazy_loading
+
 # Import shared segmentation module
 from segment import (
     PointAnnotation,
@@ -202,6 +205,7 @@ class SAM2VideoUI:
         self.masks = {}  # Store masks for each frame {frame_idx: {obj_id: mask}}
         self.has_segmentation = False  # Track if segmentation has been completed or loaded
         self.playing = False
+        self.playing_backward = False
         self.inference_state = None
         self.current_object_id = 1  # Currently selected object ID
         self.max_object_id = 1  # Track highest object ID used
@@ -215,6 +219,8 @@ class SAM2VideoUI:
         # Multi-frame annotation mode (always enabled)
         self.multi_frame_annotation_mode = True
         self.annotated_frames = set()  # Track which frames have been annotated
+        self.annotations_dirty = False  # True when annotations changed since last export/import
+        self.updated_objects: set = set()  # Object IDs with changed annotations since last segmentation
 
         # Undo/Redo functionality for annotation points
         self.undo_stack = deque(maxlen=10)  # Store removed points for undo (max 10)
@@ -224,6 +230,10 @@ class SAM2VideoUI:
         self.flash_in_progress = False
         self.flash_obj_id = None
         self.flash_white_on = False
+
+        # Point flash animation state
+        self.flash_points_in_progress = False
+        self.flash_points_on = False
 
         # Background task tracking
         self.active_exports = []
@@ -251,6 +261,7 @@ class SAM2VideoUI:
         # Button references for highlighting selected options
         self.zoom_buttons = {}  # Map zoom level -> button widget
         self.speed_buttons = {}  # Map speed -> button widget
+        self.step_buttons = {}  # Map step size -> button widget
 
         # Export folder memory (persists across sessions)
         self.last_export_dir = self._load_last_export_dir()
@@ -261,6 +272,9 @@ class SAM2VideoUI:
         self.zoom_jump_scheduled = None  # Timer ID for delayed jump
         self.last_jump_notification = 0  # Timestamp of last notification
         self.slider_manual_change = False  # Track if slider change is from user dragging
+
+        # Navigation step size (frames per left/right/scroll/play tick, independent of slider zoom)
+        self.nav_step_size = tk.IntVar(value=1)
 
         # Playback speed control
         self.playback_speed = tk.DoubleVar(value=1.0)  # 1.0 = normal speed
@@ -320,6 +334,11 @@ class SAM2VideoUI:
         self.sam3_image_model = None  # Lazy-loaded SAM3 image model (SAM3 only)
         self.sam3_processor = None  # Lazy-loaded Sam3Processor (SAM3 only)
 
+        # Responsive sizing state
+        self._resize_job = None  # Debounce job for window resize
+        self._left_panel_frac = 0.18  # Fraction of window width for left panel (updated on sash drag)
+        self._initial_left_w = 280  # Computed in setup_ui(); used by setup_left_panel()
+
         # SAM2 model
         self.sam2_model = None
         self.model_loaded = False
@@ -366,12 +385,19 @@ class SAM2VideoUI:
     def setup_ui(self):
         main_container = ttk.Frame(self.root)
         main_container.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-        
+
+        # Compute screen-relative initial left panel width
+        # 1920 px → 300 | 1440 px → 259 | 1280 px → 230 | 1024 px → 200
+        screen_w = self.root.winfo_screenwidth()
+        initial_left_w = max(200, min(300, screen_w * 18 // 100))
+        self._initial_left_w = initial_left_w
+        self._left_panel_frac = initial_left_w / max(1, screen_w)
+
         # Create paned window - use tk.PanedWindow instead of ttk.PanedWindow
-        self.paned = tk.PanedWindow(main_container, orient=tk.HORIZONTAL, 
+        self.paned = tk.PanedWindow(main_container, orient=tk.HORIZONTAL,
                                     sashwidth=5, bg='#2b2b2b')
         self.paned.pack(fill=tk.BOTH, expand=True)
-        
+
         # Create panels
         left_panel = ttk.Frame(self.paned)
         right_panel = ttk.Frame(self.paned)
@@ -381,8 +407,11 @@ class SAM2VideoUI:
         self.right_panel = right_panel
 
         # Add panels
-        self.paned.add(left_panel, width=280)  # Set initial width to 280px
+        self.paned.add(left_panel, width=initial_left_w)
         self.paned.add(right_panel)
+
+        # Track user sash drags so we can restore the fraction on resize
+        self.paned.bind('<ButtonRelease-1>', self._on_sash_moved)
 
         # Setup panels
         self.setup_left_panel(left_panel)
@@ -393,7 +422,7 @@ class SAM2VideoUI:
         right_panel.bind('<Button-1>', self._on_panel_click)
 
         # Force sash position after window renders
-        self.root.after(100, lambda: self.paned.sash_place(0, 280, 1))
+        self.root.after(100, lambda w=initial_left_w: self.paned.sash_place(0, w, 1))
         
     def setup_left_panel(self, parent):
         canvas = tk.Canvas(parent, bg='#2b2b2b', highlightthickness=0)
@@ -524,25 +553,30 @@ class SAM2VideoUI:
         self.object_tree.bind('<Leave>', lambda e: setattr(self, '_mouse_over_scrollable', False))
 
         # Point management controls
-        ttk.Button(obj_frame, text="Show Frame Points",
-                  command=self.show_frame_points, width=15).pack(fill=tk.X, pady=2)
-
         point_mgmt_frame = ttk.Frame(obj_frame)
         point_mgmt_frame.pack(fill=tk.X, pady=2)
 
-        self.remove_point_button = tk.Button(point_mgmt_frame, text="Remove Point (R)",
-                  command=self.toggle_point_removal_mode, width=14,
+        self.remove_point_button = tk.Button(point_mgmt_frame, text="Remove Point",
+                  command=self.toggle_point_removal_mode, underline=0,
                   bg='#404040', fg='white', activebackground='#505050')
-        self.remove_point_button.pack(side=tk.LEFT, padx=(0, 5))
+        self.remove_point_button.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 5))
 
-        ttk.Button(point_mgmt_frame, text="Clear All",
-                  command=self.clear_points, width=12).pack(side=tk.LEFT)
+        ttk.Button(point_mgmt_frame, text="Clear Frame",
+                  command=self.clear_current_frame_points).pack(side=tk.LEFT, fill=tk.X, expand=True)
 
-        # Flash mask button (disabled until segmentation is complete)
-        self.flash_mask_button = ttk.Button(obj_frame, text="Flash Mask (F)",
+        # Flash buttons row (mask and points side by side, both share 'f' shortcut)
+        flash_row = ttk.Frame(obj_frame)
+        flash_row.pack(fill=tk.X, pady=2)
+
+        self.flash_mask_button = ttk.Button(flash_row, text="Flash Mask",
                                            command=self.flash_selected_object_mask,
-                                           width=15, state='disabled')
-        self.flash_mask_button.pack(fill=tk.X, pady=2)
+                                           underline=0, state='disabled')
+        self.flash_mask_button.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 2))
+
+        self.flash_points_button = ttk.Button(flash_row, text="Flash Points",
+                                             command=self.flash_frame_points,
+                                             underline=0, state='disabled')
+        self.flash_points_button.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         # Model Configuration (Model selection + GPU selection merged)
         model_frame = ttk.LabelFrame(scrollable_frame, text="Model Configuration", padding=10)
@@ -672,7 +706,8 @@ class SAM2VideoUI:
         status_frame.pack(fill=tk.X)
         status_frame.bind('<Button-1>', self._on_panel_click)
 
-        self.status_label = ttk.Label(status_frame, text="Ready", wraplength=250)
+        self.status_label = ttk.Label(status_frame, text="Ready",
+                                      wraplength=max(150, self._initial_left_w - 30))
         self.status_label.pack(fill=tk.X)
         
         # Progress bar
@@ -700,7 +735,21 @@ class SAM2VideoUI:
         v_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         h_scrollbar.pack(side=tk.BOTTOM, fill=tk.X)
         self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        
+
+        # Overlay labels (placed over canvas, always at canvas-widget corners)
+        _overlay_font = ('TkDefaultFont', 10)
+        _overlay_bg = '#1a1a1a'
+        self._overlay_label_tl = tk.Label(self.canvas, text="", fg='#cccccc', bg=_overlay_bg,
+                                           font=_overlay_font, padx=4, pady=2)
+        self._overlay_label_tr = tk.Label(self.canvas, text="", fg='white', bg=_overlay_bg,
+                                           font=_overlay_font, padx=4, pady=2)
+        self._overlay_label_bl = tk.Label(self.canvas, text="", fg='#aaaaaa', bg=_overlay_bg,
+                                           font=_overlay_font, padx=4, pady=2)
+        # Place at canvas corners (relx/rely = relative to canvas widget, x/y = pixel offset from that anchor)
+        self._overlay_label_tl.place(relx=0.0, rely=0.0, x=6, y=6, anchor=tk.NW)
+        self._overlay_label_tr.place(relx=1.0, rely=0.0, x=-6, y=6, anchor=tk.NE)
+        self._overlay_label_bl.place(relx=0.0, rely=1.0, x=6, y=-6, anchor=tk.SW)
+
         # Bind canvas events
         self.canvas.bind("<Button-1>", self.on_canvas_click)
         self.canvas.bind("<Button-3>", self.on_canvas_right_click)
@@ -734,6 +783,22 @@ class SAM2VideoUI:
         # Toggle point removal mode: R key
         self.root.bind('r', lambda e: self._handle_toggle_removal_shortcut())
 
+        # Category list navigation: Home/End keys
+        self.root.bind('<Home>', lambda e: self._handle_home_shortcut())
+        self.root.bind('<End>', lambda e: self._handle_end_shortcut())
+
+        # Jump to prev/next annotated frame for current object: PageUp/PageDown
+        self.root.bind('<Prior>', lambda e: self._handle_annotated_frame_shortcut(e, 'prev'))
+        self.root.bind('<Next>', lambda e: self._handle_annotated_frame_shortcut(e, 'next'))
+
+        # Display zoom: Ctrl++ / Ctrl+= to zoom in, Ctrl+- to zoom out
+        self.root.bind('<Control-plus>', lambda e: self._handle_keyboard_zoom(1))
+        self.root.bind('<Control-equal>', lambda e: self._handle_keyboard_zoom(1))   # unshifted + key
+        self.root.bind('<Control-minus>', lambda e: self._handle_keyboard_zoom(-1))
+        self.root.bind('<Command-plus>', lambda e: self._handle_keyboard_zoom(1))    # Mac
+        self.root.bind('<Command-equal>', lambda e: self._handle_keyboard_zoom(1))   # Mac unshifted
+        self.root.bind('<Command-minus>', lambda e: self._handle_keyboard_zoom(-1))  # Mac
+
         # Video controls
         controls_frame = ttk.Frame(parent)
         controls_frame.pack(fill=tk.X)
@@ -745,6 +810,9 @@ class SAM2VideoUI:
         
         self.play_button = ttk.Button(playback_frame, text="Play", command=self.toggle_play)
         self.play_button.pack(side=tk.LEFT, padx=(0, 5))
+
+        self.play_backward_button = ttk.Button(playback_frame, text="Play Rev", command=self.toggle_play_backward)
+        self.play_backward_button.pack(side=tk.LEFT, padx=(0, 5))
 
         # Prev/Next buttons with hold-to-scroll support
         self.prev_button = tk.Button(playback_frame, text="Prev", bg='#404040', fg='white')
@@ -851,9 +919,29 @@ class SAM2VideoUI:
         )
         self.speed_info_label.pack(side=tk.LEFT, padx=(10, 0))
 
+        # ---- Step Size ----
+        step_row = ttk.Frame(controls_frame)
+        step_row.pack(fill=tk.X, pady=(0, 5))
+
+        step_frame = ttk.Frame(step_row)
+        step_frame.pack(side=tk.LEFT)
+
+        ttk.Label(step_frame, text="Step Size:").pack(side=tk.LEFT)
+
+        for step in (1, 5, 20):
+            self.step_buttons[step] = ttk.Button(
+                step_frame, text=str(step),
+                command=lambda s=step: self.set_nav_step_size(s),
+                width=6
+            )
+            self.step_buttons[step].pack(side=tk.LEFT, padx=2)
+
+        ttk.Label(step_frame, text="(frames per arrow/scroll/play tick)", foreground='gray').pack(side=tk.LEFT, padx=(10, 0))
+
         # Initialize button highlighting
         self._update_zoom_button_highlight()
         self._update_speed_button_highlight()
+        self._update_step_button_highlight()
 
         # Segmentation quality indicators
         viz_frame = ttk.LabelFrame(controls_frame, text="Segmentation Quality Indicators", padding=5)
@@ -886,6 +974,8 @@ class SAM2VideoUI:
         self.overlap_viz_canvas.bind("<Button-1>", self._on_viz_canvas_click)
         self.overlap_viz_canvas.bind("<Configure>", self._on_quality_viz_resize)
 
+        # Bind root Configure for responsive resizing (debounced)
+        self.root.bind('<Configure>', self._on_root_resize)
 
         # Info panel
         info_frame = ttk.Frame(controls_frame)
@@ -894,6 +984,48 @@ class SAM2VideoUI:
         self.points_label = ttk.Label(info_frame, text="No points (Left: +, Right: -)")
         self.points_label.pack(fill=tk.X)
         
+    def _on_sash_moved(self, event):
+        """Update stored left-panel fraction when the user drags the sash."""
+        try:
+            sash_x = self.paned.sash_coord(0)[0]
+            w = self.root.winfo_width()
+            if w > 0:
+                self._left_panel_frac = sash_x / w
+        except Exception:
+            pass
+
+    def _on_root_resize(self, event):
+        """Debounced handler for root window Configure events."""
+        if event.widget is not self.root:
+            return
+        if self._resize_job:
+            self.root.after_cancel(self._resize_job)
+        self._resize_job = self.root.after(150, self._apply_responsive_sizes)
+
+    def _apply_responsive_sizes(self):
+        """Apply screen-relative sizes after a window resize."""
+        self._resize_job = None
+        h = self.root.winfo_height()
+        w = self.root.winfo_width()
+
+        # Quality canvas height: ~1.5 % of window height, bounded 8–20 px
+        canvas_h = max(8, min(20, h // 65))
+        for c in (self.change_viz_canvas, self.bg_viz_canvas, self.overlap_viz_canvas):
+            if c:
+                c.configure(height=canvas_h)
+
+        # Re-apply sash position using stored fraction
+        new_left_w = max(180, min(320, int(w * self._left_panel_frac)))
+        try:
+            self.paned.sash_place(0, new_left_w, 1)
+        except Exception:
+            pass
+
+    def _mark_object_dirty(self, obj_id: int):
+        """Record that this object's annotations have changed since last segmentation"""
+        self.updated_objects.add(obj_id)
+        self.annotations_dirty = True
+
     def update_object_list(self):
         """Update the object list display"""
         # Clear current items
@@ -922,9 +1054,12 @@ class SAM2VideoUI:
             # Count points for this object
             point_count = sum(1 for _, _, _, oid, _ in self.click_points if oid == obj_id)
 
-            # Insert into tree
+            # Insert into tree (show * for objects with changed annotations)
+            display_name = self.object_names[obj_id]
+            if obj_id in self.updated_objects:
+                display_name += " *"
             item = self.object_tree.insert("", "end", text=str(obj_id),
-                                          values=(self.object_names[obj_id], point_count))
+                                          values=(display_name, point_count))
             
             # Highlight current object
             if obj_id == self.current_object_id:
@@ -980,8 +1115,7 @@ class SAM2VideoUI:
                 self.undo_stack.clear()
                 self.redo_stack.clear()
 
-                messagebox.showinfo("Import Complete",
-                                  f"Successfully imported {custom_count} custom objects ({imported_count} available)")
+                self.status_label.config(text=f"Imported {custom_count} custom objects ({imported_count} available)")
 
         except Exception as e:
             messagebox.showerror("Import Error", f"Failed to import object list: {str(e)}")
@@ -1014,7 +1148,7 @@ class SAM2VideoUI:
                             'color_b': color[2]
                         })
                     
-            messagebox.showinfo("Export Complete", f"Object list exported to {file_path}")
+            self.status_label.config(text=f"Object list exported to {os.path.basename(file_path)}")
             
         except Exception as e:
             messagebox.showerror("Export Error", f"Failed to export object list: {str(e)}")
@@ -1048,6 +1182,7 @@ class SAM2VideoUI:
                 "annotated_frames": sorted(self.annotated_frames),
                 "object_names": self.object_names,
                 "object_colors": {str(k): v for k, v in self.object_colors.items()},
+                "updated_objects": sorted(self.updated_objects),
                 "annotations": []
             }
 
@@ -1080,13 +1215,15 @@ class SAM2VideoUI:
             with open(file_path, 'w') as f:
                 json.dump(annotation_data, f, indent=2)
             
-            # Show success message
-            messagebox.showinfo("Export Complete", 
+            # Show success message (auto-dismisses after 4s)
+            self.annotations_dirty = False
+            self.updated_objects.clear()
+            self._show_auto_dismiss("Export Complete",
                               f"Annotations exported successfully!\n\n"
                               f"File: {file_path}\n"
                               f"Total annotations: {len(self.click_points)}\n"
                               f"Annotated frames: {len(self.annotated_frames)}\n"
-                              f"Objects: {len(self.object_names)}")
+                              f"Objects: {len(self.object_names)}", timeout_ms=4000)
             
         except Exception as e:
             messagebox.showerror("Export Error", f"Failed to export annotations: {str(e)}")
@@ -1245,8 +1382,10 @@ class SAM2VideoUI:
             # Clear undo/redo history when importing (new data, no history)
             self.undo_stack.clear()
             self.redo_stack.clear()
+            self.annotations_dirty = False
+            self.updated_objects.clear()
 
-            messagebox.showinfo("Import Complete", message)
+            self._show_auto_dismiss("Import Complete", message, timeout_ms=4000)
 
         except Exception as e:
             messagebox.showerror("Import Error", f"Failed to import annotations: {str(e)}")
@@ -1385,13 +1524,15 @@ class SAM2VideoUI:
             # Clear undo/redo history when importing (new data, no history)
             self.undo_stack.clear()
             self.redo_stack.clear()
+            self.annotations_dirty = False
+            self.updated_objects.clear()
 
-            messagebox.showinfo("Success",
+            self._show_auto_dismiss("Success",
                               f"Loaded segmentation results successfully!\n\n"
                               f"Video: {os.path.basename(segmented_video_path)}\n"
                               f"Frames: {len(self.frames)}\n"
                               f"Objects: {num_objects}\n"
-                              f"Annotations: {num_annotations}")
+                              f"Annotations: {num_annotations}", timeout_ms=4000)
 
         except Exception as e:
             messagebox.showerror("Import Error", f"Failed to import masks: {str(e)}")
@@ -1488,6 +1629,8 @@ class SAM2VideoUI:
         self.flash_in_progress = False
         self.flash_obj_id = None
         self.flash_white_on = False
+        self.flash_points_in_progress = False
+        self.flash_points_on = False
 
     def _enable_flash_mask_button(self):
         """Enable Flash Mask button when segmentation is available"""
@@ -1507,9 +1650,13 @@ class SAM2VideoUI:
             self.canvas.focus_set()
 
     def _handle_flash_shortcut(self):
-        """Handle 'f' key shortcut for flashing mask (only if not typing in text field)"""
-        if not self._should_ignore_keyboard_shortcut():
+        """Handle 'f' key shortcut: flash mask and/or points depending on availability"""
+        if self._should_ignore_keyboard_shortcut():
+            return
+        if hasattr(self, 'flash_mask_button') and str(self.flash_mask_button.cget('state')) == 'normal':
             self.flash_selected_object_mask()
+        if hasattr(self, 'flash_points_button') and str(self.flash_points_button.cget('state')) == 'normal':
+            self.flash_frame_points()
 
     def _handle_toggle_removal_shortcut(self):
         """Handle 'r' key shortcut for toggling removal mode (only if not typing in text field)"""
@@ -1535,6 +1682,75 @@ class SAM2VideoUI:
         """Handle Down arrow key for next object (only if not typing in text field)"""
         if not self._should_ignore_keyboard_shortcut():
             self.next_object()
+
+    def _handle_keyboard_zoom(self, delta):
+        """Handle Ctrl++/Ctrl+- keyboard zoom, anchored to current cursor position over canvas."""
+        if self._should_ignore_keyboard_shortcut():
+            return
+        if not self.frames or self.current_frame is None:
+            return
+
+        # Get pointer position in screen coordinates
+        ptr_x = self.root.winfo_pointerx()
+        ptr_y = self.root.winfo_pointery()
+
+        # Convert to canvas-relative coordinates
+        canvas_root_x = self.canvas.winfo_rootx()
+        canvas_root_y = self.canvas.winfo_rooty()
+        canvas_width = self.canvas.winfo_width()
+        canvas_height = self.canvas.winfo_height()
+
+        canvas_x = ptr_x - canvas_root_x
+        canvas_y = ptr_y - canvas_root_y
+
+        # If cursor is outside the canvas, anchor to canvas center
+        if canvas_x < 0 or canvas_x >= canvas_width or canvas_y < 0 or canvas_y >= canvas_height:
+            canvas_x = canvas_width // 2
+            canvas_y = canvas_height // 2
+
+        # Build a minimal event-like object for _handle_zoom
+        class _FakeEvent:
+            pass
+        ev = _FakeEvent()
+        ev.x = canvas_x
+        ev.y = canvas_y
+
+        self._handle_zoom(ev, delta)
+
+    def _handle_home_shortcut(self):
+        """Jump to first object in the visible category list"""
+        if self._should_ignore_keyboard_shortcut():
+            return
+        children = self.object_tree.get_children()
+        if children:
+            obj_id = int(self.object_tree.item(children[0], "text"))
+            self.object_var.set(obj_id)
+            self.on_object_change()
+
+    def _handle_end_shortcut(self):
+        """Jump to last object in the visible category list that has a custom name"""
+        if self._should_ignore_keyboard_shortcut():
+            return
+        generic_pattern = re.compile(r'^Object_\d+$')
+        children = self.object_tree.get_children()
+        target_item = None
+        for item in children:
+            name = self.object_tree.item(item, "values")[0]
+            if not generic_pattern.match(name):
+                target_item = item
+        if target_item:
+            obj_id = int(self.object_tree.item(target_item, "text"))
+            self.object_var.set(obj_id)
+            self.on_object_change()
+
+    def _handle_annotated_frame_shortcut(self, event, direction):
+        """Handle PageUp/PageDown keys to jump between annotated frames (only if not typing)"""
+        if self._should_ignore_keyboard_shortcut():
+            return
+        if direction == 'prev':
+            self.jump_to_prev_annotated_frame()
+        else:
+            self.jump_to_next_annotated_frame()
 
     def flash_selected_object_mask(self):
         """Flash the mask for the currently selected object with white color"""
@@ -1584,10 +1800,10 @@ class SAM2VideoUI:
             messagebox.showinfo("Info", "No mask found for selected object on current frame")
             return
 
-        # Initialize flash state
+        # Initialize flash state; start False so first toggle → ON (mask visible first)
         self.flash_in_progress = True
         self.flash_obj_id = current_obj_id
-        self.flash_white_on = True
+        self.flash_white_on = False
 
         # Flash 3 times: white for 0.3s, normal for 0.3s
         flash_count = [0]  # Use list to make it mutable in nested function
@@ -1614,6 +1830,37 @@ class SAM2VideoUI:
         # Start flashing
         flash_step()
 
+    def flash_frame_points(self):
+        """Flash annotation points for the current object on the current frame"""
+        current_obj_id = self.current_object_id
+        frame_points = [p for p in self.click_points
+                        if p[3] == current_obj_id and p[4] == self.current_frame_idx]
+        if not frame_points:
+            return  # No points on this frame, do nothing
+
+        self.flash_points_in_progress = True
+        self.flash_points_on = True
+
+        flash_count = [0]
+        max_flashes = 3
+
+        def flash_step():
+            if flash_count[0] >= max_flashes:
+                self.flash_points_in_progress = False
+                self.flash_points_on = False
+                self.display_current_frame()
+                return
+
+            self.flash_points_on = not self.flash_points_on
+            self.display_current_frame()
+
+            if not self.flash_points_on:
+                flash_count[0] += 1
+
+            self.root.after(300, flash_step)
+
+        flash_step()
+
     def undo_last_point(self, event=None):
         """Undo the most recent annotation operation (add or remove)"""
         if not self.undo_stack:
@@ -1623,6 +1870,32 @@ class SAM2VideoUI:
         # Get last operation
         operation = self.undo_stack.pop()
         action = operation['action']
+
+        if action == 'clear_frame':
+            # Undo clear_frame: restore all removed points at their original indices
+            points = operation['points']
+            indices = operation['indices']
+            obj_id = operation['obj_id']
+            frame_idx = operation['frame_idx']
+            # Insert in ascending index order so each insertion lands at the correct position
+            for idx, point in sorted(zip(indices, points), key=lambda t: t[0]):
+                self.click_points.insert(idx, point)
+            self.annotated_frames.add(frame_idx)
+            self.redo_stack.append(operation)
+            self._mark_object_dirty(obj_id)
+            self.current_object_id = obj_id
+            self.object_var.set(obj_id)
+            self.object_name_var.set(self.object_names.get(obj_id, f"Object_{obj_id}"))
+            self.update_object_color_display()
+            self.current_frame_idx = frame_idx
+            self.frame_var.set(frame_idx)
+            self.update_object_list()
+            self.update_points_display()
+            self.display_current_frame()
+            obj_name = self.object_names.get(obj_id, f"Object_{obj_id}")
+            self.status_label.config(text=f"Undid clear frame for {obj_name} at frame {frame_idx + 1} ({len(points)} points restored)")
+            return
+
         point = operation['point']
         x, y, is_positive, obj_id, frame_idx = point
 
@@ -1654,6 +1927,7 @@ class SAM2VideoUI:
 
         # Add operation to redo stack
         self.redo_stack.append(operation)
+        self._mark_object_dirty(obj_id)
 
         # Switch to the object that the point belonged to
         self.current_object_id = obj_id
@@ -1684,6 +1958,34 @@ class SAM2VideoUI:
         # Get operation from redo stack
         operation = self.redo_stack.pop()
         action = operation['action']
+
+        if action == 'clear_frame':
+            # Redo clear_frame: remove all points again
+            points = operation['points']
+            obj_id = operation['obj_id']
+            frame_idx = operation['frame_idx']
+            for point in points:
+                try:
+                    self.click_points.remove(point)
+                except ValueError:
+                    pass
+            remaining_frames = {p[4] for p in self.click_points}
+            self.annotated_frames = self.annotated_frames.intersection(remaining_frames)
+            self.undo_stack.append(operation)
+            self._mark_object_dirty(obj_id)
+            self.current_object_id = obj_id
+            self.object_var.set(obj_id)
+            self.object_name_var.set(self.object_names.get(obj_id, f"Object_{obj_id}"))
+            self.update_object_color_display()
+            self.current_frame_idx = frame_idx
+            self.frame_var.set(frame_idx)
+            self.update_object_list()
+            self.update_points_display()
+            self.display_current_frame()
+            obj_name = self.object_names.get(obj_id, f"Object_{obj_id}")
+            self.status_label.config(text=f"Redid clear frame for {obj_name} at frame {frame_idx + 1} ({len(points)} points removed)")
+            return
+
         point = operation['point']
         x, y, is_positive, obj_id, frame_idx = point
 
@@ -1710,6 +2012,7 @@ class SAM2VideoUI:
 
         # Add operation back to undo stack
         self.undo_stack.append(operation)
+        self._mark_object_dirty(obj_id)
 
         # Switch to the object that the point belongs to
         self.current_object_id = obj_id
@@ -1730,6 +2033,26 @@ class SAM2VideoUI:
         point_type = "positive" if is_positive else "negative"
         obj_name = self.object_names.get(obj_id, f"Object_{obj_id}")
         self.status_label.config(text=f"{status_prefix} {point_type} point for {obj_name} at frame {frame_idx + 1}")
+
+    def _show_auto_dismiss(self, title, message, timeout_ms=4000):
+        """Show an informational dialog that auto-closes after timeout_ms. User can also click OK."""
+        dialog = tk.Toplevel(self.root)
+        dialog.title(title)
+        dialog.resizable(False, False)
+        dialog.transient(self.root)
+
+        tk.Label(dialog, text=message, justify=tk.LEFT, padx=20, pady=12).pack()
+
+        btn_frame = tk.Frame(dialog)
+        btn_frame.pack(pady=(0, 10))
+        tk.Button(btn_frame, text="OK", command=dialog.destroy, width=8).pack()
+
+        dialog.update_idletasks()
+        px = self.root.winfo_x() + (self.root.winfo_width() - dialog.winfo_width()) // 2
+        py = self.root.winfo_y() + (self.root.winfo_height() - dialog.winfo_height()) // 2
+        dialog.geometry(f"+{max(0, px)}+{max(0, py)}")
+
+        dialog.after(timeout_ms, lambda: dialog.destroy() if dialog.winfo_exists() else None)
 
     def _handle_annotation_frame_mismatch(self, annotation_data):
         """Handle frame count mismatch between saved annotations and current video"""
@@ -1822,9 +2145,12 @@ class SAM2VideoUI:
         self.update_object_list()
         self.display_current_frame()
         
-        messagebox.showinfo("Import Complete", 
+        self.annotations_dirty = False
+        self.updated_objects.clear()
+        self._show_auto_dismiss("Import Complete",
                         f"Imported {imported_count} annotations\n"
-                        f"Skipped {skipped_count} annotations with invalid frame indices")
+                        f"Skipped {skipped_count} annotations with invalid frame indices",
+                        timeout_ms=4000)
 
     def _get_next_color(self):
         """Get next available color for a new object"""
@@ -1882,6 +2208,7 @@ class SAM2VideoUI:
         if closest_point_idx is not None and min_distance <= 20:
             removed_point = self.click_points.pop(closest_point_idx)
             px, py, is_pos, obj_id, f_idx = removed_point
+            self._mark_object_dirty(obj_id)
 
             # Store removal operation for undo
             operation = {
@@ -2824,6 +3151,12 @@ class SAM2VideoUI:
         if not self.frames:
             return
 
+        # Update Flash Points button state based on whether active object has points on this frame
+        if hasattr(self, 'flash_points_button'):
+            has_pts = any(p[3] == self.current_object_id and p[4] == self.current_frame_idx
+                         for p in self.click_points)
+            self.flash_points_button.config(state='normal' if has_pts else 'disabled')
+
         # Special case: If we have prerendered masks AND a temp mask for this frame,
         # load the original frame so we can display the temp mask cleanly
         if (self.has_prerendered_masks and
@@ -2972,96 +3305,41 @@ class SAM2VideoUI:
                     display_frame = cv2.addWeighted(display_frame, 1-alpha, combined_overlay, alpha, 0)
         
         # Draw click points only for the current frame
+        flash_pts = self.flash_points_in_progress and self.flash_points_on
         for i, (x, y, is_positive, obj_id, frame_idx) in enumerate(self.click_points):
             if frame_idx != self.current_frame_idx:
                 continue
             # Only draw points for current object or if showing all
             if obj_id == self.current_object_id or not hasattr(self, 'current_object_id'):
                 obj_color = self.object_colors.get(obj_id, [255, 255, 255])
-                color = tuple(obj_color) if is_positive else (255, 0, 0)
+                radius = 16 if flash_pts else 10
+                line_length = 11 if flash_pts else 7
+                line_thickness = 3 if flash_pts else 2
 
-                # Draw unfilled circle in object color
-                cv2.circle(display_frame, (int(x), int(y)), 7, color, 2)
-
-                # Draw symbol using lines in object color
-                line_length = 5
-                line_thickness = 2
+                if flash_pts:
+                    # Draw white halo behind point for visibility
+                    cv2.circle(display_frame, (int(x), int(y)), radius + 3, (255, 255, 255), 3)
 
                 if is_positive:
-                    # Draw + (vertical and horizontal lines)
-                    # Vertical line
+                    color = tuple(obj_color)
+                    # Draw unfilled circle in object color
+                    cv2.circle(display_frame, (int(x), int(y)), radius, color, line_thickness)
+                    # Draw + symbol
                     cv2.line(display_frame,
                             (int(x), int(y - line_length)),
                             (int(x), int(y + line_length)),
                             color, line_thickness)
-                    # Horizontal line
                     cv2.line(display_frame,
                             (int(x - line_length), int(y)),
                             (int(x + line_length), int(y)),
                             color, line_thickness)
                 else:
-                    # Draw - (horizontal line only)
+                    # Draw unfilled black circle with white minus line
+                    cv2.circle(display_frame, (int(x), int(y)), radius, (0, 0, 0), line_thickness)
                     cv2.line(display_frame,
                             (int(x - line_length), int(y)),
                             (int(x + line_length), int(y)),
-                            color, line_thickness)
-                
-                # Draw object name
-                obj_name = self.object_names.get(obj_id, f"Obj{obj_id}")[:8]
-                cv2.putText(display_frame, obj_name, (int(x)+15, int(y)-10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2)
-
-        # Display currently active object at top right corner
-        current_obj_name = self.object_names.get(self.current_object_id, f"Object_{self.current_object_id}")
-        current_obj_text = f"{current_obj_name}, (ID: {self.current_object_id})"
-        current_obj_color = self.object_colors.get(self.current_object_id, [255, 255, 255])
-
-        # Get text size to position at top right
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        font_scale = 0.7
-        font_thickness = 2
-        (text_width, text_height), baseline = cv2.getTextSize(current_obj_text, font, font_scale, font_thickness)
-
-        # Position at top right with padding
-        padding = 10
-        text_x = display_frame.shape[1] - text_width - padding
-        text_y = text_height + padding
-
-        # Draw semi-transparent background for better readability
-        bg_pt1 = (text_x - 5, text_y - text_height - 5)
-        bg_pt2 = (text_x + text_width + 5, text_y + baseline + 5)
-        overlay = display_frame.copy()
-        cv2.rectangle(overlay, bg_pt1, bg_pt2, (0, 0, 0), -1)
-        cv2.addWeighted(overlay, 0.6, display_frame, 0.4, 0, display_frame)
-
-        # Draw text in object color
-        cv2.putText(display_frame, current_obj_text, (text_x, text_y),
-                   font, font_scale, tuple(current_obj_color), font_thickness)
-
-        # Display video/results path at top left corner
-        if self.video_display_text:
-            info_font = cv2.FONT_HERSHEY_SIMPLEX
-            info_font_scale = 0.5
-            info_font_thickness = 1
-            (info_text_width, info_text_height), info_baseline = cv2.getTextSize(
-                self.video_display_text, info_font, info_font_scale, info_font_thickness
-            )
-
-            # Position at top left with padding
-            info_padding = 10
-            info_text_x = info_padding
-            info_text_y = info_text_height + info_padding
-
-            # Draw semi-transparent background for better readability
-            info_bg_pt1 = (info_text_x - 5, info_text_y - info_text_height - 5)
-            info_bg_pt2 = (info_text_x + info_text_width + 5, info_text_y + info_baseline + 5)
-            info_overlay = display_frame.copy()
-            cv2.rectangle(info_overlay, info_bg_pt1, info_bg_pt2, (0, 0, 0), -1)
-            cv2.addWeighted(info_overlay, 0.6, display_frame, 0.4, 0, display_frame)
-
-            # Draw text in light gray
-            cv2.putText(display_frame, self.video_display_text, (info_text_x, info_text_y),
-                       info_font, info_font_scale, (200, 200, 200), info_font_thickness)
+                            (255, 255, 255), line_thickness)
 
         # Convert to PIL and display
         pil_image = Image.fromarray(display_frame)
@@ -3092,10 +3370,12 @@ class SAM2VideoUI:
 
         # Position image: center if not zoomed, otherwise keep zoom center at canvas center
         if self.display_zoom_level <= 1.0:
-            # Center the image on canvas (normal mode)
+            # Center the image on canvas (normal mode).
+            # Set scrollregion to the full canvas widget so xview_moveto(0) keeps image centered.
             canvas_center_x = canvas_width // 2
             canvas_center_y = canvas_height // 2
             self.canvas.create_image(canvas_center_x, canvas_center_y, image=self.display_frame)
+            self.canvas.configure(scrollregion=(0, 0, canvas_width, canvas_height))
         else:
             # Position image so zoom center point stays at canvas center (zoomed mode)
             # The zoom center (as fraction of image) should be at canvas center
@@ -3104,9 +3384,37 @@ class SAM2VideoUI:
 
             # Create image at calculated position (using NW anchor for absolute positioning)
             self.canvas.create_image(img_pos_x, img_pos_y, anchor=tk.NW, image=self.display_frame)
-        
-        # Update scroll region
-        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+            self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+
+        # Update canvas overlay labels (always at canvas-widget corners, outside frame area)
+        if hasattr(self, '_overlay_label_tl'):
+            # Top-left: video filename
+            if getattr(self, 'segmented_video_displayed', False) and getattr(self, 'original_video_path_for_resegment', None):
+                vid_text = self._truncate_path(self.original_video_path_for_resegment)
+            elif getattr(self, 'video_path', None):
+                vid_text = self._truncate_path(self.video_path)
+            else:
+                vid_text = ""
+            self._overlay_label_tl.config(text=vid_text)
+
+            # Top-right: current active category with its color
+            current_obj_name = self.object_names.get(self.current_object_id, f"Object_{self.current_object_id}")
+            current_obj_text = f"{current_obj_name} (ID: {self.current_object_id})"
+            obj_rgb = self.object_colors.get(self.current_object_id, [255, 255, 255])
+            obj_hex = f'#{obj_rgb[0]:02x}{obj_rgb[1]:02x}{obj_rgb[2]:02x}'
+            self._overlay_label_tr.config(text=current_obj_text, fg=obj_hex)
+
+            # Bottom-left: results folder (only when viewing segmented results)
+            if self.results_output_dir:
+                results_text = f"Results: {self._truncate_path(self.results_output_dir)}"
+            else:
+                results_text = ""
+            self._overlay_label_bl.config(text=results_text)
+
+            # Raise overlay labels above canvas items so they stay visible
+            self._overlay_label_tl.lift()
+            self._overlay_label_tr.lift()
+            self._overlay_label_bl.lift()
         
         # Update frame info
         self.frame_var.set(self.current_frame_idx)
@@ -3212,7 +3520,7 @@ class SAM2VideoUI:
 
     def _handle_zoom(self, event, delta):
         """Handle zoom in/out centered on cursor position"""
-        if not self.frames or not self.current_frame:
+        if not self.frames or self.current_frame is None:
             return
 
         # Get cursor position in canvas coordinates
@@ -3387,7 +3695,8 @@ class SAM2VideoUI:
                 # Store frame-aware point
                 self.click_points.append((img_x, img_y, is_positive,
                                         self.current_object_id, self.current_frame_idx))
-                
+                self._mark_object_dirty(self.current_object_id)
+
                 # Track annotated frames in multi-frame annotation mode
                 if self.multi_frame_annotation_mode:
                     self.annotated_frames.add(self.current_frame_idx)
@@ -3425,8 +3734,43 @@ class SAM2VideoUI:
         
         self.points_label.config(text=points_text)
             
+    def clear_current_frame_points(self):
+        """Clear all click points for the current object on the current frame only"""
+        removed = [p for p in self.click_points
+                   if p[3] == self.current_object_id and p[4] == self.current_frame_idx]
+        if not removed:
+            return
+
+        # Record original indices for undo restoration
+        indices = [self.click_points.index(p) for p in removed]
+
+        self.click_points = [p for p in self.click_points
+                             if not (p[3] == self.current_object_id and p[4] == self.current_frame_idx)]
+
+        # Update annotated frames set - remove frames that no longer have any points
+        remaining_frames = {p[4] for p in self.click_points}
+        self.annotated_frames = self.annotated_frames.intersection(remaining_frames)
+
+        self._mark_object_dirty(self.current_object_id)
+
+        # Push bulk operation to undo stack so it can be undone with Ctrl+Z
+        self.undo_stack.append({
+            'action': 'clear_frame',
+            'points': removed,
+            'indices': indices,
+            'obj_id': self.current_object_id,
+            'frame_idx': self.current_frame_idx,
+        })
+        self.redo_stack.clear()
+
+        self.update_points_display()
+        self.update_object_list()
+        if self.frames:
+            self.display_current_frame()
+
     def clear_points(self):
         """Clear all click points for the current object only"""
+        had_points = any(p[3] == self.current_object_id for p in self.click_points)
         # Filter out points for current object
         self.click_points = [p for p in self.click_points if p[3] != self.current_object_id]
 
@@ -3435,6 +3779,8 @@ class SAM2VideoUI:
         self.annotated_frames = self.annotated_frames.intersection(remaining_frames)
 
         # Clear undo/redo history (bulk operation, not individually undoable)
+        if had_points:
+            self._mark_object_dirty(self.current_object_id)
         self.undo_stack.clear()
         self.redo_stack.clear()
 
@@ -3445,8 +3791,11 @@ class SAM2VideoUI:
     
     def clear_current_object(self):
         """Clear points and masks for current object only"""
+        had_points = any(p[3] == self.current_object_id for p in self.click_points)
         # Remove points for current object
         self.click_points = [p for p in self.click_points if p[3] != self.current_object_id]
+        if had_points:
+            self._mark_object_dirty(self.current_object_id)
         
         # Remove masks for current object
         for frame_idx in self.masks:
@@ -3469,23 +3818,17 @@ class SAM2VideoUI:
             self.display_current_frame()
             
     def prev_frame(self):
-        """Go to previous frame (or jump by zoom level)"""
+        """Go to previous frame (jump by nav step size)"""
         if self.frames and self.current_frame_idx > 0:
-            # Reset flash state when changing frames
             self._reset_flash_state()
-            # Jump by the selected zoom level
-            jump_size = self.slider_zoom_level.get()
-            self.current_frame_idx = max(0, self.current_frame_idx - jump_size)
+            self.current_frame_idx = max(0, self.current_frame_idx - self.nav_step_size.get())
             self.display_current_frame()
 
     def next_frame(self):
-        """Go to next frame (or jump by zoom level)"""
+        """Go to next frame (jump by nav step size)"""
         if self.frames and self.current_frame_idx < len(self.frames) - 1:
-            # Reset flash state when changing frames
             self._reset_flash_state()
-            # Jump by the selected zoom level
-            jump_size = self.slider_zoom_level.get()
-            self.current_frame_idx = min(len(self.frames) - 1, self.current_frame_idx + jump_size)
+            self.current_frame_idx = min(len(self.frames) - 1, self.current_frame_idx + self.nav_step_size.get())
             self.display_current_frame()
 
     def _start_continuous_nav(self, direction):
@@ -3547,9 +3890,14 @@ class SAM2VideoUI:
             delattr(self, '_nav_start_time')
 
     def reset_video(self):
-        """Reset to first frame"""
+        """Reset to first frame, slider zoom, playback speed, and display zoom"""
         if self.frames:
             self.current_frame_idx = 0
+            self.set_slider_zoom(1)
+            self.set_playback_speed(1.0)
+            self.display_zoom_level = 1.0
+            self.zoom_center_img_x = 0.5
+            self.zoom_center_img_y = 0.5
             self.display_current_frame()
 
     def jump_to_prev_annotated_frame(self):
@@ -3575,7 +3923,7 @@ class SAM2VideoUI:
             self.current_frame_idx = sorted_annotated[-1]
             self.display_current_frame()
             obj_name = self.object_names.get(self.current_object_id, f"Object_{self.current_object_id}")
-            messagebox.showinfo("Jump to Annotation", f"Wrapped to last annotated frame for {obj_name}")
+            self.status_label.config(text=f"Wrapped to last annotated frame for {obj_name}")
     
     def jump_to_next_annotated_frame(self):
         """Jump to the next frame with annotations for the current object"""
@@ -3600,7 +3948,7 @@ class SAM2VideoUI:
             self.current_frame_idx = sorted_annotated[0]
             self.display_current_frame()
             obj_name = self.object_names.get(self.current_object_id, f"Object_{self.current_object_id}")
-            messagebox.showinfo("Jump to Annotation", f"Wrapped to first annotated frame for {obj_name}")
+            self.status_label.config(text=f"Wrapped to first annotated frame for {obj_name}")
             
     def set_slider_zoom(self, zoom_level):
         """Set slider zoom level for precise navigation"""
@@ -3672,6 +4020,20 @@ class SAM2VideoUI:
                 button.configure(style='Selected.TButton')  # Bright teal/green background
             else:
                 button.configure(style='TButton')  # Normal dark gray background
+
+    def set_nav_step_size(self, step):
+        """Set navigation step size (frames per arrow/scroll/play tick)"""
+        self.nav_step_size.set(step)
+        self._update_step_button_highlight()
+
+    def _update_step_button_highlight(self):
+        """Update step size button styling to show current selection"""
+        current_step = self.nav_step_size.get()
+        for step, button in self.step_buttons.items():
+            if step == current_step:
+                button.configure(style='Selected.TButton')
+            else:
+                button.configure(style='TButton')
 
     def on_slider_change(self, value):
         """Handle frame slider change"""
@@ -3785,6 +4147,11 @@ class SAM2VideoUI:
         if not self.frames:
             return
 
+        # Stop backward playback if running
+        if self.playing_backward:
+            self.playing_backward = False
+            self.play_backward_button.config(text="Play Rev")
+
         self.playing = not self.playing
         if self.playing:
             # Reset flash state when starting playback
@@ -3796,17 +4163,16 @@ class SAM2VideoUI:
             
     def play_video(self):
         """Play video in separate thread"""
-        # Calculate frame step and delay based on video FPS and speed multiplier.
-        # For speed >= 1x: skip frames (step > 1) to achieve speedup, since the
-        # per-frame display overhead dominates and shrinking the delay has no effect.
-        # For speed < 1x: stretch delay to slow down, no skipping.
+        # Frame step = nav_step_size * speed (for speed >= 1x, skip frames to achieve speedup).
+        # For speed < 1x: use nav_step_size with a longer delay to slow down.
         speed = self.playback_speed.get()
+        step_size = self.nav_step_size.get()
         base_delay = 1.0 / self.video_fps  # Delay for original FPS
         if speed >= 1.0:
-            frame_step = max(1, round(speed))
+            frame_step = max(1, round(speed)) * step_size
             adjusted_delay = base_delay
         else:
-            frame_step = 1
+            frame_step = step_size
             adjusted_delay = base_delay / speed
 
         while self.playing and self.frames:
@@ -3827,6 +4193,50 @@ class SAM2VideoUI:
                 self.root.after(0, lambda: self.play_button.config(text="Play"))
                 break
     
+    def toggle_play_backward(self):
+        """Toggle reverse video playback"""
+        if not self.frames:
+            return
+
+        # Stop forward playback if running
+        if self.playing:
+            self.playing = False
+            self.play_button.config(text="Play")
+
+        self.playing_backward = not self.playing_backward
+        if self.playing_backward:
+            self._reset_flash_state()
+            self.play_backward_button.config(text="Pause Rev")
+            threading.Thread(target=self.play_video_backward, daemon=True).start()
+        else:
+            self.play_backward_button.config(text="Play Rev")
+
+    def play_video_backward(self):
+        """Play video in reverse in a separate thread"""
+        speed = self.playback_speed.get()
+        step_size = self.nav_step_size.get()
+        base_delay = 1.0 / self.video_fps
+        if speed >= 1.0:
+            frame_step = max(1, round(speed)) * step_size
+            adjusted_delay = base_delay
+        else:
+            frame_step = step_size
+            adjusted_delay = base_delay / speed
+
+        while self.playing_backward and self.frames:
+            if self.current_frame_idx > 0:
+                self.current_frame_idx = max(0, self.current_frame_idx - frame_step)
+                self.root.after(0, self.display_current_frame)
+
+                if self.slider_zoom_level.get() > 1:
+                    self.root.after(0, lambda: self.frame_var.set(self.current_frame_idx))
+
+                threading.Event().wait(adjusted_delay)
+            else:
+                self.playing_backward = False
+                self.root.after(0, lambda: self.play_backward_button.config(text="Play Rev"))
+                break
+
     def _detect_available_gpus(self):
         """Detect available GPUs and return list of options"""
         gpu_options = []
@@ -4456,6 +4866,37 @@ class SAM2VideoUI:
             messagebox.showerror("Directory Error", f"Failed to create output directories: {e}")
             return
 
+        # Check if only-updated mode is applicable
+        only_updated = False
+        unchanged_ids: set = set()
+        prev_masks_dir = None
+        if (self.updated_objects
+                and hasattr(self, 'mask_export_dir')
+                and self.mask_export_dir
+                and os.path.isdir(self.mask_export_dir)):
+            all_obj_ids = set(self.object_names.keys())
+            candidates_for_reuse = all_obj_ids - self.updated_objects
+            if candidates_for_reuse:
+                answer = messagebox.askyesnocancel(
+                    "Partial Re-segmentation",
+                    f"{len(self.updated_objects)} object(s) have updated annotations "
+                    f"(IDs: {', '.join(str(i) for i in sorted(self.updated_objects))}).\n\n"
+                    f"Re-segment only updated objects and reuse existing masks for "
+                    f"unchanged object(s) (IDs: {', '.join(str(i) for i in sorted(candidates_for_reuse))})"
+                    f"?\n\n"
+                    f"[Yes] Re-segment updated objects only\n"
+                    f"[No] Re-segment all objects\n"
+                    f"[Cancel] Abort"
+                )
+                if answer is None:  # Cancel
+                    return
+                if answer:  # Yes
+                    only_updated = True
+                    unchanged_ids = candidates_for_reuse
+                    prev_masks_dir = self.mask_export_dir
+                    print(f"Partial re-segmentation: updating {sorted(self.updated_objects)}, "
+                          f"reusing masks for {sorted(unchanged_ids)}")
+
         try:
             self.status_label.config(text="Preparing for segmentation...")
             self.progress_bar.pack(fill=tk.X, pady=(5, 0))
@@ -4501,6 +4942,8 @@ class SAM2VideoUI:
                 annotations = []
                 for x, y, is_pos, obj_id, frame_idx in self.click_points:
                     if frame_idx not in frames_to_process:
+                        continue
+                    if only_updated and obj_id not in self.updated_objects:
                         continue
 
                     # Get sequential index for SAM
@@ -4580,11 +5023,49 @@ class SAM2VideoUI:
                             self.masks[frame_idx] = {}
                         self.masks[frame_idx][obj_id] = None  # Placeholder
 
+                # Merge unchanged masks from previous directory (only-updated mode)
+                if only_updated and unchanged_ids and prev_masks_dir:
+                    import re as _re
+                    import shutil as _shutil
+                    _mask_pattern = _re.compile(r"^mask_f(\d{6})_(.+)_id(\d+)\.png$")
+                    _prev_path = Path(prev_masks_dir)
+                    _new_path = Path(export_dir)
+                    _merged = 0
+                    for _fp in sorted(_prev_path.glob("mask_f*.png")):
+                        _m = _mask_pattern.match(_fp.name)
+                        if not _m:
+                            continue
+                        _oid = int(_m.group(3))
+                        if _oid not in unchanged_ids:
+                            continue
+                        _fidx = int(_m.group(1))
+                        _obj_name = _m.group(2)
+                        # Copy file if target dir differs
+                        if _prev_path.resolve() != _new_path.resolve():
+                            _dst = _new_path / _fp.name
+                            if not _dst.exists():
+                                _shutil.copy2(str(_fp), str(_dst))
+                        # Merge into metadata and self.masks
+                        mask_metadata.append({
+                            'frame_idx': _fidx,
+                            'obj_id': _oid,
+                            'mask_file': _fp.name,
+                            'object_name': self.object_names.get(_oid, _obj_name),
+                            'color': self.object_colors.get(_oid, (255, 0, 0))
+                        })
+                        if _fidx not in self.masks:
+                            self.masks[_fidx] = {}
+                        self.masks[_fidx][_oid] = None
+                        _merged += 1
+                    print(f"Reused {_merged} masks for unchanged objects {sorted(unchanged_ids)} from {_prev_path}")
+
                 # Store export directory
                 self.mask_export_dir = export_dir
 
-                # Get quality metrics from result
-                quality_metrics = result.quality_metrics
+                # Get quality metrics from result.
+                # If only-updated mode was used, result.quality_metrics only covers the updated
+                # objects; force recalculation from the full merged self.masks instead.
+                quality_metrics = None if only_updated else result.quality_metrics
                 propagation_success = len(mask_metadata) > 0
 
                 # Save metadata and temporary directory
@@ -4636,6 +5117,7 @@ class SAM2VideoUI:
                 if propagation_success and total_masks > 0:
                     self.status_label.config(text=f"Segmentation complete! Generated {total_masks} masks for {len(unique_objects)} objects")
                     # Multi-frame annotation mode stays active for continued annotation
+                    self.updated_objects.clear()  # All objects are now up to date
 
                     # Enable Flash Mask button now that segmentation is complete
                     self._enable_flash_mask_button()
@@ -4761,12 +5243,12 @@ class SAM2VideoUI:
                     # Enable Refine button now that segmentation is complete
                     self._update_refine_button_state()
 
-                    messagebox.showinfo("Success",
+                    self._show_auto_dismiss("Success",
                                       f"Segmentation completed!\n"
                                       f"Objects: {len(unique_objects)}\n"
                                       f"Total masks: {total_masks}\n"
                                       f"Frames processed: {len(frames_to_process)}\n\n"
-                                      f"Results saved to:\n{output_base_dir}")
+                                      f"Results saved to:\n{output_base_dir}", timeout_ms=6000)
                 elif total_masks > 0:
                     # Masks were generated but propagation had errors
                     self.status_label.config(text=f"Partial results: {total_masks} masks generated with errors")
@@ -5140,10 +5622,10 @@ class SAM2VideoUI:
                 self.progress_bar.pack_forget()
                 self.status_label.config(text=f"Refined frames {start_frame}-{end_frame}")
 
-                messagebox.showinfo("Refinement Complete",
+                self._show_auto_dismiss("Refinement Complete",
                                    f"Successfully refined frames {start_frame} to {end_frame}.\n\n"
                                    f"Masks updated: {end_frame - start_frame + 1} frames\n"
-                                   f"Video regenerated: {'Yes' if regenerate_video else 'No'}")
+                                   f"Video regenerated: {'Yes' if regenerate_video else 'No'}", timeout_ms=5000)
 
             except Exception as e:
                 self.progress_bar.pack_forget()
@@ -5942,8 +6424,7 @@ class SAM2VideoUI:
                 self.root.update()
             
             self.progress_bar.pack_forget()
-            messagebox.showinfo("Export Complete", f"Masks exported to {file_path}")
-            self.status_label.config(text="Mask export complete")
+            self.status_label.config(text=f"Masks exported to {os.path.basename(file_path)}")
             
             # Determine if this was a limited export
             if hasattr(self, 'processing_range') and self.processing_range and len(self.processing_range) < len(self.frames):
@@ -5951,13 +6432,13 @@ class SAM2VideoUI:
             else:
                 range_info = ""
             
-            # Show brief success message without asking
-            messagebox.showinfo("Export Complete", 
+            # Show brief success message (auto-dismisses after 5s)
+            self._show_auto_dismiss("Export Complete",
                               f"Video exported successfully!\n"
                               f"Location: {file_path}\n"
                               f"Frames: {total_frames}{range_info}\n"
                               f"FPS: {fps}\n"
-                              f"Format: {export_format.upper()}")
+                              f"Format: {export_format.upper()}", timeout_ms=5000)
                               
         except Exception as e:
             self.progress_bar.pack_forget()
@@ -6084,6 +6565,12 @@ class SAM2VideoUI:
                     raise FileNotFoundError(f"Checkpoint not found: {sam2_checkpoint}\n\nPlease run setup.py to download models.")
                 if not os.path.exists(model_cfg):
                     raise FileNotFoundError(f"Config not found: {model_cfg}\n\nPlease ensure SAM2 is properly installed.")
+
+                # Enable lazy loading BEFORE building the predictor.
+                # This monkey-patches SAM2's load_video_frames_from_jpg_images() so
+                # that init_state() loads frames on-demand (LRU cache) instead of
+                # eagerly loading all frames into RAM (~178GB for 36K frames → ~2GB).
+                enable_lazy_loading(cache_size=20, enable_sam3=True)
 
                 # Import the correct builder for VIDEO segmentation
                 from sam2.build_sam import build_sam2_video_predictor
@@ -6583,6 +7070,16 @@ def main():
                     app._handle_background_tasks_save_on_exit()
                 # Don't stop workers - let them continue
             # else: No - user wants to quit without saving, just exit
+
+        # Warn if there are unsaved annotation changes
+        if getattr(app, 'annotations_dirty', False) and app.click_points:
+            keep_open = messagebox.askyesno(
+                "Unsaved Annotations",
+                "You have annotation changes that have not been exported.\n\n"
+                "Close anyway? (Changes will be lost)"
+            )
+            if not keep_open:
+                return  # User chose to stay and export first
 
         # Clean up video capture if lazy loading
         if hasattr(app, 'video_cap_lazy') and app.video_cap_lazy:

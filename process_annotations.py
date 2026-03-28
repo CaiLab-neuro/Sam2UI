@@ -89,20 +89,23 @@ def _check_sam3_available():
 SAM3_AVAILABLE = _check_sam3_available()
 
 # Model configuration mappings
-# NOTE: Config paths are relative to the sam2 package (Hydra search path: pkg://sam2)
-# Checkpoint paths are absolute/relative to the script directory
+# NOTE: Config paths are absolute filesystem paths to sam_models/sam2/sam2/configs/
+# (matching sam2_ui.py approach; Hydra requires a leading '//' workaround on Linux — see load_model())
+# Checkpoint paths are relative to the script directory
+_SCRIPT_DIR = Path(__file__).parent
+_SAM2_CONFIG_DIR = _SCRIPT_DIR / "sam_models" / "sam2" / "sam2" / "configs"
 MODEL_CONFIGS = {
     # SAM2.1 models (recommended)
-    "sam2.1-tiny": ("configs/sam2.1/sam2.1_hiera_t.yaml", "sam_models/sam2/checkpoints/sam2.1_hiera_tiny.pt"),
-    "sam2.1-small": ("configs/sam2.1/sam2.1_hiera_s.yaml", "sam_models/sam2/checkpoints/sam2.1_hiera_small.pt"),
-    "sam2.1-base+": ("configs/sam2.1/sam2.1_hiera_b+.yaml", "sam_models/sam2/checkpoints/sam2.1_hiera_base_plus.pt"),
-    "sam2.1-large": ("configs/sam2.1/sam2.1_hiera_l.yaml", "sam_models/sam2/checkpoints/sam2.1_hiera_large.pt"),
+    "sam2.1-tiny": (str(_SAM2_CONFIG_DIR / "sam2.1" / "sam2.1_hiera_t.yaml"), "sam_models/sam2/checkpoints/sam2.1_hiera_tiny.pt"),
+    "sam2.1-small": (str(_SAM2_CONFIG_DIR / "sam2.1" / "sam2.1_hiera_s.yaml"), "sam_models/sam2/checkpoints/sam2.1_hiera_small.pt"),
+    "sam2.1-base+": (str(_SAM2_CONFIG_DIR / "sam2.1" / "sam2.1_hiera_b+.yaml"), "sam_models/sam2/checkpoints/sam2.1_hiera_base_plus.pt"),
+    "sam2.1-large": (str(_SAM2_CONFIG_DIR / "sam2.1" / "sam2.1_hiera_l.yaml"), "sam_models/sam2/checkpoints/sam2.1_hiera_large.pt"),
 
     # SAM2 models (legacy)
-    "sam2-tiny": ("configs/sam2/sam2_hiera_t.yaml", "sam_models/sam2/checkpoints/sam2_hiera_tiny.pt"),
-    "sam2-small": ("configs/sam2/sam2_hiera_s.yaml", "sam_models/sam2/checkpoints/sam2_hiera_small.pt"),
-    "sam2-base+": ("configs/sam2/sam2_hiera_b+.yaml", "sam_models/sam2/checkpoints/sam2_hiera_base_plus.pt"),
-    "sam2-large": ("configs/sam2/sam2_hiera_l.yaml", "sam_models/sam2/checkpoints/sam2_hiera_large.pt"),
+    "sam2-tiny": (str(_SAM2_CONFIG_DIR / "sam2" / "sam2_hiera_t.yaml"), "sam_models/sam2/checkpoints/sam2_hiera_tiny.pt"),
+    "sam2-small": (str(_SAM2_CONFIG_DIR / "sam2" / "sam2_hiera_s.yaml"), "sam_models/sam2/checkpoints/sam2_hiera_small.pt"),
+    "sam2-base+": (str(_SAM2_CONFIG_DIR / "sam2" / "sam2_hiera_b+.yaml"), "sam_models/sam2/checkpoints/sam2_hiera_base_plus.pt"),
+    "sam2-large": (str(_SAM2_CONFIG_DIR / "sam2" / "sam2_hiera_l.yaml"), "sam_models/sam2/checkpoints/sam2_hiera_large.pt"),
 
     # SAM3 model
     "sam3": (None, "sam_models/sam3/checkpoints/sam3.pt"),  # Config loaded automatically
@@ -391,16 +394,22 @@ class SAM2Processor:
 
             else:
                 # SAM2 loading
+                # Hydra on Linux strips the leading '/' from absolute paths, so prepend
+                # an extra '/' (matching sam2_ui.py behavior at line ~6472)
+                config_for_hydra = self.config_file
+                if config_for_hydra and config_for_hydra.startswith('/'):
+                    config_for_hydra = '/' + config_for_hydra
+
                 if should_disable_cuda_for_device(device):
                     with DisableCUDADuringInit():
                         self.video_predictor = build_sam2_video_predictor(
-                            config_file=self.config_file,
+                            config_file=config_for_hydra,
                             ckpt_path=self.checkpoint_file,  # Optional parameter
                             device=device
                         )
                 else:
                     self.video_predictor = build_sam2_video_predictor(
-                        config_file=self.config_file,
+                        config_file=config_for_hydra,
                         ckpt_path=self.checkpoint_file,  # Optional parameter
                         device=device
                     )
@@ -1009,7 +1018,7 @@ class SAM2Processor:
 
             # Handle SAM2 structure (per-object dict access)
             elif isinstance(inference_state, dict) and "output_dict_per_obj" in inference_state:
-                for obj_idx in range(len(objects_with_annotations)):
+                for obj_idx in range(len(inference_state.get("obj_ids", []))):
                     obj_output_dict = inference_state["output_dict_per_obj"][obj_idx]
                     # Clear non-conditioning frames (keep conditioning for potential refinement)
                     non_cond = obj_output_dict.get("non_cond_frame_outputs", {})
@@ -1113,6 +1122,38 @@ class SAM2Processor:
                 print(f"WARNING: Could not clean up temp directory: {e}")
 
 
+def _load_masks_metadata(masks_dir: Path, obj_ids=None):
+    """
+    Scan a masks directory and return metadata dicts keyed by frame_idx.
+    Filename pattern: mask_f{frame:06d}_{name}_id{obj_id}.png
+
+    Returns: (masks_by_frame, object_names_by_id)
+    """
+    import re
+    pattern = re.compile(r"^mask_f(\d{6})_(.+)_id(\d+)\.png$")
+    masks_by_frame = {}
+    object_names_found = {}
+
+    if not masks_dir.exists():
+        return masks_by_frame, object_names_found
+
+    for filepath in sorted(masks_dir.glob("mask_f*.png")):
+        m = pattern.match(filepath.name)
+        if not m:
+            continue
+        frame_idx = int(m.group(1))
+        obj_name = m.group(2)
+        obj_id = int(m.group(3))
+
+        if obj_ids is not None and obj_id not in obj_ids:
+            continue
+
+        masks_by_frame.setdefault(frame_idx, {})[obj_id] = {"filename": filepath.name}
+        object_names_found[obj_id] = obj_name
+
+    return masks_by_frame, object_names_found
+
+
 def main():
     """Main processing function"""
     parser = argparse.ArgumentParser(
@@ -1147,7 +1188,7 @@ Examples:
 
     parser.add_argument("annotation_file", help="Path to annotation JSON file from SAM2 Video UI")
     parser.add_argument("video_file", help="Path to input video file")
-    parser.add_argument("--output_dir", default="sam2_output", help="Output directory (default: sam2_output)")
+    parser.add_argument("--output-dir", default="sam2_output", help="Output directory (default: sam2_output)")
 
     # Model selection (mutually exclusive)
     model_group = parser.add_mutually_exclusive_group()
@@ -1177,6 +1218,12 @@ Examples:
                        help="Disable backward propagation (not recommended, may result in lower quality segmentation for frames before first annotation)")
     parser.add_argument("--device", type=str, default=None,
                        help="Device to use for inference (e.g., 'cpu', 'cuda', 'cuda:0', 'cuda:1'). Default: auto-detect (CUDA if available, else CPU)")
+    parser.add_argument("--only-updated", action="store_true",
+                       help="Re-segment only objects marked as updated in the annotation file (updated_objects field). Unchanged objects reuse existing masks from --prev-results or the output directory.")
+    parser.add_argument("--prev-results", type=str, default=None,
+                       help="Directory with previous segmentation results to reuse masks from (used with --only-updated). Defaults to the output directory.")
+    parser.add_argument("--video-only", action="store_true",
+                       help="Skip segmentation entirely; create/recreate the output video from existing masks in the output directory.")
 
     args = parser.parse_args()
 
@@ -1257,6 +1304,46 @@ Examples:
         print(f"Memory optimization: CPU offloading enabled")
     print()
 
+    # --video-only: recreate output video from existing masks, no segmentation
+    if args.video_only:
+        masks_dir = output_dir / "masks"
+        masks_by_frame, object_names_found = _load_masks_metadata(masks_dir)
+        if not masks_by_frame:
+            print(f"ERROR: No masks found in {masks_dir}")
+            return 1
+        # Load object colors from metadata if available
+        object_colors = {}
+        meta_file = output_dir / "processing_metadata.json"
+        if meta_file.exists():
+            with open(meta_file) as f:
+                meta = json.load(f)
+            orig = meta.get("original_annotations", {})
+            object_names_meta = orig.get("object_names", {})
+            object_colors = orig.get("object_colors", {})
+            object_names_found = {int(k): v for k, v in object_names_meta.items()} if object_names_meta else object_names_found
+        object_names = {str(k): v for k, v in object_names_found.items()}
+        fps_val = args.fps
+        cap = cv2.VideoCapture(args.video_file)
+        if cap.isOpened() and fps_val == 30.0:
+            fps_val = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        cap.release()
+        import torch
+        use_gpu_overlay = torch.cuda.is_available()
+        export_video_from_dict(
+            video_path=args.video_file,
+            masks_by_frame=masks_by_frame,
+            object_names=object_names,
+            object_colors=object_colors,
+            output_dir=str(output_dir),
+            fps=fps_val,
+            overlay_opacity=args.opacity,
+            compress=True,
+            crf=23,
+            use_gpu=use_gpu_overlay,
+        )
+        print(f"\nVideo recreated from {len(masks_by_frame)} frames of existing masks.")
+        return 0
+
     # Enable lazy loading BEFORE creating SAM2/SAM3 model
     # This prevents loading all frames into memory at once (huge memory savings for long videos)
     enable_lazy_loading(cache_size=args.frame_cache_size, enable_sam3=True)
@@ -1289,7 +1376,27 @@ Examples:
     annotations_data = processor.load_annotations(args.annotation_file)
     if not annotations_data:
         return 1
-    
+
+    # --only-updated: filter to just changed objects, remember which ones to reuse
+    unchanged_ids = set()
+    prev_results_dir = None
+    full_annotations_data = annotations_data  # preserved for export_metadata (Fix: bug where metadata loses unchanged objects)
+    if args.only_updated:
+        updated_ids = set(annotations_data.get("updated_objects", []))
+        if not updated_ids:
+            print("WARNING: No updated_objects found in annotation file. Processing all objects.")
+        else:
+            all_ids = {a["object_id"] for a in annotations_data["annotations"]}
+            unchanged_ids = all_ids - updated_ids
+            prev_results_dir = Path(args.prev_results) if args.prev_results else output_dir
+            print(f"--only-updated: re-segmenting {sorted(updated_ids)}, reusing masks for {sorted(unchanged_ids)}")
+            # Filter annotations to updated objects only (for segmentation; full data kept in full_annotations_data)
+            annotations_data = dict(annotations_data)
+            annotations_data["annotations"] = [
+                a for a in annotations_data["annotations"]
+                if a["object_id"] in updated_ids
+            ]
+
     # Get video info
     frame_count, fps, width, height = processor.get_video_info(args.video_file)
     if frame_count is None:
@@ -1315,6 +1422,54 @@ Examples:
 
         print(f"\nOK: Generated masks for {len(masks_by_frame)} frames")
 
+        # --only-updated: merge unchanged masks from prev_results into masks_by_frame
+        if unchanged_ids and prev_results_dir is not None:
+            prev_masks_dir = prev_results_dir / "masks"
+            prev_masks, prev_names = _load_masks_metadata(prev_masks_dir, unchanged_ids)
+            if prev_masks:
+                # Copy unchanged mask files to output dir if different directory
+                if prev_results_dir.resolve() != output_dir.resolve():
+                    out_masks_dir = output_dir / "masks"
+                    out_masks_dir.mkdir(exist_ok=True)
+                    for frame_masks in prev_masks.values():
+                        for data in frame_masks.values():
+                            src = prev_masks_dir / data["filename"]
+                            dst = out_masks_dir / data["filename"]
+                            if src.exists() and not dst.exists():
+                                shutil.copy2(str(src), str(dst))
+                # Merge metadata into masks_by_frame, enriching each dict with 'name' and 'color'
+                # so export_video_from_dict can use them (it falls back to object_names[int_key]
+                # but the dict has string keys from JSON, causing "Object_N" names)
+                for frame_idx, frame_masks in prev_masks.items():
+                    for oid, data in frame_masks.items():
+                        data['name'] = prev_names.get(oid, f"Object_{oid}")
+                        raw_color = object_colors.get(str(oid), [255, 0, 0])
+                        data['color'] = list(raw_color) if not isinstance(raw_color, list) else raw_color
+                    masks_by_frame.setdefault(frame_idx, {}).update(frame_masks)
+                for oid, name in prev_names.items():
+                    object_names[str(oid)] = name
+                print(f"Reused masks for unchanged objects {sorted(unchanged_ids)} from {prev_masks_dir}")
+
+                # Re-calculate quality metrics with all objects (updated + unchanged).
+                # The metrics saved inside process_segmentation only cover updated objects.
+                print("Re-calculating quality metrics with all objects (updated + unchanged)...")
+                _merged_masks_dir = output_dir / "masks"
+                def _load_merged_mask(frame_idx, obj_id):
+                    obj_data = masks_by_frame.get(frame_idx, {}).get(obj_id)
+                    if obj_data is None:
+                        return None
+                    mask_path = _merged_masks_dir / obj_data['filename']
+                    m = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+                    return (m > 0).astype(np.uint8) * 255 if m is not None else None
+                from utils import calculate_quality_metrics
+                _inter, _bg, _overlap = calculate_quality_metrics(
+                    masks_by_frame, _load_merged_mask, (height, width), num_frames
+                )
+                save_quality_metrics(str(output_dir), _inter, _bg, _overlap)
+                print("OK: Re-saved quality metrics with all objects")
+            else:
+                print(f"WARNING: No masks found in {prev_masks_dir} for unchanged objects {sorted(unchanged_ids)}")
+
         # Export results
         processor.export_masks(masks_by_frame, args.video_file, object_names, output_dir)
 
@@ -1336,7 +1491,7 @@ Examples:
             gpu_device=processor.device if use_gpu_overlay else None,
         )
 
-        processor.export_metadata(annotations_data, masks_by_frame, output_dir, num_frames,
+        processor.export_metadata(full_annotations_data, masks_by_frame, output_dir, num_frames,
                                 video_path=args.video_file, overlay_opacity=args.opacity)
 
         print("\n" + "=" * 60)
