@@ -1380,6 +1380,7 @@ Examples:
     # --only-updated: filter to just changed objects, remember which ones to reuse
     unchanged_ids = set()
     prev_results_dir = None
+    full_annotations_data = annotations_data  # preserved for export_metadata (Fix: bug where metadata loses unchanged objects)
     if args.only_updated:
         updated_ids = set(annotations_data.get("updated_objects", []))
         if not updated_ids:
@@ -1389,7 +1390,7 @@ Examples:
             unchanged_ids = all_ids - updated_ids
             prev_results_dir = Path(args.prev_results) if args.prev_results else output_dir
             print(f"--only-updated: re-segmenting {sorted(updated_ids)}, reusing masks for {sorted(unchanged_ids)}")
-            # Filter annotations to updated objects only
+            # Filter annotations to updated objects only (for segmentation; full data kept in full_annotations_data)
             annotations_data = dict(annotations_data)
             annotations_data["annotations"] = [
                 a for a in annotations_data["annotations"]
@@ -1436,12 +1437,36 @@ Examples:
                             dst = out_masks_dir / data["filename"]
                             if src.exists() and not dst.exists():
                                 shutil.copy2(str(src), str(dst))
-                # Merge metadata into masks_by_frame
+                # Merge metadata into masks_by_frame, enriching each dict with 'name' and 'color'
+                # so export_video_from_dict can use them (it falls back to object_names[int_key]
+                # but the dict has string keys from JSON, causing "Object_N" names)
                 for frame_idx, frame_masks in prev_masks.items():
+                    for oid, data in frame_masks.items():
+                        data['name'] = prev_names.get(oid, f"Object_{oid}")
+                        raw_color = object_colors.get(str(oid), [255, 0, 0])
+                        data['color'] = list(raw_color) if not isinstance(raw_color, list) else raw_color
                     masks_by_frame.setdefault(frame_idx, {}).update(frame_masks)
                 for oid, name in prev_names.items():
                     object_names[str(oid)] = name
                 print(f"Reused masks for unchanged objects {sorted(unchanged_ids)} from {prev_masks_dir}")
+
+                # Re-calculate quality metrics with all objects (updated + unchanged).
+                # The metrics saved inside process_segmentation only cover updated objects.
+                print("Re-calculating quality metrics with all objects (updated + unchanged)...")
+                _merged_masks_dir = output_dir / "masks"
+                def _load_merged_mask(frame_idx, obj_id):
+                    obj_data = masks_by_frame.get(frame_idx, {}).get(obj_id)
+                    if obj_data is None:
+                        return None
+                    mask_path = _merged_masks_dir / obj_data['filename']
+                    m = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+                    return (m > 0).astype(np.uint8) * 255 if m is not None else None
+                from utils import calculate_quality_metrics
+                _inter, _bg, _overlap = calculate_quality_metrics(
+                    masks_by_frame, _load_merged_mask, (height, width), num_frames
+                )
+                save_quality_metrics(str(output_dir), _inter, _bg, _overlap)
+                print("OK: Re-saved quality metrics with all objects")
             else:
                 print(f"WARNING: No masks found in {prev_masks_dir} for unchanged objects {sorted(unchanged_ids)}")
 
@@ -1466,7 +1491,7 @@ Examples:
             gpu_device=processor.device if use_gpu_overlay else None,
         )
 
-        processor.export_metadata(annotations_data, masks_by_frame, output_dir, num_frames,
+        processor.export_metadata(full_annotations_data, masks_by_frame, output_dir, num_frames,
                                 video_path=args.video_file, overlay_opacity=args.opacity)
 
         print("\n" + "=" * 60)

@@ -4866,6 +4866,37 @@ class SAM2VideoUI:
             messagebox.showerror("Directory Error", f"Failed to create output directories: {e}")
             return
 
+        # Check if only-updated mode is applicable
+        only_updated = False
+        unchanged_ids: set = set()
+        prev_masks_dir = None
+        if (self.updated_objects
+                and hasattr(self, 'mask_export_dir')
+                and self.mask_export_dir
+                and os.path.isdir(self.mask_export_dir)):
+            all_obj_ids = set(self.object_names.keys())
+            candidates_for_reuse = all_obj_ids - self.updated_objects
+            if candidates_for_reuse:
+                answer = messagebox.askyesnocancel(
+                    "Partial Re-segmentation",
+                    f"{len(self.updated_objects)} object(s) have updated annotations "
+                    f"(IDs: {', '.join(str(i) for i in sorted(self.updated_objects))}).\n\n"
+                    f"Re-segment only updated objects and reuse existing masks for "
+                    f"unchanged object(s) (IDs: {', '.join(str(i) for i in sorted(candidates_for_reuse))})"
+                    f"?\n\n"
+                    f"[Yes] Re-segment updated objects only\n"
+                    f"[No] Re-segment all objects\n"
+                    f"[Cancel] Abort"
+                )
+                if answer is None:  # Cancel
+                    return
+                if answer:  # Yes
+                    only_updated = True
+                    unchanged_ids = candidates_for_reuse
+                    prev_masks_dir = self.mask_export_dir
+                    print(f"Partial re-segmentation: updating {sorted(self.updated_objects)}, "
+                          f"reusing masks for {sorted(unchanged_ids)}")
+
         try:
             self.status_label.config(text="Preparing for segmentation...")
             self.progress_bar.pack(fill=tk.X, pady=(5, 0))
@@ -4911,6 +4942,8 @@ class SAM2VideoUI:
                 annotations = []
                 for x, y, is_pos, obj_id, frame_idx in self.click_points:
                     if frame_idx not in frames_to_process:
+                        continue
+                    if only_updated and obj_id not in self.updated_objects:
                         continue
 
                     # Get sequential index for SAM
@@ -4990,11 +5023,49 @@ class SAM2VideoUI:
                             self.masks[frame_idx] = {}
                         self.masks[frame_idx][obj_id] = None  # Placeholder
 
+                # Merge unchanged masks from previous directory (only-updated mode)
+                if only_updated and unchanged_ids and prev_masks_dir:
+                    import re as _re
+                    import shutil as _shutil
+                    _mask_pattern = _re.compile(r"^mask_f(\d{6})_(.+)_id(\d+)\.png$")
+                    _prev_path = Path(prev_masks_dir)
+                    _new_path = Path(export_dir)
+                    _merged = 0
+                    for _fp in sorted(_prev_path.glob("mask_f*.png")):
+                        _m = _mask_pattern.match(_fp.name)
+                        if not _m:
+                            continue
+                        _oid = int(_m.group(3))
+                        if _oid not in unchanged_ids:
+                            continue
+                        _fidx = int(_m.group(1))
+                        _obj_name = _m.group(2)
+                        # Copy file if target dir differs
+                        if _prev_path.resolve() != _new_path.resolve():
+                            _dst = _new_path / _fp.name
+                            if not _dst.exists():
+                                _shutil.copy2(str(_fp), str(_dst))
+                        # Merge into metadata and self.masks
+                        mask_metadata.append({
+                            'frame_idx': _fidx,
+                            'obj_id': _oid,
+                            'mask_file': _fp.name,
+                            'object_name': self.object_names.get(_oid, _obj_name),
+                            'color': self.object_colors.get(_oid, (255, 0, 0))
+                        })
+                        if _fidx not in self.masks:
+                            self.masks[_fidx] = {}
+                        self.masks[_fidx][_oid] = None
+                        _merged += 1
+                    print(f"Reused {_merged} masks for unchanged objects {sorted(unchanged_ids)} from {_prev_path}")
+
                 # Store export directory
                 self.mask_export_dir = export_dir
 
-                # Get quality metrics from result
-                quality_metrics = result.quality_metrics
+                # Get quality metrics from result.
+                # If only-updated mode was used, result.quality_metrics only covers the updated
+                # objects; force recalculation from the full merged self.masks instead.
+                quality_metrics = None if only_updated else result.quality_metrics
                 propagation_success = len(mask_metadata) > 0
 
                 # Save metadata and temporary directory
