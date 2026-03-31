@@ -1,6 +1,10 @@
-# SAM2 Video UI - Setup and Processing
+# Sam2UI: Object Segmentation and Gaze-Target Annotation
 
-Annotation tool for SAM2 video object segmentation with automatic setup and model management.
+Sam2UI is a toolkit for semi-automatic video object segmentation and gaze-target annotation. It is designed for workflows in which researchers first segment objects in video with SAM2/SAM3 and then use those segmented results to estimate which object a participant is looking at. The toolkit includes three main components: a setup utility, an interactive segmentation UI, and scripts for exporting segmentation outputs and aligning them with gaze data.
+
+## Why this toolkit exists
+
+Object segmentation and gaze-target annotation are both central to behavioral video analysis. Object segmentation separates meaningful items in a scene from the background and tracks them across frames, which makes it possible to represent dynamic visual environments in a structured way. Gaze-target annotation then links gaze samples to objects, allowing researchers to study attention, action, and social interaction at a finer level than frame-level manual coding alone. Because both video and gaze streams are dense and time-resolved, fully manual annotation is usually slow and difficult to scale. Sam2UI supports a semi-automatic workflow in which segmentation masks produced with SAM2/SAM3 can be reused to make gaze-target annotation more efficient and more reproducible.
 
 ## Prerequisites
 
@@ -107,6 +111,53 @@ python process_annotations.py annotations.json video.mp4 \
   --fps 30 --opacity 0.4
 ```
 
+## 4. Gaze-Target Annotation with Segmented Results (`gazed_object_published_version.py`)
+
+**Purpose**: Use exported segmentation masks together with gaze and world-camera timestamps to assign each gaze sample to the most likely object.
+
+This component is intended for a workflow where segmentation is completed first in Sam2UI, and the resulting masks are then matched against gaze coordinates frame by frame. For each gaze point, the script compares the gaze location to the available object masks in the corresponding frame and outputs the most likely gazed object together with a confidence score.
+
+**Required inputs**:
+- **Gaze/world-camera directory** containing files named like `{subject_id}_{camera}_gaze.csv` and `{subject_id}_{camera}_world_timestamps.csv`
+- **Segmentation mask directory** containing folders named like `{subject_id}_{camera}/masks/`
+- **Output directory** for gaze-target annotation results
+
+**Optional input**:
+- **Blink directory** containing `{subject_id}_{camera}_blinks.csv` files if you want to label or remove gaze points during blinks
+
+**Usage**:
+```bash
+# Process one subject/camera pair
+python gazed_object_published_version.py \
+  /path/to/gaze_world_data \
+  /path/to/segmentation_masks \
+  /path/to/output_dir \
+  --subject-id 27 \
+  --camera-id child
+
+# Remove gaze points during blinks
+python gazed_object_published_version.py \
+  /path/to/gaze_world_data \
+  /path/to/segmentation_masks \
+  /path/to/output_dir \
+  --subject-id 27 \
+  --camera-id child \
+  --blink-dir /path/to/blink_data
+```
+
+**How to do gaze-target annotation from segmented results**:
+1. Use `sam2_ui.py` to segment objects in the video and export annotations.
+2. Run `process_annotations.py` to generate frame-level masks in the output `masks/` directory.
+3. Organize your gaze CSVs and world-camera timestamp CSVs using the expected naming pattern.
+4. Run `gazed_object_published_version.py` with the gaze directory, mask directory, and output directory.
+5. Review the generated gaze-object CSV, which contains the assigned object label and confidence for each gaze sample.
+
+**Output files**:
+- **`output_dir/{subject_id}_gazed_object/{subject_id}_{camera}_gazed_object.csv`** - Gaze samples with assigned object labels and confidence
+- **`output_dir/{subject_id}_gazed_object/{subject_id}_{camera}_gaze_object_probabilities.pkl`** - Per-gaze probabilities for all available masks
+- **`output_dir/{subject_id}_gazed_object/{subject_id}_{camera}_gaze_blink_labeled.csv`** - Blink-labeled gaze data when `--blink-dir` is used
+- **`output_dir/{subject_id}_gazed_object/{subject_id}_{camera}_gaze_blink_removed.csv`** - Blink-removed gaze data when `--blink-dir` is used
+
 ## Complete Workflow
 
 ### 1. Create Environment (First Time Only)
@@ -154,6 +205,16 @@ python sam2_ui.py
 python process_annotations.py annotations.json video.mp4
 ```
 
+### 5. Assign Gaze Targets from Segmentation Masks
+```bash
+python gazed_object_published_version.py \
+  /path/to/gaze_world_data \
+  /path/to/segmentation_masks \
+  /path/to/output_dir \
+  --subject-id 27 \
+  --camera-id child
+```
+
 ## Output Files
 
 After processing, you'll get:
@@ -161,6 +222,7 @@ After processing, you'll get:
 - **`output_dir/masks/`** - Individual mask images (PNG files)
 - **`output_dir/segmented_video.mp4`** - Video with colored mask overlays
 - **`output_dir/processing_metadata.json`** - Processing statistics
+- **`output_dir/{subject_id}_gazed_object/`** - Gaze-target annotation outputs generated from segmentation masks
 
 ## Command Line Options
 
