@@ -1,10 +1,7 @@
-# Sam2UI: Object Segmentation and Gaze-Target Annotation
+# Object Segmentation and Gaze-Target Annotation (Gaze Target Annotator)
 
-Sam2UI is a toolkit for semi-automatic video object segmentation and gaze-target annotation. It is designed for workflows in which researchers first segment objects in video with SAM2/SAM3 and then use those segmented results to estimate which object a participant is looking at. The toolkit includes three main components: a setup utility, an interactive segmentation UI, and scripts for exporting segmentation outputs and aligning them with gaze data.
+Gaze Target Annotator, as a part of GazeBehavior Annotation Toolkit (GBAT), includes semi-automatic video object segmentation and gaze-target annotation. It is designed for workflows in which researchers first segment objects in video with SAM2/SAM3 and then use those segmented results to estimate which object a participant is looking at. The toolkit includes three main components: a setup utility, an interactive segmentation UI, and scripts for exporting segmentation outputs and aligning them with gaze data.
 
-## Why this toolkit exists
-
-Object segmentation and gaze-target annotation are both central to behavioral video analysis. Object segmentation separates meaningful items in a scene from the background and tracks them across frames, which makes it possible to represent dynamic visual environments in a structured way. Gaze-target annotation then links gaze samples to objects, allowing researchers to study attention, action, and social interaction at a finer level than frame-level manual coding alone. Because both video and gaze streams are dense and time-resolved, fully manual annotation is usually slow and difficult to scale. Sam2UI supports a semi-automatic workflow in which segmentation masks produced with SAM2/SAM3 can be reused to make gaze-target annotation more efficient and more reproducible.
 
 ## Prerequisites
 
