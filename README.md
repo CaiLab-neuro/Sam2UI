@@ -102,7 +102,6 @@ python process_annotations.py annotations.json video.mp4 --model sam2.1-large
 # With custom output directory
 python process_annotations.py annotations.json video.mp4 --output_dir results/
 
-<<<<<<< HEAD
 # With custom settings
 python process_annotations.py annotations.json video.mp4 \
   --output_dir results/ \
@@ -127,12 +126,6 @@ This component is intended for a workflow where segmentation is completed first 
 - **`{subject_id}_{camera}_gaze.csv`**: one row per gaze sample, ordered by time. Required columns are `timestamp [ns]`, `gaze x [px]`, and `gaze y [px]`. Additional columns are allowed and are preserved in the merged/output tables.
 - **`{subject_id}_{camera}_world_timestamps.csv`**: one row per world-camera frame, ordered by time. Required column is `timestamp [ns]`. Additional columns are allowed, but the script rebuilds `frame_idx` and `frame_timestamp` from this file during alignment.
 - **`{subject_id}_{camera}_blinks.csv`**: used only with `--blink-dir`. The code expects `start timestamp [ns]`, `end timestamp [ns]`, and `blink id`, because those columns are used to mark whether a gaze sample falls inside a blink interval.
-
-**How the CSVs are used**:
-- Gaze samples are aligned to the nearest world-camera frame at or before the gaze timestamp using `timestamp [ns]`.
-- After alignment, each gaze row carries the matched `frame_idx` and `frame_timestamp` from the world-camera timestamps file.
-- If blink data is provided, the script adds `in_blink` and `blink id`, then optionally removes gaze samples that fall inside blink intervals before object assignment.
-- Object assignment is performed per aligned `frame_idx` using the exported masks in `{subject_id}_{camera}/masks/`.
 
 **Minimum column examples**:
 ```csv
@@ -202,64 +195,6 @@ The main output CSV keeps the original gaze columns and any extra gaze metadata,
 ## Complete Workflow
 
 ### 1. Create Environment (First Time Only)
-=======
-# With custom settings
-python process_annotations.py annotations.json video.mp4 \
-  --output_dir results/ \
-  --fps 30 --opacity 0.4
-```
-
-## 4. Gaze-Target Annotation with Segmented Results (`gazed_object_published_version.py`)
-
-**Purpose**: Use exported segmentation masks together with gaze and world-camera timestamps to assign each gaze sample to the most likely object.
-
-This component is intended for a workflow where segmentation is completed first in Sam2UI, and the resulting masks are then matched against gaze coordinates frame by frame. For each gaze point, the script compares the gaze location to the available object masks in the corresponding frame and outputs the most likely gazed object together with a confidence score.
-
-**Required inputs**:
-- **Gaze/world-camera directory** containing files named like `{subject_id}_{camera}_gaze.csv` and `{subject_id}_{camera}_world_timestamps.csv`
-- **Segmentation mask directory** containing folders named like `{subject_id}_{camera}/masks/`
-- **Output directory** for gaze-target annotation results
-
-**Optional input**:
-- **Blink directory** containing `{subject_id}_{camera}_blinks.csv` files if you want to label or remove gaze points during blinks
-
-**Usage**:
-```bash
-# Process one subject/camera pair
-python gazed_object_published_version.py \
-  /path/to/gaze_world_data \
-  /path/to/segmentation_masks \
-  /path/to/output_dir \
-  --subject-id 27 \
-  --camera-id child
-
-# Remove gaze points during blinks
-python gazed_object_published_version.py \
-  /path/to/gaze_world_data \
-  /path/to/segmentation_masks \
-  /path/to/output_dir \
-  --subject-id 27 \
-  --camera-id child \
-  --blink-dir /path/to/blink_data
-```
-
-**How to do gaze-target annotation from segmented results**:
-1. Use `sam2_ui.py` to segment objects in the video and export annotations.
-2. Run `process_annotations.py` to generate frame-level masks in the output `masks/` directory.
-3. Organize your gaze CSVs and world-camera timestamp CSVs using the expected naming pattern.
-4. Run `gazed_object_published_version.py` with the gaze directory, mask directory, and output directory.
-5. Review the generated gaze-object CSV, which contains the assigned object label and confidence for each gaze sample.
-
-**Output files**:
-- **`output_dir/{subject_id}_gazed_object/{subject_id}_{camera}_gazed_object.csv`** - Gaze samples with assigned object labels and confidence
-- **`output_dir/{subject_id}_gazed_object/{subject_id}_{camera}_gaze_object_probabilities.pkl`** - Per-gaze probabilities for all available masks
-- **`output_dir/{subject_id}_gazed_object/{subject_id}_{camera}_gaze_blink_labeled.csv`** - Blink-labeled gaze data when `--blink-dir` is used
-- **`output_dir/{subject_id}_gazed_object/{subject_id}_{camera}_gaze_blink_removed.csv`** - Blink-removed gaze data when `--blink-dir` is used
-
-## Complete Workflow
-
-### 1. Create Environment (First Time Only)
->>>>>>> 54f4943821251f051218e343655f349d07b2d3be
 ```bash
 # Conda (recommended)
 conda create -n sam python=3.12 -y
