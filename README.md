@@ -125,6 +125,40 @@ This component is intended for a workflow where segmentation is completed first 
 **Optional input**:
 - **Blink directory** containing `{subject_id}_{camera}_blinks.csv` files if you want to label or remove gaze points during blinks
 
+**Expected CSV structure**:
+- **`{subject_id}_{camera}_gaze.csv`**: one row per gaze sample, ordered by time. Required columns are `timestamp [ns]`, `gaze x [px]`, and `gaze y [px]`. Additional columns are allowed and are preserved in the merged/output tables.
+- **`{subject_id}_{camera}_world_timestamps.csv`**: one row per world-camera frame, ordered by time. Required column is `timestamp [ns]`. Additional columns are allowed, but the script rebuilds `frame_idx` and `frame_timestamp` from this file during alignment.
+- **`{subject_id}_{camera}_blinks.csv`**: used only with `--blink-dir`. The code expects `start timestamp [ns]`, `end timestamp [ns]`, and `blink id`, because those columns are used to mark whether a gaze sample falls inside a blink interval.
+
+**How the CSVs are used**:
+- Gaze samples are aligned to the nearest world-camera frame at or before the gaze timestamp using `timestamp [ns]`.
+- After alignment, each gaze row carries the matched `frame_idx` and `frame_timestamp` from the world-camera timestamps file.
+- If blink data is provided, the script adds `in_blink` and `blink id`, then optionally removes gaze samples that fall inside blink intervals before object assignment.
+- Object assignment is performed per aligned `frame_idx` using the exported masks in `{subject_id}_{camera}/masks/`.
+
+**Minimum column examples**:
+```csv
+# {subject_id}_{camera}_gaze.csv
+timestamp [ns],gaze x [px],gaze y [px]
+1000000000,640.5,360.2
+1000033333,642.1,361.0
+```
+
+```csv
+# {subject_id}_{camera}_world_timestamps.csv
+timestamp [ns]
+999999000
+1000030000
+1000063000
+```
+
+```csv
+# {subject_id}_{camera}_blinks.csv
+blink id,start timestamp [ns],end timestamp [ns]
+0,1000200000,1000400000
+1,1001000000,1001200000
+```
+
 **Usage**:
 ```bash
 # Process one subject/camera pair
@@ -157,6 +191,15 @@ python gazed_object_published_version.py \
 - **`output_dir/{subject_id}_gazed_object/{subject_id}_{camera}_gaze_object_probabilities.pkl`** - Per-gaze probabilities for all available masks
 - **`output_dir/{subject_id}_gazed_object/{subject_id}_{camera}_gaze_blink_labeled.csv`** - Blink-labeled gaze data when `--blink-dir` is used
 - **`output_dir/{subject_id}_gazed_object/{subject_id}_{camera}_gaze_blink_removed.csv`** - Blink-removed gaze data when `--blink-dir` is used
+
+The main output CSV keeps the original gaze columns and any extra gaze metadata, then adds the alignment/object-assignment fields below:
+- `frame_idx`: world-camera frame index matched to the gaze sample
+- `frame_timestamp`: timestamp of the matched world-camera frame
+- `in_blink`: added only when `--blink-dir` is used
+- `blink id`: added only when `--blink-dir` is used
+- `gazed_object_id`: mask/object ID parsed from the exported mask filename
+- `gazed_object`: object label parsed from the exported mask filename
+- `gazed_object_confidence`: fraction of pixels inside the 20 px gaze-radius circle that overlap the winning object mask
 
 ## Complete Workflow
 
