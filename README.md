@@ -49,41 +49,38 @@ python install.py
 - Creates launcher scripts (run.bat/run.sh)
 - Verifies installation
 
-**Interactive Model Selection**:
-During setup, you'll be prompted to choose models:
-- **Option B (Recommended)**: SAM2.1 Small + Base+ (~500 MB)
+**Checkpoint Download**:
+During setup, you'll be prompted to choose which model checkpoints to download:
+- **Option B**: SAM2.1 Small + Base+ (~500 MB, lower memory usage)
 - **Option A**: All SAM2.1 models (~1.5 GB)
-- **Options 1-8**: Individual models (e.g., `2` for Small only)
-- **Range syntax**: Download multiple models (e.g., `2-4` for Small, Base+, Large)
-- **Comma-separated**: Select specific models (e.g., `2,4` for Small and Large)
-- **Option C**: Custom selection (interactive)
+- **Option C**: Custom selection — enter individual model numbers or a range (e.g., `2`, `2-4`, `2,4`)
 
-## 2. Model Selection
+Only models whose checkpoints are downloaded will be available at runtime.
 
-SAM2 UI supports multiple model variants with automatic selection:
+## 2. Using the SAM2 Video UI
 
-**SAM2.1 Models (Recommended - Released Sept 2024)**:
-- **Tiny** (156 MB): Fastest, good for real-time interaction
-- **Small** (184 MB): Best balance of speed and quality
-- **Base+** (324 MB): High quality segmentation
-- **Large** (898 MB): Best quality, slower inference
+### Initial Setup
+1. Load a video file
+2. Create an object list — add each object you want to track and give it a name
 
-**SAM2 Models (Legacy - Released July 2024)**:
-- Available in same sizes as SAM2.1
-- Use if you need compatibility with older workflows
+### Annotation
+1. Navigate to a frame where the object is clearly visible
+2. Add annotation points on the object (positive and negative clicks)
+3. Repeat for additional objects or frames as needed
+4. Export annotations as a JSON file
 
-**Model Selection Methods**:
-1. **During Setup**: Choose which models to download
-2. **In UI**: Use dropdown menu to select model before loading
-3. **Auto Mode**: Automatically picks best model for your GPU memory:
-   - <4GB VRAM: Tiny/Small models
-   - 4-8GB VRAM: Small/Base+ models
-   - ≥8GB VRAM: Large models (best quality)
+### Segmentation
+Select a model from the dropdown (larger models such as Base+ or Large generally produce better masks but are slower; only downloaded checkpoints appear), then either segment within the UI or use the processing script:
+```bash
+python process_annotations.py annotations.json video.mp4
+```
+For videos longer than a few hundred frames, using the processing script is recommended as the UI can be slow on long videos.
 
-**GPU Memory Requirements**:
-- Tiny/Small: 2GB+ VRAM
-- Base+: 4GB+ VRAM
-- Large: 8GB+ VRAM
+### Refinement
+1. Import segmentation results (this also imports the original annotations)
+2. Use quality metrics to identify segments in video where segmentation is poor
+3. Add or adjust annotation points and re-segment the frame to verify
+4. Re-export the updated annotations and re-run the processing script, or run segmentation in refinement mode for a range of frames within UI
 
 ## 3. Processing Script (`process_annotations.py`)
 
@@ -113,6 +110,20 @@ python process_annotations.py annotations.json video.mp4 \
 python process_annotations.py annotations.json video.mp4 \
   --output-dir results/ --only-updated
 ```
+
+### `process_annotations.py` Options
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--output-dir` | Output directory | `sam2_output` |
+| `--model` | SAM2 model to use | auto (best for GPU) |
+| `--fps` | Output video FPS | 30.0 |
+| `--opacity` | Mask overlay opacity (0.0-1.0) | 0.4 |
+| `--video-only` | Re-render video from existing masks, skip segmentation | — |
+| `--only-updated` | Re-segment only objects marked as updated; reuse other masks | — |
+| `--prev-results` | Directory with previous masks to reuse (with `--only-updated`) | output dir |
+| `--offload-to-cpu` | Offload video frames to CPU to reduce GPU memory usage | — |
+| `--frame-dir` | Persistent directory for extracted frames (avoids re-extraction) | temp dir |
 
 ## 4. Gaze-Target Annotation with Segmented Results (`gazed_object_published_version.py`)
 
@@ -191,63 +202,6 @@ The main output CSV keeps the original gaze columns and any extra gaze metadata,
 - `gazed_object`: object label parsed from the exported mask filename
 - `gazed_object_confidence`: fraction of pixels inside the 20 px gaze-radius circle that overlap the winning object mask
 
-## Complete Workflow
-
-### 1. Create Environment (First Time Only)
-```bash
-# Conda (recommended)
-conda create -n sam python=3.12 -y
-conda activate sam
-
-# OR venv
-python3 -m venv sam_env
-source sam_env/bin/activate  # Linux/Mac
-```
-
-### 2. Setup (First Time Only)
-```bash
-# Ensure environment is activated!
-conda activate sam  # or: source sam_env/bin/activate
-
-# Run setup
-python install.py
-```
-
-### 3. Use SAM2 Video UI
-```bash
-# Ensure environment is activated!
-conda activate sam
-
-# Windows
-run.bat
-
-# Linux/Mac
-./run.sh
-
-# Manual
-python sam2_ui.py
-```
-
-### 4. Create Annotations
-- Load video in SAM2 Video UI
-- Add click points on objects
-- Export annotations as JSON
-
-### 5. Process Annotations
-```bash
-python process_annotations.py annotations.json video.mp4
-```
-
-### 6. Assign Gaze Targets from Segmentation Masks
-```bash
-python gazed_object_published_version.py \
-  /path/to/gaze_world_data \
-  /path/to/segmentation_masks \
-  /path/to/output_dir \
-  --subject-id 27 \
-  --camera-id child
-```
-
 ## Output Files
 
 After processing, you'll get:
@@ -256,22 +210,6 @@ After processing, you'll get:
 - **`output_dir/segmented_video.mp4`** - Video with colored mask overlays
 - **`output_dir/processing_metadata.json`** - Processing statistics
 - **`output_dir/{subject_id}_gazed_object/`** - Gaze-target annotation outputs generated from segmentation masks
-
-## Command Line Options
-
-### `process_annotations.py` Options
-
-| Option | Description | Default |
-|--------|-------------|---------|
-| `--output-dir` | Output directory | `sam2_output` |
-| `--model` | SAM2 model to use | auto (best for GPU) |
-| `--fps` | Output video FPS | 30.0 |
-| `--opacity` | Mask overlay opacity (0.0-1.0) | 0.4 |
-| `--video-only` | Re-render video from existing masks, skip segmentation | — |
-| `--only-updated` | Re-segment only objects marked as updated; reuse other masks | — |
-| `--prev-results` | Directory with previous masks to reuse (with `--only-updated`) | output dir |
-| `--offload-to-cpu` | Offload video frames to CPU to reduce GPU memory usage | — |
-| `--frame-dir` | Persistent directory for extracted frames (avoids re-extraction) | temp dir |
 
 ## SAM3 Support (Optional)
 
@@ -357,28 +295,25 @@ python -c "from sam3.model_builder import build_sam3_video_predictor; print('SAM
 
 - Combined text + point prompts for refinement
 
-### Troubleshooting SAM3
-
-- **CUDA version too old**: SAM3 requires CUDA 12.6+. Check with `nvidia-smi` or upgrade CUDA toolkit
-- **PyTorch too old**: Upgrade PyTorch: `pip install torch==2.7.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126`
-- **Access not granted**: Request access at https://huggingface.co/facebook/sam3 and wait for approval
-- **Checkpoint not found**: Ensure checkpoints are in `sam_models/sam3/checkpoints/` after download
-- **Import error**: Verify installation: `pip list | grep -i sam3`
-
 ## Troubleshooting
 
 ### Setup Issues
 - **Python version**: Requires Python 3.10+ for SAM2, 3.12+ for SAM3
 - **Git not installed**: Download from https://git-scm.com/downloads
-- **Permissions**: May need admin rights, or you can set up within your own virtual environment created by conda or venv
 - **Failed to install some packages**: Try downgrading Python from the newest version, then rerun install.py. If it still fails, install the failed package with conda, then rerun install.py.
-- **Failed to install pycocotools-windows**: Modify install.py to install pycocotools instead.
 - **Failed to load pytorch_python dll**: Remove torch and torchvision, then let install.py reinstall them
 
 ### Processing Issues
 - **Model not found**: Run `install.py` first to download models
 - **Memory errors**: Use smaller model (tiny or small) or reduce video resolution
 - **Path errors**: Ensure you're running from the Sam2UI directory
+
+### SAM3 Issues
+- **CUDA version too old**: SAM3 requires CUDA 12.6+. Check with `nvidia-smi` or upgrade CUDA toolkit
+- **PyTorch too old**: Upgrade PyTorch: `pip install torch==2.7.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126`
+- **Access not granted**: Request access at https://huggingface.co/facebook/sam3 and wait for approval
+- **Checkpoint not found**: Ensure checkpoints are in `sam_models/sam3/checkpoints/` after download
+- **Import error**: Verify installation: `pip list | grep -i sam3`
 
 ### Common Solutions
 1. **Re-run setup**: `python install.py`
