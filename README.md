@@ -26,9 +26,9 @@ source sam_env/bin/activate  # Linux/Mac
 sam_env\Scripts\activate  # Windows
 ```
 
-**Note**: Always activate your environment before running `setup.py` or the UI!
+**Note**: Always activate your environment before running `install.py` or the UI!
 
-## 1. Setup Script (`setup.py`)
+## 1. Setup Script (`install.py`)
 
 **Purpose**: Automatically install SAM2, dependencies, and model checkpoints
 
@@ -38,7 +38,7 @@ sam_env\Scripts\activate  # Windows
 conda activate sam  # or: source sam_env/bin/activate
 
 # Then run setup
-python setup.py
+python install.py
 ```
 
 **What it does**:
@@ -211,7 +211,7 @@ source sam_env/bin/activate  # Linux/Mac
 conda activate sam  # or: source sam_env/bin/activate
 
 # Run setup
-python setup.py
+python install.py
 ```
 
 ### 3. Use SAM2 Video UI
@@ -306,7 +306,7 @@ SAM3 adds text-based prompting capabilities for object segmentation.
 ### Installation Steps
 
 #### 1. During Setup
-When running `setup.py`, answer 'y' when prompted for SAM3 installation.
+When running `install.py`, answer 'y' when prompted for SAM3 installation.
 
 The installer will:
 - Check Python version (≥3.12)
@@ -403,23 +403,19 @@ python -c "from sam3.model_builder import build_sam3_video_predictor; print('SAM
 ### Setup Issues
 - **Python version**: Requires Python 3.10+ for SAM2, 3.12+ for SAM3
 - **Git not installed**: Download from https://git-scm.com/downloads
-- **Internet connection**: Needed to download models
 - **Permissions**: May need admin rights, or you can set up within your own virtual environment created by conda or venv
-- **Failed to install some packages**: Try downgrading Python from the newest version, then rerun setup.py. If it still fails, install the failed package with conda, then rerun setup.py.
-- **Failed to install pycocotools-windows**: Modify setup.py to install pycocotools instead.
-- **Failed to load pytorch_python dll**: Remove torch and torchvision, then let setup.py reinstall them
-- **SAM2 import error**: Check that `sam2/sam2/` directory exists with `__init__.py`
-- **Model not found**: Ensure checkpoints are in `sam2/checkpoints/`
-- **Config not found**: Verify `sam2/configs/` directory exists
+- **Failed to install some packages**: Try downgrading Python from the newest version, then rerun install.py. If it still fails, install the failed package with conda, then rerun install.py.
+- **Failed to install pycocotools-windows**: Modify install.py to install pycocotools instead.
+- **Failed to load pytorch_python dll**: Remove torch and torchvision, then let install.py reinstall them
 
 ### Processing Issues
-- **Model not found**: Run `setup.py` first to download models
+- **Model not found**: Run `install.py` first to download models
 - **Memory errors**: Use smaller model (tiny or small) or reduce video resolution
 - **Import errors**: Verify SAM2 package is installed: `pip list | grep -i sam`
 - **Path errors**: Ensure you're running from the Sam2UI directory
 
 ### Common Solutions
-1. **Re-run setup**: `python setup.py`
+1. **Re-run setup**: `python install.py`
 2. **Check SAM2 installation**: Verify `sam2/` directory exists with subdirectories
 3. **Verify Python version**: `python --version` (must be 3.10+)
 4. **Check file paths**: Ensure annotation and video files exist
