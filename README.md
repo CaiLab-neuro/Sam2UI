@@ -74,13 +74,13 @@ Select a model from the dropdown (larger models such as Base+ or Large generally
 ```bash
 python process_annotations.py annotations.json video.mp4
 ```
-For videos longer than roughly one minute, using the processing script is recommended as the UI can be slow on long videos.
+For videos longer than a few hundred frames, using the processing script is recommended as the UI can be slow on long videos.
 
 ### Refinement
-1. Import segmentation results (this also restores the annotations)
-2. Use quality metrics to identify frames where segmentation is poor
+1. Import segmentation results (this also imports the original annotations)
+2. Use quality metrics to identify segments in video where segmentation is poor
 3. Add or adjust annotation points and re-segment the frame to verify
-4. Re-export the updated annotations and re-run the processing script
+4. Re-export the updated annotations and re-run the processing script, or run segmentation in refinement mode for a range of frames within UI
 
 ## 3. Processing Script (`process_annotations.py`)
 
