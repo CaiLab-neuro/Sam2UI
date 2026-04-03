@@ -1,6 +1,9 @@
-# Object Segmentation and Gaze-Target Annotation (Gaze Target Annotator)
+# SAM2 Graphic User Interface and Gaze-Target Annotation (Gaze Target Annotator)
 
-Gaze Target Annotator, as a part of GazeBehavior Annotation Toolkit (GBAT), includes semi-automatic video object segmentation and gaze-target annotation. It is designed for workflows in which researchers first segment objects in video with SAM2/SAM3 and then use those segmented results to estimate which object a participant is looking at. The toolkit includes three main components: a setup utility, an interactive segmentation UI, and scripts for exporting segmentation outputs and aligning them with gaze data.
+Gaze Target Annotator, as a part of GazeBehavior Annotation Toolkit (GBAT), provides a generic-purpose graphical user interface to annotate objects in a video with a few points, and utilize SAM2 or SAM3 to segment objects in the video. 
+For eye-tracking research, it further includes utility to map eye-gaze coordinate in the scene video of head-mounted eye-tracker to categories of gaze target.
+
+The toolkit includes three main components: an interactive segmentation UI, an offline processing script, and a script for using segmentation outputs and eye-tracker gaze coordiate data to generate time series of gaze target. For gaze coordinate data, we follow the format of Pupil Labs output.
 
 
 ## Prerequisites
@@ -291,7 +294,7 @@ python process_annotations.py annotations.json video.mp4 \
 
 ## SAM3 Support (Optional)
 
-SAM3 adds text-based prompting capabilities for object segmentation.
+SAM3 adds text-based prompting capabilities for object segmentation. So far, we have not integreated this feature. But users can still use the point-based prompt for SAM3. Empirically we found it may perform worse than SAM2 in this usage.
 
 ### Requirements
 
@@ -355,7 +358,7 @@ hf_hub_download(
 "
 ```
 
-**Expected checkpoint location**: `Sam2UI/sam3/checkpoints/sam3_hiera_l.pt`
+**Expected checkpoint location**: `Sam2UI/sam_models/sam3/checkpoints/`
 
 #### 5. Verify Installation
 
@@ -370,16 +373,14 @@ python -c "from sam3.model_builder import build_sam3_video_predictor; print('SAM
 
 ### Coming Soon
 
-- Text-based object prompts
 - Combined text + point prompts for refinement
-- Multi-modal prompting (text + points + boxes)
 
 ### Troubleshooting SAM3
 
 - **CUDA version too old**: SAM3 requires CUDA 12.6+. Check with `nvidia-smi` or upgrade CUDA toolkit
 - **PyTorch too old**: Upgrade PyTorch: `pip install torch==2.7.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126`
 - **Access not granted**: Request access at https://huggingface.co/facebook/sam3 and wait for approval
-- **Checkpoint not found**: Ensure checkpoints are in `sam3/checkpoints/` after download
+- **Checkpoint not found**: Ensure checkpoints are in `sam_models/sam3/checkpoints/` after download
 - **Import error**: Verify installation: `pip list | grep -i sam3`
 
 ## Requirements
@@ -411,7 +412,6 @@ python -c "from sam3.model_builder import build_sam3_video_predictor; print('SAM
 ### Processing Issues
 - **Model not found**: Run `install.py` first to download models
 - **Memory errors**: Use smaller model (tiny or small) or reduce video resolution
-- **Import errors**: Verify SAM2 package is installed: `pip list | grep -i sam`
 - **Path errors**: Ensure you're running from the Sam2UI directory
 
 ### Common Solutions
@@ -419,7 +419,5 @@ python -c "from sam3.model_builder import build_sam3_video_predictor; print('SAM
 2. **Check SAM2 installation**: Verify `sam2/` directory exists with subdirectories
 3. **Verify Python version**: `python --version` (must be 3.10+)
 4. **Check file paths**: Ensure annotation and video files exist
-5. **Verify formats**: Use JSON files exported from SAM2 Video UI
-6. **Try different model**: Use the dropdown to select a different model variant
 
 
