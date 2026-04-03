@@ -26,18 +26,13 @@ source sam_env/bin/activate  # Linux/Mac
 sam_env\Scripts\activate  # Windows
 ```
 
-**Note**: Always activate your environment before running `install.py` or the UI!
-
 ## 1. Setup Script (`install.py`)
 
 **Purpose**: Automatically install SAM2, dependencies, and model checkpoints
 
-**Usage** (run inside activated conda/venv environment):
+**Usage** (activate your environment first, then run):
 ```bash
-# IMPORTANT: Activate your environment first!
 conda activate sam  # or: source sam_env/bin/activate
-
-# Then run setup
 python install.py
 ```
 
@@ -100,12 +95,20 @@ python process_annotations.py annotations.json video.mp4
 python process_annotations.py annotations.json video.mp4 --model sam2.1-large
 
 # With custom output directory
-python process_annotations.py annotations.json video.mp4 --output_dir results/
+python process_annotations.py annotations.json video.mp4 --output-dir results/
 
 # With custom settings
 python process_annotations.py annotations.json video.mp4 \
-  --output_dir results/ \
+  --output-dir results/ \
   --fps 30 --opacity 0.4
+
+# Re-render output video from existing masks (no re-segmentation)
+python process_annotations.py annotations.json video.mp4 \
+  --output-dir results/ --video-only --opacity 0.6
+
+# Re-segment only objects that were updated in the annotation file
+python process_annotations.py annotations.json video.mp4 \
+  --output-dir results/ --only-updated
 ```
 
 ## 4. Gaze-Target Annotation with Segmented Results (`gazed_object_published_version.py`)
@@ -170,13 +173,6 @@ python gazed_object_published_version.py \
   --blink-dir /path/to/blink_data
 ```
 
-**How to do gaze-target annotation from segmented results**:
-1. Use `sam2_ui.py` to segment objects in the video and export annotations.
-2. Run `process_annotations.py` to generate frame-level masks in the output `masks/` directory.
-3. Organize your gaze CSVs and world-camera timestamp CSVs using the expected naming pattern.
-4. Run `gazed_object_published_version.py` with the gaze directory, mask directory, and output directory.
-5. Review the generated gaze-object CSV, which contains the assigned object label and confidence for each gaze sample.
-
 **Output files**:
 - **`output_dir/{subject_id}_gazed_object/{subject_id}_{camera}_gazed_object.csv`** - Gaze samples with assigned object labels and confidence
 - **`output_dir/{subject_id}_gazed_object/{subject_id}_{camera}_gaze_object_probabilities.pkl`** - Per-gaze probabilities for all available masks
@@ -229,17 +225,17 @@ run.bat
 python sam2_ui.py
 ```
 
-### 3. Create Annotations
+### 4. Create Annotations
 - Load video in SAM2 Video UI
 - Add click points on objects
 - Export annotations as JSON
 
-### 4. Process Annotations
+### 5. Process Annotations
 ```bash
 python process_annotations.py annotations.json video.mp4
 ```
 
-### 5. Assign Gaze Targets from Segmentation Masks
+### 6. Assign Gaze Targets from Segmentation Masks
 ```bash
 python gazed_object_published_version.py \
   /path/to/gaze_world_data \
@@ -264,30 +260,15 @@ After processing, you'll get:
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `--output_dir` | Output directory | `sam2_output` |
-| `--model` | SAM2 model to use | `sam2_hiera_base_plus.pt` |
+| `--output-dir` | Output directory | `sam2_output` |
+| `--model` | SAM2 model to use | auto (best for GPU) |
 | `--fps` | Output video FPS | 30.0 |
 | `--opacity` | Mask overlay opacity (0.0-1.0) | 0.4 |
-
-## Examples
-
-### Basic Processing
-```bash
-python process_annotations.py my_annotations.json my_video.mp4
-```
-
-### Custom Output Directory
-```bash
-python process_annotations.py annotations.json video.mp4 --output_dir my_results/
-```
-
-### High Quality Processing
-```bash
-python process_annotations.py annotations.json video.mp4 \
-  --model sam2.1-large \
-  --fps 60 --opacity 0.6 \
-  --output_dir high_quality_results/
-```
+| `--video-only` | Re-render video from existing masks, skip segmentation | — |
+| `--only-updated` | Re-segment only objects marked as updated; reuse other masks | — |
+| `--prev-results` | Directory with previous masks to reuse (with `--only-updated`) | output dir |
+| `--offload-to-cpu` | Offload video frames to CPU to reduce GPU memory usage | — |
+| `--frame-dir` | Persistent directory for extracted frames (avoids re-extraction) | temp dir |
 
 ## SAM3 Support (Optional)
 
@@ -338,11 +319,11 @@ huggingface-cli login
 
 #### 4. Download Checkpoints
 
-After authentication, download SAM3 checkpoints from HuggingFace and place them in the `sam3/checkpoints/` directory:
+After authentication, download SAM3 checkpoints from HuggingFace and place them in the `sam_models/sam3/checkpoints/` directory:
 
 ```bash
 # Create checkpoints directory
-mkdir -p sam3/checkpoints
+mkdir -p sam_models/sam3/checkpoints
 
 # Download using Python (after huggingface-cli login)
 python -c "
@@ -350,12 +331,12 @@ from huggingface_hub import hf_hub_download
 hf_hub_download(
     repo_id='facebook/sam3',
     filename='sam3_hiera_l.pt',
-    local_dir='sam3/checkpoints'
+    local_dir='sam_models/sam3/checkpoints'
 )
 "
 ```
 
-**Expected checkpoint location**: `Sam2UI/sam3/checkpoints/sam3_hiera_l.pt`
+**Expected checkpoint location**: `Sam2UI/sam_models/sam3/checkpoints/sam3_hiera_l.pt`
 
 #### 5. Verify Installation
 
@@ -379,24 +360,8 @@ python -c "from sam3.model_builder import build_sam3_video_predictor; print('SAM
 - **CUDA version too old**: SAM3 requires CUDA 12.6+. Check with `nvidia-smi` or upgrade CUDA toolkit
 - **PyTorch too old**: Upgrade PyTorch: `pip install torch==2.7.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126`
 - **Access not granted**: Request access at https://huggingface.co/facebook/sam3 and wait for approval
-- **Checkpoint not found**: Ensure checkpoints are in `sam3/checkpoints/` after download
+- **Checkpoint not found**: Ensure checkpoints are in `sam_models/sam3/checkpoints/` after download
 - **Import error**: Verify installation: `pip list | grep -i sam3`
-
-## Requirements
-
-**For SAM2**:
-- Python 3.10 or higher
-- PyTorch 2.5.1+
-- torchvision 0.20.1+
-- 4GB+ RAM (8GB+ recommended)
-- NVIDIA GPU with CUDA (recommended)
-- Git (for cloning SAM2 repository)
-- Internet connection (for setup)
-
-**For SAM3 (Optional)**:
-- Python 3.12+
-- PyTorch 2.7+
-- HuggingFace account with SAM3 access
 
 ## Troubleshooting
 
@@ -416,7 +381,7 @@ python -c "from sam3.model_builder import build_sam3_video_predictor; print('SAM
 
 ### Common Solutions
 1. **Re-run setup**: `python install.py`
-2. **Check SAM2 installation**: Verify `sam2/` directory exists with subdirectories
+2. **Check SAM2 installation**: Verify `sam_models/sam2/` directory exists with subdirectories
 3. **Verify Python version**: `python --version` (must be 3.10+)
 4. **Check file paths**: Ensure annotation and video files exist
 5. **Verify formats**: Use JSON files exported from SAM2 Video UI
