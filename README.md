@@ -49,41 +49,38 @@ python install.py
 - Creates launcher scripts (run.bat/run.sh)
 - Verifies installation
 
-**Interactive Model Selection**:
-During setup, you'll be prompted to choose models:
-- **Option B (Recommended)**: SAM2.1 Small + Base+ (~500 MB)
+**Checkpoint Download**:
+During setup, you'll be prompted to choose which model checkpoints to download:
+- **Option B**: SAM2.1 Small + Base+ (~500 MB, lower memory usage)
 - **Option A**: All SAM2.1 models (~1.5 GB)
-- **Options 1-8**: Individual models (e.g., `2` for Small only)
-- **Range syntax**: Download multiple models (e.g., `2-4` for Small, Base+, Large)
-- **Comma-separated**: Select specific models (e.g., `2,4` for Small and Large)
-- **Option C**: Custom selection (interactive)
+- **Option C**: Custom selection — enter individual model numbers or a range (e.g., `2`, `2-4`, `2,4`)
 
-## 2. Model Selection
+Only models whose checkpoints are downloaded will be available at runtime.
 
-SAM2 UI supports multiple model variants with automatic selection:
+## 2. Using the SAM2 Video UI
 
-**SAM2.1 Models (Recommended - Released Sept 2024)**:
-- **Tiny** (156 MB): Fastest, good for real-time interaction
-- **Small** (184 MB): Best balance of speed and quality
-- **Base+** (324 MB): High quality segmentation
-- **Large** (898 MB): Best quality, slower inference
+### Initial Setup
+1. Load a video file
+2. Create an object list — add each object you want to track and give it a name
 
-**SAM2 Models (Legacy - Released July 2024)**:
-- Available in same sizes as SAM2.1
-- Use if you need compatibility with older workflows
+### Annotation
+1. Navigate to a frame where the object is clearly visible
+2. Add annotation points on the object (positive and negative clicks)
+3. Repeat for additional objects or frames as needed
+4. Export annotations as a JSON file
 
-**Model Selection Methods**:
-1. **During Setup**: Choose which models to download
-2. **In UI**: Use dropdown menu to select model before loading
-3. **Auto Mode**: Automatically picks best model for your GPU memory:
-   - <4GB VRAM: Tiny/Small models
-   - 4-8GB VRAM: Small/Base+ models
-   - ≥8GB VRAM: Large models (best quality)
+### Segmentation
+Select a model from the dropdown (larger models such as Base+ or Large generally produce better masks but are slower; only downloaded checkpoints appear), then either segment within the UI or use the processing script:
+```bash
+python process_annotations.py annotations.json video.mp4
+```
+For videos longer than roughly one minute, using the processing script is recommended as the UI can be slow on long videos.
 
-**GPU Memory Requirements**:
-- Tiny/Small: 2GB+ VRAM
-- Base+: 4GB+ VRAM
-- Large: 8GB+ VRAM
+### Refinement
+1. Import segmentation results (this also restores the annotations)
+2. Use quality metrics to identify frames where segmentation is poor
+3. Add or adjust annotation points and re-segment the frame to verify
+4. Re-export the updated annotations and re-run the processing script
 
 ## 3. Processing Script (`process_annotations.py`)
 
