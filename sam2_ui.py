@@ -36,7 +36,7 @@ from utils import (
 )
 
 # Import lazy loader to prevent SAM2 from loading all frames into RAM at inference time
-from sam2_lazy_loader import enable_lazy_loading
+from lazy_loader import enable_lazy_loading
 
 # Import shared segmentation module
 from segment import (

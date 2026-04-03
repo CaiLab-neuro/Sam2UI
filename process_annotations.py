@@ -39,7 +39,7 @@ from PIL import Image
 import psutil
 
 # Import lazy loader BEFORE importing SAM2
-from sam2_lazy_loader import enable_lazy_loading
+from lazy_loader import enable_lazy_loading
 
 # Import quality metrics utilities and CUDA helpers
 from utils import (
