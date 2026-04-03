@@ -10,24 +10,39 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import logging, sys
 import argparse
+import re
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 """
-This is an aligner script (published version) to find which object is being gazed at based on segmentation masks and gaze data.
-This code includes functions to
-    1) Load segmentation masks from SAM2 or 3,
-    2) Load gaze data and align gaze points with the corresponding video frames based on timestamps,
-    3) Compute confidence scores for each gaze point against each object mask,
-    4) Output the gazed object and confidence for each gaze point, as well as probabilities for all masks.
+Published-version aligner to assign an object label to each gaze sample using
+segmentation masks and gaze/world-camera timestamps.
+
+This script:
+    1) Resolves a subject/camera mask directory from either
+       *{subject_id}/{camera}/masks/* or legacy *{subject_id}_{camera}/masks/*.
+    2) Loads *{subject_id}_{camera}_gaze.csv* and
+       *{subject_id}_{camera}_world_timestamps.csv* from the gaze/world directory.
+    3) Aligns each gaze timestamp to the most recent world-camera frame at or
+       before that timestamp.
+    4) Optionally labels blinks from *{subject_id}_{camera}_blinks.csv* and
+       removes blink-period gaze samples from the object-assignment stage.
+    5) Scores each aligned gaze sample against all readable masks in the matched
+       frame and assigns the highest-confidence object label.
+    6) Saves the per-gaze object assignments, a pickle of per-mask confidence
+       values, and method-figure trajectory/heatmap plots.
 
 Authors: Yanbin Xu
 Date: Jan.7 2026
 
 Inputs:
-    1) Subject ID(s) and Camera ID(s).
-    Subject ID: e.g. 27 or 27,28 etc.
-    Camera ID: e.g. child or parent or child,parent
+    1) Subject ID(s) and Camera ID(s), provided with the optional CLI arguments
+       *--subject-id* and *--camera-id*.
+       Subject ID examples: *27* or *27,28*
+       Camera ID examples: *child* or *child,parent*
+       If omitted, both are auto-discovered from the CSV filenames in
+       *gaze_world_dir*.
 
     2) Gaze and World Camera data directory: /path/to/gaze_world_data
     Within this directory, the code expects
@@ -41,40 +56,69 @@ Inputs:
         Rows: Each frame in the egocentric video ordered by timestamp.
         Columns(required/Column Name Case Specific):
             timestamp [ns]: Timestamp of the frame.
-        Note: these files can include more columns. Gaze recordings and frame rates do not need to be the same.
+        Note: these files can include additional columns such as
+              *source_frame_idx*. Gaze recordings sampling rates and frame rates
+              do not need to be the same.
 
     3) Segmentation mask directory: /path/to/segmentation_masks
-    Within this directory, the code expects
-        a) folders named as *{subject_id}_{camera}/masks/*
+    Within this directory, the code expects either
+        a) folders named as *{subject_id}/{camera}/masks/*
+        b) or legacy folders named as *{subject_id}_{camera}/masks/*
         Each folder contains:
-        Segmentation masks (.png) of multiple objects from SAM2/3 (numpy arrays).
+        Segmentation mask image files (.png) for multiple objects from SAM2/3.
         Mask name format: *mask_f{frame_id}_{mask_object_name}_{mask_id}*.png
         e.g. mask_f000000_ceiling_inside_id32.png
 
     4) (Optional) Blink data directory: /path/to/blink_data
     If provided, the code will label and remove gaze points that fall within blink periods and remove them from the analysis.
     Within this directory, the code expects
-        a) Blink data CSV files named as *{subject_id}_{camera}_blinks.csv
+        a) Blink data CSV files named as *{subject_id}_{camera}_blinks.csv*
+        Columns(required/Column Name Case Specific):
+            start timestamp [ns]
+            end timestamp [ns]
+            blink id
 
 Outputs:
     1) Output directory: /path/to/output_directory
     Within this directory, the code will create new folders named as *{subject_id}_gazed_object/*
 
         Each folder contains:
-        A csv file containing the gaze and its associated gazed object with confidence score.
+        A csv file containing the aligned gaze rows and their assigned gazed object.
         *{subject_id_temp}_{camera_temp}_gazed_object.csv*
+        Added columns include:
+            gazed_object_id
+            gazed_object
+            gazed_object_confidence
+        Depending on the input CSVs, the output may also include aligned frame
+        mapping columns such as *frame_idx*, *frame_timestamp*, and
+        *source_frame_idx*.
 
         A pickle file containing the probabilities of all object masks for each gaze point. 
         *{subject_id_temp}_{camera_temp}_gaze_object_probabilities.pkl*
 
-        if remove blink option is applied:
-        A csv file containing the gaze data labeled within_blink.
+        If blink removal is enabled:
+        A csv file containing the aligned gaze data labeled with blink status.
         *{subject_id_temp}_{camera_temp}_gaze_blink_labeled.csv*
 
-        A csv file containing gaze data removed all gazes in blink.
+        A csv file containing the aligned gaze data after removing blink-period gazes.
         *{subject_id_temp}_{camera_temp}_gaze_blink_removed.csv*
 
+        A figures subdirectory containing method-figure outputs:
+        *figures/{subject_id_temp}_{camera_temp}_trajectory_plot.png*
+        *figures/{subject_id_temp}_{camera_temp}_trajectory_plot.pdf*
+        *figures/{subject_id_temp}_{camera_temp}_confidence_heatmap.png*
+        *figures/{subject_id_temp}_{camera_temp}_confidence_heatmap.pdf*
+
+    2) A log file is written to *--log-path* if provided, otherwise to
+       *{output_dir}/gaze_object.log*.
 """
+
+
+class RawDescriptionDefaultsHelpFormatter(
+    argparse.ArgumentDefaultsHelpFormatter,
+    argparse.RawDescriptionHelpFormatter,
+):
+    pass
 
 def setup_logging(log_path: Path):
         log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -87,6 +131,11 @@ def setup_logging(log_path: Path):
             ],
             force=True,  # important if running in notebooks / reused envs
         )
+
+
+def format_log_datetime(dt: Optional[datetime] = None) -> str:
+        dt = dt or datetime.now().astimezone()
+        return dt.strftime("%Y-%m-%d %H:%M:%S %Z%z")
 
 
 class GazeObjectAligner:
@@ -107,6 +156,55 @@ class GazeObjectAligner:
         self.start_plot_time = start_plot_time
         self.end_plot_time = end_plot_time
         self.logger = logger or logging.getLogger(__name__)
+
+    def resolve_mask_dir(self, subj: str, camera: str) -> Path:
+        """Resolve the mask directory for a subject/camera across supported layouts."""
+        root = Path(self.mask_dir)
+        candidates = [
+            root / subj / camera / "masks",
+            root / f"{subj}_{camera}" / "masks",
+        ]
+
+        for candidate in candidates:
+            if candidate.is_dir():
+                return candidate
+
+        checked = ", ".join(str(path) for path in candidates)
+        raise FileNotFoundError(
+            f"Could not find a mask directory for subject={subj}, camera={camera}. "
+            f"Checked: {checked}"
+        )
+
+    def summarize_mask_frames(self, mask_dir: Path) -> dict[str, object]:
+        """Summarize which frame ids are present in a mask directory."""
+        # mask_f000123.png → match.group(1) = "000123" -> int("000123") = 123
+        frame_pattern = re.compile(r"mask_f(\d{6})")
+        frame_ids = sorted(
+            {
+                int(match.group(1))
+                for mask_path in Path(mask_dir).glob("*.png")
+                for match in [frame_pattern.search(mask_path.name)]
+                if match is not None
+            }
+        )
+
+        if not frame_ids:
+            return {
+                "count": 0,
+                "frame_ids": set(),
+                "contiguous": False,
+                "min_frame": None,
+                "max_frame": None,
+            }
+
+        contiguous = frame_ids == list(range(frame_ids[0], frame_ids[-1] + 1))
+        return {
+            "count": len(frame_ids),
+            "frame_ids": set(frame_ids),
+            "contiguous": contiguous,
+            "min_frame": frame_ids[0],
+            "max_frame": frame_ids[-1],
+        }
 
     def load_mask(self, frame_id: int, mask_dir: str) -> dict[str, np.ndarray]:
         """Load segmentation mask for one frame of multiple objects from SAM2 for a given subject and camera.
@@ -392,7 +490,7 @@ class GazeObjectAligner:
         plt.close(heatmap_fig)
         self.logger.info("Saved confidence heatmap to %s and %s", heatmap_png, heatmap_pdf)
 
-    def load_gaze_data(self, subj: str, camera: str) -> pd.DataFrame:
+    def load_gaze_data(self, subj: str, camera: str) -> tuple[pd.DataFrame, pd.DataFrame, Path]:
         """Load gaze data from a CSV file.
         Select gaze data within the cut video duration.
         Label each gaze with the corresponding frame id in the cut video. 
@@ -444,7 +542,7 @@ class GazeObjectAligner:
             allow_exact_matches=True
         )
         aligned = aligned.dropna(subset=['frame_idx']) # drop rows where no matching world frame found
-        return aligned
+        return aligned, world_cam_dic, world_cam_path
 
     def label_blinks(self, aligned_gaze_df: pd.DataFrame, subj: str, camera: str) -> pd.DataFrame:
         """Label each gaze point with blink information, whether they are in blink periods.
@@ -537,133 +635,222 @@ class GazeObjectAligner:
 
     def process_subject(self, subject_id_temp: str, camera_temp: str) -> None:
         """Process gaze data for a specific subject and camera."""
+        subject_run_started_at = datetime.now().astimezone()
+        self.logger.info(
+            "Subject-camera run started at (local time): %s",
+            format_log_datetime(subject_run_started_at),
+        )
         out_dir= Path(self.output_dir) / f'{subject_id_temp}_gazed_object'
         out_dir.mkdir(parents=True, exist_ok=True)
-        gaze= self.load_gaze_data(subject_id_temp, camera_temp)
-        if len(gaze) == 0:
-            self.logger.warning(f"No gaze data found for subject {subject_id_temp} and camera {camera_temp}. Skipping.")
-            return
+        run_status = "completed"
+        try:
+            gaze, world_cam_dic, world_cam_path = self.load_gaze_data(subject_id_temp, camera_temp)
+            if len(gaze) == 0:
+                self.logger.warning(f"No gaze data found for subject {subject_id_temp} and camera {camera_temp}. Skipping.")
+                return
 
-        if self.blink_dir is None:
-            gaze_blink_removed = gaze
-        else:
-            gaze_blink_labeled= self.label_blinks(gaze, subject_id_temp, camera_temp)
-            gaze_blink_labeled.to_csv(os.path.join(out_dir, f"{subject_id_temp}_{camera_temp}_gaze_blink_labeled.csv"), index= False)
-            self.logger.info(f"Saved blink labeled gaze data to {os.path.join(out_dir, f'{subject_id_temp}_{camera_temp}_gaze_blink_labeled.csv')}")
-            # Create a copy of the gaze DataFrame to store results
-            gaze_blink_removed = gaze_blink_labeled.loc[~gaze_blink_labeled['in_blink']].copy()
-            gaze_blink_removed.to_csv(os.path.join(out_dir, f"{subject_id_temp}_{camera_temp}_gaze_blink_removed.csv"), index= False)
-            self.logger.info(f"Saved blink removed gaze data to {os.path.join(out_dir, f'{subject_id_temp}_{camera_temp}_gaze_blink_removed.csv')}")
+            unique_aligned_frames = int(gaze["frame_idx"].nunique())
+            cut_world_frames = len(world_cam_dic)
 
-        subject_gaze_probabilities = {}
-        mask_subject = Path(self.mask_dir) / f"{subject_id_temp}_{camera_temp}" / "masks"
-        self.logger.info(f"Loading masks from {mask_subject}")
-        total_gaze_points = len(gaze_blink_removed)
-        total_frames = int(gaze_blink_removed["frame_idx"].nunique())
-        frames_with_masks = 0
-        frames_without_masks = 0
-        assigned_gaze_points = 0
-        assigned_confidences = []
+            if self.blink_dir is None:
+                gaze_blink_removed = gaze
+            else:
+                gaze_blink_labeled= self.label_blinks(gaze, subject_id_temp, camera_temp)
+                gaze_blink_labeled.to_csv(os.path.join(out_dir, f"{subject_id_temp}_{camera_temp}_gaze_blink_labeled.csv"), index= False)
+                self.logger.info(f"Saved blink labeled gaze data to {os.path.join(out_dir, f'{subject_id_temp}_{camera_temp}_gaze_blink_labeled.csv')}")
+                # Create a copy of the gaze DataFrame to store results
+                gaze_blink_removed = gaze_blink_labeled.loc[~gaze_blink_labeled['in_blink']].copy()
+                gaze_blink_removed.to_csv(os.path.join(out_dir, f"{subject_id_temp}_{camera_temp}_gaze_blink_removed.csv"), index= False)
+                self.logger.info(f"Saved blink removed gaze data to {os.path.join(out_dir, f'{subject_id_temp}_{camera_temp}_gaze_blink_removed.csv')}")
 
-        gaze_blink_removed['gazed_object_id'] = None
-        gaze_blink_removed['gazed_object'] = None
-        gaze_blink_removed['gazed_object_confidence'] = 0.0
-        for frame_idx, gdf in gaze_blink_removed.groupby('frame_idx', sort=False):
-            masks_one_frame = self.load_mask(int(frame_idx), mask_subject)  # ONE disk read per frame
-            if len(masks_one_frame) == 0:
-                frames_without_masks += 1
-                continue
-            frames_with_masks += 1
-            # now score each gaze in that group against those masks
-            for i in gdf.index:
-                row = gdf.loc[i]
-                subject_gaze_probabilities[i]= {}
-                x = row['gaze x [px]']
-                y = row['gaze y [px]']
-                best_name, best_conf = None, 0.0
-                for mask_name, mask in masks_one_frame.items():
-                    conf = self.gaze_to_object_radius(mask, x, y, r=20)
-                    subject_gaze_probabilities[i][mask_name]= conf
-                    if conf > best_conf:
-                        best_name, best_conf = mask_name, conf
-                if best_name:
-                    gaze_blink_removed.loc[i, 'gazed_object_id'] = best_name.split('.')[0].split('_')[-1]
-                    gaze_blink_removed.loc[i, 'gazed_object'] = '_'.join(best_name.split('.')[0].split('_')[2:-1])
-                    gaze_blink_removed.loc[i, 'gazed_object_confidence'] = best_conf
-                    assigned_gaze_points += 1
-                    assigned_confidences.append(best_conf)
-                    self.logger.debug(
-                        "Processed gaze index %s: gazed object=%s confidence=%.4f",
-                        i,
-                        best_name,
-                        best_conf,
-                    )
+            unique_post_blink_frames = int(gaze_blink_removed["frame_idx"].nunique())
+            mask_subject = self.resolve_mask_dir(subject_id_temp, camera_temp)
+            mask_summary = self.summarize_mask_frames(mask_subject)
+            post_blink_frame_ids = set(gaze_blink_removed["frame_idx"].astype(int).unique())
+            post_blink_missing_mask_frames = sorted(post_blink_frame_ids.difference(mask_summary["frame_ids"]))
 
-        assignment_rate = (assigned_gaze_points / total_gaze_points * 100.0) if total_gaze_points > 0 else 0.0
-        mean_conf = float(np.mean(assigned_confidences)) if assigned_confidences else 0.0
-        median_conf = float(np.median(assigned_confidences)) if assigned_confidences else 0.0
-        self.logger.info(
-            (
-                "Gaze-object assignment summary for subject=%s camera=%s: "
-                "total_gaze_points=%d assigned=%d assignment_rate=%.2f%% "
-                "frames_with_masks=%d/%d mean_conf=%.4f median_conf=%.4f"
-            ),
-            subject_id_temp,
-            camera_temp,
-            total_gaze_points,
-            assigned_gaze_points,
-            assignment_rate,
-            frames_with_masks,
-            total_frames,
-            mean_conf,
-            median_conf,
-        )
-        if frames_without_masks > 0:
             self.logger.info(
-                "No segmentation masks were found for %d frame(s) for subject=%s camera=%s.",
-                frames_without_masks,
+                "Number of frames in camera timestamp: %d from %s",
+                cut_world_frames,
+                world_cam_path,
+            )
+            if mask_summary["count"] == 0:
+                self.logger.info(
+                    "Mask frames present: 0, no parsed frame ids, from %s",
+                    mask_subject,
+                )
+            else:
+                coverage_label = "contiguous" if mask_summary["contiguous"] else "non-contiguous"
+                self.logger.info(
+                    "Number of frames in masks: %d, min frame: %d, max frame: %d, from %s",
+                    mask_summary["count"],
+                    mask_summary["min_frame"],
+                    mask_summary["max_frame"],
+                    mask_subject,
+                )
+            self.logger.info(
+                "Number of frames with gaze data before blink removal: %d",
+                unique_aligned_frames,
+            )
+            if self.blink_dir is None:
+                self.logger.info(
+                    "Number of frames with gaze data after blink removal: %d (blink removal not applied)",
+                    unique_post_blink_frames,
+                )
+            else:
+                self.logger.info(
+                    "Number of frames with gaze data after blink removal: %d",
+                    unique_post_blink_frames,
+                )
+            self.logger.info(
+                "Post-blink frames missing masks: %d",
+                len(post_blink_missing_mask_frames),
+            )
+            if post_blink_missing_mask_frames:
+                preview = ", ".join(str(frame_id) for frame_id in post_blink_missing_mask_frames[:20])
+                self.logger.warning(
+                    "Sample post-blink frame ids without masks for subject=%s camera=%s: %s",
+                    subject_id_temp,
+                    camera_temp,
+                    preview,
+                )
+
+            subject_gaze_probabilities = {}
+            self.logger.info(f"Loading masks from {mask_subject}")
+            total_gaze_points = len(gaze_blink_removed)
+            total_frames = unique_post_blink_frames
+            frames_with_masks = 0
+            frames_without_masks = 0
+            assigned_gaze_points = 0
+            assigned_confidences = []
+
+            gaze_blink_removed['gazed_object_id'] = None
+            gaze_blink_removed['gazed_object'] = None
+            gaze_blink_removed['gazed_object_confidence'] = 0.0
+            for frame_idx, gdf in gaze_blink_removed.groupby('frame_idx', sort=False):
+                masks_one_frame = self.load_mask(int(frame_idx), mask_subject)  # ONE disk read per frame
+                if len(masks_one_frame) == 0:
+                    frames_without_masks += 1
+                    continue
+                frames_with_masks += 1
+                # now score each gaze in that group against those masks
+                for i in gdf.index:
+                    row = gdf.loc[i]
+                    subject_gaze_probabilities[i]= {}
+                    x = row['gaze x [px]']
+                    y = row['gaze y [px]']
+                    best_name, best_conf = None, 0.0
+                    for mask_name, mask in masks_one_frame.items():
+                        conf = self.gaze_to_object_radius(mask, x, y, r=20)
+                        subject_gaze_probabilities[i][mask_name]= conf
+                        if conf > best_conf:
+                            best_name, best_conf = mask_name, conf
+                    if best_name:
+                        gaze_blink_removed.loc[i, 'gazed_object_id'] = best_name.split('.')[0].split('_')[-1]
+                        gaze_blink_removed.loc[i, 'gazed_object'] = '_'.join(best_name.split('.')[0].split('_')[2:-1])
+                        gaze_blink_removed.loc[i, 'gazed_object_confidence'] = best_conf
+                        assigned_gaze_points += 1
+                        assigned_confidences.append(best_conf)
+                        self.logger.debug(
+                            "Processed gaze index %s: gazed object=%s confidence=%.4f",
+                            i,
+                            best_name,
+                            best_conf,
+                        )
+
+            assignment_rate = (assigned_gaze_points / total_gaze_points * 100.0) if total_gaze_points > 0 else 0.0
+            mean_conf = float(np.mean(assigned_confidences)) if assigned_confidences else 0.0
+            median_conf = float(np.median(assigned_confidences)) if assigned_confidences else 0.0
+            self.logger.info(
+                (
+                    "Gaze-object assignment summary for subject=%s camera=%s: "
+                    "total_gaze_points=%d assigned=%d assignment_rate=%.2f%% "
+                    "frames_with_readable_masks=%d/%d post_blink_frames "
+                    "mean_conf=%.4f median_conf=%.4f"
+                ),
                 subject_id_temp,
                 camera_temp,
+                total_gaze_points,
+                assigned_gaze_points,
+                assignment_rate,
+                frames_with_masks,
+                total_frames,
+                mean_conf,
+                median_conf,
             )
-        output_path = os.path.join(out_dir, f"{subject_id_temp}_{camera_temp}_gazed_object.csv")
-        gaze_blink_removed.to_csv(output_path, index=False)
-        self.logger.info(f"Saved gaze object results to {output_path}")
-        with open(os.path.join(out_dir, f"{subject_id_temp}_{camera_temp}_gaze_object_probabilities.pkl"), 'wb') as f:
-            pickle.dump(subject_gaze_probabilities, f)
-        self.logger.info(f"Saved probabilities of each mask for each eye gaze to {os.path.join(out_dir, f'{subject_id_temp}_{camera_temp}_gaze_object_probabilities.pkl')}")
-        self.plot_method_figures(
-            subject_id_temp=subject_id_temp,
-            camera_temp=camera_temp,
-            gaze_df=gaze_blink_removed,
-            subject_gaze_probabilities=subject_gaze_probabilities,
-            out_dir=out_dir,
-        )
+            if frames_without_masks > 0:
+                self.logger.info(
+                    "No readable segmentation masks were found for %d post-blink frame(s) for subject=%s camera=%s.",
+                    frames_without_masks,
+                    subject_id_temp,
+                    camera_temp,
+                )
+            output_path = os.path.join(out_dir, f"{subject_id_temp}_{camera_temp}_gazed_object.csv")
+            gaze_blink_removed.to_csv(output_path, index=False)
+            self.logger.info(f"Saved gaze object results to {output_path}")
+            with open(os.path.join(out_dir, f"{subject_id_temp}_{camera_temp}_gaze_object_probabilities.pkl"), 'wb') as f:
+                pickle.dump(subject_gaze_probabilities, f)
+            self.logger.info(f"Saved probabilities of each mask for each eye gaze to {os.path.join(out_dir, f'{subject_id_temp}_{camera_temp}_gaze_object_probabilities.pkl')}")
+            self.plot_method_figures(
+                subject_id_temp=subject_id_temp,
+                camera_temp=camera_temp,
+                gaze_df=gaze_blink_removed,
+                subject_gaze_probabilities=subject_gaze_probabilities,
+                out_dir=out_dir,
+            )
+        except Exception:
+            run_status = "failed"
+            raise
+        finally:
+            subject_run_finished_at = datetime.now().astimezone()
+            self.logger.info(
+                "Subject-camera run %s at (local time): %s",
+                run_status,
+                format_log_datetime(subject_run_finished_at),
+            )
         
 
 def main():
     parser = argparse.ArgumentParser(
     description='Detect gazed objects based on gaze data and SAM2 masks.',
-    formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    formatter_class=RawDescriptionDefaultsHelpFormatter,
     epilog=(
-        'Example usage:\n'
-        '# Process a single subject and camera\n'
-        'python gazed_object.py 27 child '
-        'gaze_dir /path/to/gaze '
-        'mask_dir /path/to/masks '
-        'output_dir /path/to/output '
-        '--blink-dir /path/to/blinks(If remove gaze during blinks) '
-        '--log-path /path/to/logfile.log\n\n'
+        'Examples:\n'
+        '  # Process one subject and one camera\n'
+        '  python gazed_object_published_version.py \\\n'
+        '    /path/to/gaze_world_data \\\n'
+        '    /path/to/segmentation_masks \\\n'
+        '    /path/to/output_directory \\\n'
+        '    --subject-id 27 \\\n'
+        '    --camera-id child\n\n'
 
-        '# Process multiple subjects and cameras\n'
-        'python gazed_object.py 27,28 child,parent'
-        'gaze_dir /path/to/gaze '
-        'mask_dir /path/to/masks '
-        'output_dir /path/to/output '
-        '--blink-dir /path/to/blinks(If remove gaze during blinks) '
-        '--log-path /path/to/logfile.log\n\n'
-        'This code will make new folders with the names '
-        '[(subj_id)_gazed_object] in the specified output directory. '
-        'Output files will be saved in that folder.'
+        '  # Process multiple subjects/cameras and apply blink removal\n'
+        '  python gazed_object_published_version.py \\\n'
+        '    /path/to/gaze_world_data \\\n'
+        '    /path/to/segmentation_masks \\\n'
+        '    /path/to/output_directory \\\n'
+        '    --subject-id 27,28 \\\n'
+        '    --camera-id child,parent \\\n'
+        '    --blink-dir /path/to/blink_data \\\n'
+        '    --log-path /path/to/gaze_object.log\n\n'
+
+        '  # Auto-discover subjects and cameras from gaze/world CSV filenames\n'
+        '  python gazed_object_published_version.py \\\n'
+        '    /path/to/gaze_world_data \\\n'
+        '    /path/to/segmentation_masks \\\n'
+        '    /path/to/output_directory\n\n'
+
+        'Notes:\n'
+        '  - gaze_world_dir must contain both {subject}_{camera}_gaze.csv and\n'
+        '    {subject}_{camera}_world_timestamps.csv.\n'
+        '  - mask_dir must contain either {subject}/{camera}/masks/ or\n'
+        '    {subject}_{camera}/masks/.\n'
+        '  - If --blink-dir is provided, blink CSVs must be named\n'
+        '    {subject}_{camera}_blinks.csv and include start timestamp [ns],\n'
+        '    end timestamp [ns], and blink id.\n'
+        '  - Output folders are created as {output_dir}/{subject}_gazed_object/.\n'
+        '  - Method figures are always written under each subject output folder in\n'
+        '    the figures/ subdirectory.'
     ))
 
     # Required positional arguments (already required by argparse)
@@ -706,6 +893,8 @@ def main():
     setup_logging(log_path)
     logger = logging.getLogger(__name__)
     logger.info(f"Logging to: {log_path.resolve()}")
+    pipeline_run_started_at = datetime.now().astimezone()
+    logger.info("Pipeline run started at (local time): %s", format_log_datetime(pipeline_run_started_at))
 
     if args.subject_id:
         subj_ids = [int(id.strip()) for id in args.subject_id.split(',')]
@@ -773,6 +962,7 @@ def main():
             gaze_aligner.process_subject(str(subj), cam)
             logger.info(f"------- Finished processing subject {subj}, camera {cam} -------")
     logger.info("Gaze object detection complete!")
+    logger.info("Pipeline run finished at (local time): %s", format_log_datetime(datetime.now().astimezone()))
 
 if __name__ == "__main__":
     main()

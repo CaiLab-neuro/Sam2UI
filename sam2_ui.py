@@ -5420,6 +5420,30 @@ class SAM2VideoUI:
                                   f"Add annotation points in this range before refining.")
             return
 
+        # Determine which objects in the range need re-segmentation.
+        # When updated_objects is tracked, only re-segment objects whose annotations
+        # have changed; unchanged objects keep their existing masks from self.masks.
+        obj_ids_in_range = {a.object_id for a in annotations_in_range}
+        unchanged_obj_ids_in_range: set = set()
+        if self.updated_objects:
+            updated_in_range = obj_ids_in_range & self.updated_objects
+            unchanged_in_range = obj_ids_in_range - self.updated_objects
+            if not updated_in_range:
+                messagebox.showwarning(
+                    "No Updated Annotations",
+                    f"No updated annotation points found in frames "
+                    f"{start_frame + 1}–{end_frame + 1}.\n\n"
+                    f"All objects in this range are unchanged since the last segmentation. "
+                    f"No re-segmentation needed."
+                )
+                return
+            # Filter to only re-segment the updated objects
+            annotations_in_range = [a for a in annotations_in_range
+                                     if a.object_id in updated_in_range]
+            unchanged_obj_ids_in_range = unchanged_in_range
+            print(f"Partial refinement: re-segmenting {sorted(updated_in_range)}, "
+                  f"keeping existing masks for {sorted(unchanged_in_range)}")
+
         # Get output directory (use existing results dir if available)
         if self.results_output_dir and os.path.exists(self.results_output_dir):
             output_dir = self.results_output_dir
@@ -5440,14 +5464,30 @@ class SAM2VideoUI:
         num_frames = end_frame - start_frame + 1
         num_annotations = len(annotations_in_range)
 
-        # Confirmation dialog
+        # Build confirmation message (include partial-object info when applicable)
+        partial_obj_info = ""
+        if unchanged_obj_ids_in_range:
+            reseg_names = ", ".join(
+                self.object_names.get(oid, f"Object_{oid}")
+                for oid in sorted(obj_ids_in_range - unchanged_obj_ids_in_range)
+            )
+            keep_names = ", ".join(
+                self.object_names.get(oid, f"Object_{oid}")
+                for oid in sorted(unchanged_obj_ids_in_range)
+            )
+            partial_obj_info = (
+                f"Re-segment: {reseg_names}\n"
+                f"Keep existing masks: {keep_names}\n"
+            )
+
         confirm_msg = (
             f"Refine Segmentation\n\n"
             f"Frame range: {start_frame + 1} to {end_frame + 1} ({num_frames} frames)\n"
             f"Annotations in range: {num_annotations}\n"
-            f"Output directory: {output_dir}\n"
+            + (partial_obj_info)
+            + f"Output directory: {output_dir}\n"
             f"Regenerate video: {'Yes (automatic)' if regenerate_video else 'No (full range)'}\n\n"
-            f"This will overwrite existing masks in this range.\n"
+            f"This will overwrite existing masks for re-segmented objects in this range.\n"
             f"Continue?"
         )
 
@@ -5567,7 +5607,15 @@ class SAM2VideoUI:
                     for obj_id, mask_meta in obj_masks.items():
                         self.masks[frame_idx][obj_id] = mask_meta
 
+                # Mark re-segmented objects as no longer updated and refresh object list
+                refined_obj_ids = {a.object_id for a in annotations}
+                self.updated_objects -= refined_obj_ids
+                self.update_object_list()
+
                 # Update quality metrics for the range (plus boundary frames)
+                # _update_quality_metrics_for_range reads ALL mask files on disk for the
+                # range (both newly written and pre-existing unchanged objects), so
+                # quality metrics correctly reflect the full scene.
                 self._update_quality_metrics_for_range(start_frame, end_frame, masks_dir)
 
                 # Regenerate video if requested
@@ -5604,6 +5652,9 @@ class SAM2VideoUI:
 
                         # Initialize original frame source for segment_current_frame_only
                         self._initialize_original_frame_source()
+
+                        # Re-enable Flash Mask button (load_video_frames disables it)
+                        self._enable_flash_mask_button()
 
                         # Restore frame position
                         if 0 <= saved_frame_idx < len(self.frames):
@@ -5832,15 +5883,18 @@ class SAM2VideoUI:
         try:
             segments = []
 
-            # 1. Extract pre-segment (frames 0 to start_frame-1) using frame-exact selection
+            # 1. Extract pre-segment (frames 0 to start_frame-1).
+            # -frames:v stops decoding after start_frame frames, avoiding the full-video
+            # decode that select='lt(n,X)' would require.
+            # setpts=PTS-STARTPTS resets PTS to 0 so the concat demuxer adds offsets
+            # correctly (avoids duplicate-frame inflation from PTS mismatch).
             if start_frame > 0:
                 pre_segment = os.path.join(temp_dir, "pre_segment.avi")
-                # Use select filter for frame-exact cutting
-                # select='lt(n,START_FRAME)' selects frames where frame number < start_frame
                 cmd_pre = [
                     'ffmpeg', '-y', '-i', existing_video_path,
-                    '-vf', f"select='lt(n\\,{start_frame})'",
-                    '-vsync', '0',  # Prevent frame duplication/dropping
+                    '-vf', 'setpts=PTS-STARTPTS',
+                    '-frames:v', str(start_frame),
+                    '-vsync', '0',
                     '-c:v', 'mjpeg', '-q:v', '5',
                     pre_segment
                 ]
@@ -5861,15 +5915,23 @@ class SAM2VideoUI:
                 return False
             segments.append(middle_segment)
 
-            # 3. Extract post-segment (frames end_frame+1 to end) using frame-exact selection
+            # 3. Extract post-segment (frames end_frame+1 to end).
+            # Fast input seeking (-ss before -i) jumps directly to ~1 s before the
+            # target frame rather than decoding from the start (the old select approach
+            # had to decode all end_frame+1 frames just to skip them).
+            # For x264: -ss always lands on an I-frame so all decoded frames are valid.
+            # Timestamp-based select='gte(t,T)' trims to exact target; setpts resets PTS.
             if end_frame < total_frames - 1:
                 post_segment = os.path.join(temp_dir, "post_segment.avi")
-                # Use select filter for frame-exact cutting
-                # select='gt(n,END_FRAME)' selects frames where frame number > end_frame
+                target_pts = (end_frame + 1) / fps      # exact target time (s)
+                seek_time  = max(0.0, target_pts - 1.0) # seek ~1 s before (stays before keyframe)
+                epsilon    = 0.5 / fps                   # half-frame tolerance for float precision
                 cmd_post = [
-                    'ffmpeg', '-y', '-i', existing_video_path,
-                    '-vf', f"select='gt(n\\,{end_frame})'",
-                    '-vsync', '0',  # Prevent frame duplication/dropping
+                    'ffmpeg', '-y',
+                    '-ss', f'{seek_time:.6f}',           # fast input seek
+                    '-i', existing_video_path,
+                    '-vf', f"select='gte(t\\,{target_pts - epsilon:.6f})',setpts=PTS-STARTPTS",
+                    '-vsync', '0',
                     '-c:v', 'mjpeg', '-q:v', '5',
                     post_segment
                 ]
@@ -5891,13 +5953,15 @@ class SAM2VideoUI:
             for i, seg in enumerate(segments):
                 print(f"  Segment {i+1}: {os.path.basename(seg)}")
 
-            # 5. Concatenate segments
+            # 5. Concatenate segments.
+            # All three segments are MJPEG AVI so -c:v copy skips re-encoding entirely,
+            # making concatenation nearly instantaneous regardless of video length.
             output_video = os.path.join(output_dir, "segmented_video.avi")
             temp_output = os.path.join(temp_dir, "concat_output.avi")
             cmd_concat = [
                 'ffmpeg', '-y', '-f', 'concat', '-safe', '0',
                 '-i', concat_list,
-                '-c:v', 'mjpeg', '-q:v', '5',
+                '-c:v', 'copy',
                 temp_output
             ]
             result = subprocess.run(cmd_concat, capture_output=True, text=True)
@@ -5947,6 +6011,7 @@ class SAM2VideoUI:
         """
         from pathlib import Path
         import numpy as np
+        from utils import parse_mask_filename
 
         try:
             # Open original video
@@ -5986,12 +6051,11 @@ class SAM2VideoUI:
                 mask_files = list(masks_path.glob(frame_pattern))
 
                 for mask_file in mask_files:
-                    # Extract object ID from filename
-                    parts = mask_file.stem.split('_')
-                    try:
-                        obj_id = int(parts[-1].replace('obj', ''))
-                    except (ValueError, IndexError):
+                    # Extract object ID from filename using utils parser
+                    parsed = parse_mask_filename(mask_file.name)
+                    if parsed is None:
                         continue
+                    _, _, obj_id = parsed
 
                     mask = cv2.imread(str(mask_file), cv2.IMREAD_GRAYSCALE)
                     if mask is None:
