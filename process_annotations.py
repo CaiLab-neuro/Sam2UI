@@ -19,8 +19,6 @@ Examples:
     # Use custom config and checkpoint
     python process_annotations.py annotations.json video.mp4 --config configs/sam2/sam2_hiera_l.yaml --checkpoint checkpoints/sam2_hiera_large.pt
     
-    # Process with chunking for large videos (reduces memory usage)
-    python process_annotations.py annotations.json video.mp4 --chunk-size 100
 """
 
 import os
@@ -39,7 +37,7 @@ from PIL import Image
 import psutil
 
 # Import lazy loader BEFORE importing SAM2
-from lazy_loader import enable_lazy_loading
+from sam_lazy_loader import enable_lazy_loading
 
 # Import quality metrics utilities and CUDA helpers
 from utils import (
