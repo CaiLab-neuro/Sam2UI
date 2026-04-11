@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-SAM2 Lazy Frame Loader
-======================
+Lazy Frame Loader
+=================
 
-Implements lazy loading for SAM2 video frames to reduce memory usage.
+Implements lazy loading for SAM2/SAM3 video frames to reduce memory usage.
 Instead of loading all frames into RAM at once (~178GB for 36K frames),
 loads frames on-demand with LRU caching (~2-5GB for 20-frame cache).
 
 Usage:
-    from sam2_lazy_loader import enable_lazy_loading
+    from sam_lazy_loader import enable_lazy_loading
 
     # Before creating SAM2VideoPredictor
     enable_lazy_loading(cache_size=20)
