@@ -16,6 +16,7 @@ import csv
 import time
 import threading
 import re
+import argparse
 from collections import deque
 
 # Import utility functions
@@ -175,8 +176,9 @@ class TkProgressCallback:
 
 
 class SAM2VideoUI:
-    def __init__(self, root):
+    def __init__(self, root, working_dir=None):
         self.root = root
+        self.working_dir = working_dir if working_dir else os.getcwd()
         self.root.title("SAM Video Segmentation Tool")
         self.root.geometry("1600x1000")
         self.root.configure(bg='#2b2b2b')
@@ -235,6 +237,11 @@ class SAM2VideoUI:
         self.flash_points_in_progress = False
         self.flash_points_on = False
 
+        # Overlap flash animation state
+        self.flash_overlap_in_progress = False
+        self.flash_overlap_on = False
+        self.flash_overlap_computed = None  # Cached per-pixel overlap bool mask (H,W) for current flash
+
         # Background task tracking
         self.active_exports = []
         self.active_segmentation = []
@@ -254,6 +261,9 @@ class SAM2VideoUI:
         self.model_type_var = tk.StringVar(value="SAM2")  # Default to SAM2
         self.using_sam3 = False
         
+        # Segmentation options
+        self.exclusive_masks_var = tk.BooleanVar(value=False)  # Winner-takes-all per pixel
+
         # Lazy loading option for large videos
         self.lazy_load_var = tk.BooleanVar(value=True)  # Load frames on demand
         self.video_cap_lazy = None  # Keep video capture open for lazy loading
@@ -265,6 +275,13 @@ class SAM2VideoUI:
 
         # Export folder memory (persists across sessions)
         self.last_export_dir = self._load_last_export_dir()
+
+        # Per-dialog-type last-used directories (first use falls back to working_dir)
+        self.last_dir_video = None
+        self.last_dir_annotations = None
+        self.last_dir_object_list = None
+        self.last_dir_results = None
+        self.last_dir_video_export = None
 
         # Slider zoom functionality for precise navigation
         self.slider_zoom_level = tk.IntVar(value=1)  # 1 = full range, 10/100/1000 = zoomed
@@ -566,7 +583,7 @@ class SAM2VideoUI:
 
         # Flash buttons row (mask and points side by side, both share 'f' shortcut)
         flash_row = ttk.Frame(obj_frame)
-        flash_row.pack(fill=tk.X, pady=2)
+        flash_row.pack(fill=tk.X, pady=(2, 1))
 
         self.flash_mask_button = ttk.Button(flash_row, text="Flash Mask",
                                            command=self.flash_selected_object_mask,
@@ -577,6 +594,15 @@ class SAM2VideoUI:
                                              command=self.flash_frame_points,
                                              underline=0, state='disabled')
         self.flash_points_button.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        # Flash Overlap button on its own row - highlights pixels claimed by 2+ objects (shortcut: 'o')
+        flash_overlap_row = ttk.Frame(obj_frame)
+        flash_overlap_row.pack(fill=tk.X, pady=(1, 2))
+
+        self.flash_overlap_button = ttk.Button(flash_overlap_row, text="Flash Overlap",
+                                              command=self.flash_overlap_regions,
+                                              state='disabled')
+        self.flash_overlap_button.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         # Model Configuration (Model selection + GPU selection merged)
         model_frame = ttk.LabelFrame(scrollable_frame, text="Model Configuration", padding=10)
@@ -655,6 +681,14 @@ class SAM2VideoUI:
 
         ttk.Button(seg_frame, text="Segment Video",
                   command=self.segment_video, width=15).pack(fill=tk.X, pady=2)
+
+        # Exclusive masks option
+        ttk.Checkbutton(seg_frame, text="Exclusive masks (winner-takes-all)",
+                        variable=self.exclusive_masks_var).pack(anchor=tk.W, pady=(3, 0))
+        ttk.Label(seg_frame,
+                  text="Each pixel assigned to at most one object (highest logit wins).",
+                  foreground='gray', font=('Arial', 8, 'italic'),
+                  wraplength=200).pack(anchor=tk.W)
 
         # Mask opacity slider
         opacity_frame = ttk.Frame(seg_frame)
@@ -762,6 +796,7 @@ class SAM2VideoUI:
 
         # Keyboard shortcuts - cross-platform support
         self.root.bind('f', lambda e: self._handle_flash_shortcut())
+        self.root.bind('o', lambda e: self._handle_overlap_shortcut())
 
         # Undo: Ctrl+Z (Windows/Linux) or Cmd+Z (Mac)
         self.root.bind('<Control-z>', self.undo_last_point)
@@ -1085,12 +1120,15 @@ class SAM2VideoUI:
         """Import object names from CSV file"""
         file_path = filedialog.askopenfilename(
             title="Import Object List",
-            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")]
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+            initialdir=self.last_dir_object_list or self.working_dir
         )
-        
+
         if not file_path:
             return
-            
+
+        self.last_dir_object_list = os.path.dirname(file_path)
+
         try:
             with open(file_path, 'r', newline='', encoding='utf-8') as csvfile:
                 reader = csv.DictReader(csvfile)
@@ -1125,11 +1163,14 @@ class SAM2VideoUI:
         file_path = filedialog.asksaveasfilename(
             title="Export Object List",
             defaultextension=".csv",
-            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")]
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+            initialdir=self.last_dir_object_list or self.working_dir
         )
-        
+
         if not file_path:
             return
+
+        self.last_dir_object_list = os.path.dirname(file_path)
             
         try:
             with open(file_path, 'w', newline='', encoding='utf-8') as csvfile:
@@ -1168,7 +1209,8 @@ class SAM2VideoUI:
                     ("JSON files", "*.json"),
                     ("All files", "*.*")
                 ],
-                default_ext=".json"
+                default_ext=".json",
+                last_dir_attr='last_dir_annotations'
             )
             
             if not file_path:
@@ -1237,12 +1279,15 @@ class SAM2VideoUI:
                 filetypes=[
                     ("JSON files", "*.json"),
                     ("All files", "*.*")
-                ]
+                ],
+                initialdir=self.last_dir_annotations or self.working_dir
             )
-            
+
             if not file_path:
                 return
-            
+
+            self.last_dir_annotations = os.path.dirname(file_path)
+
             # Load annotation data
             with open(file_path, 'r') as f:
                 annotation_data = json.load(f)
@@ -1394,9 +1439,14 @@ class SAM2VideoUI:
         """Load segmentation results: segmented video, annotations, and mask directory"""
         try:
             # Select output directory
-            output_dir = filedialog.askdirectory(title="Select Result Directory to Load")
+            output_dir = filedialog.askdirectory(
+                title="Select Result Directory to Load",
+                initialdir=self.last_dir_results or self.working_dir
+            )
             if not output_dir:
                 return
+
+            self.last_dir_results = os.path.dirname(output_dir)
 
             # Load metadata first
             metadata_path = os.path.join(output_dir, "processing_metadata.json")
@@ -1423,10 +1473,12 @@ class SAM2VideoUI:
                                      f"Please locate the segmented video file.")
                 segmented_video_path = filedialog.askopenfilename(
                     title="Select Segmented Video",
-                    filetypes=[("Video files", "*.mp4 *.avi *.mov *.mkv"), ("All files", "*.*")]
+                    filetypes=[("Video files", "*.mp4 *.avi *.mov *.mkv"), ("All files", "*.*")],
+                    initialdir=self.last_dir_results or self.working_dir
                 )
                 if not segmented_video_path:
                     return
+                self.last_dir_results = os.path.dirname(segmented_video_path)
 
             # Clean up any existing lazy loading state (like load_video does)
             if hasattr(self, 'video_cap_lazy') and self.video_cap_lazy:
@@ -1594,9 +1646,12 @@ class SAM2VideoUI:
 
         original_video_path = filedialog.askopenfilename(
             title="Select Original Video for Re-segmentation",
-            filetypes=[("Video files", "*.mp4 *.avi *.mov *.mkv"), ("All files", "*.*")]
+            filetypes=[("Video files", "*.mp4 *.avi *.mov *.mkv"), ("All files", "*.*")],
+            initialdir=self.last_dir_video or self.working_dir
         )
 
+        if original_video_path:
+            self.last_dir_video = os.path.dirname(original_video_path)
         return original_video_path if original_video_path else None
 
     def _initialize_original_frame_source(self):
@@ -1631,12 +1686,17 @@ class SAM2VideoUI:
         self.flash_white_on = False
         self.flash_points_in_progress = False
         self.flash_points_on = False
+        self.flash_overlap_in_progress = False
+        self.flash_overlap_on = False
+        self.flash_overlap_computed = None
 
     def _enable_flash_mask_button(self):
         """Enable Flash Mask button when segmentation is available"""
         self.has_segmentation = True
         if hasattr(self, 'flash_mask_button'):
             self.flash_mask_button.config(state='normal')
+        if hasattr(self, 'flash_overlap_button'):
+            self.flash_overlap_button.config(state='normal')
 
     def _should_ignore_keyboard_shortcut(self):
         """Check if keyboard shortcuts should be ignored (e.g., when typing in Entry widgets)"""
@@ -1855,6 +1915,99 @@ class SAM2VideoUI:
             self.display_current_frame()
 
             if not self.flash_points_on:
+                flash_count[0] += 1
+
+            self.root.after(300, flash_step)
+
+        flash_step()
+
+    def _handle_overlap_shortcut(self):
+        """Handle 'o' key shortcut: flash overlap regions if segmentation is available"""
+        if self._should_ignore_keyboard_shortcut():
+            return
+        if hasattr(self, 'flash_overlap_button') and str(self.flash_overlap_button.cget('state')) == 'normal':
+            self.flash_overlap_regions()
+
+    def _compute_overlap_mask_for_frame(self, frame_idx):
+        """
+        Compute a per-pixel boolean mask of regions claimed by 2 or more objects on frame_idx.
+
+        Loads masks from disk (via _load_mask) or memory, so it works regardless of whether
+        the displayed video is prerendered or original.  Only looks at the permanent self.masks
+        dict (temp_masks are single-object previews and don't represent multi-object conflicts).
+
+        Returns:
+            np.ndarray (H, W) bool, or None if fewer than 2 objects have masks on this frame.
+        """
+        if frame_idx not in self.masks:
+            return None
+
+        obj_ids = list(self.masks[frame_idx].keys())
+        if len(obj_ids) < 2:
+            return None
+
+        loaded = []
+        for obj_id in obj_ids:
+            mask = self._load_mask(frame_idx, obj_id)
+            if mask is not None:
+                loaded.append(mask)
+
+        if len(loaded) < 2:
+            return None
+
+        # Sum across all masks; pixels with count >= 2 are the overlap regions
+        # Use the shape of the first mask; _load_mask returns consistent shapes
+        h, w = loaded[0].shape[:2]
+        count = np.zeros((h, w), dtype=np.int32)
+        for mask in loaded:
+            if mask.shape[:2] != (h, w):
+                from PIL import Image as PILImage
+                mask_pil = PILImage.fromarray(mask.astype(np.uint8))
+                mask_pil = mask_pil.resize((w, h), PILImage.NEAREST)
+                mask = np.array(mask_pil)
+            count[mask > 0] += 1
+
+        overlap_mask = count >= 2
+        if not np.any(overlap_mask):
+            return None  # No actual overlap pixels
+        return overlap_mask
+
+    def flash_overlap_regions(self):
+        """Flash pixels that are claimed by 2+ objects on the current frame with a red overlay."""
+        if not hasattr(self, 'mask_export_dir') or self.mask_export_dir is None:
+            messagebox.showinfo("Flash Overlap Not Available",
+                "No mask data available.\n\n"
+                "Run or load a segmentation first.")
+            return
+
+        overlap_mask = self._compute_overlap_mask_for_frame(self.current_frame_idx)
+        if overlap_mask is None:
+            messagebox.showinfo("No Overlap",
+                "No pixels are claimed by multiple objects on this frame.\n\n"
+                "Either fewer than 2 objects are segmented here, or there is no overlap.")
+            return
+
+        # Cache the computed mask for the duration of the animation
+        self.flash_overlap_computed = overlap_mask
+
+        self.flash_overlap_in_progress = True
+        self.flash_overlap_on = False  # First toggle → ON so overlay appears first
+
+        flash_count = [0]
+        max_flashes = 3
+
+        def flash_step():
+            if flash_count[0] >= max_flashes:
+                self.flash_overlap_in_progress = False
+                self.flash_overlap_on = False
+                self.flash_overlap_computed = None
+                self.display_current_frame()
+                return
+
+            self.flash_overlap_on = not self.flash_overlap_on
+            self.display_current_frame()
+
+            if not self.flash_overlap_on:
                 flash_count[0] += 1
 
             self.root.after(300, flash_step)
@@ -2322,12 +2475,15 @@ class SAM2VideoUI:
                 ("MP4 files", "*.mp4"),
                 ("AVI files", "*.avi"),
                 ("All files", "*.*")
-            ]
+            ],
+            initialdir=self.last_dir_video or self.working_dir
         )
-        
+
         if not file_path:
             return
-            
+
+        self.last_dir_video = os.path.dirname(file_path)
+
         try:
             self.video_path = file_path
             # Store video path for display on canvas
@@ -3304,6 +3460,21 @@ class SAM2VideoUI:
 
                     display_frame = cv2.addWeighted(display_frame, 1-alpha, combined_overlay, alpha, 0)
         
+        # Overlap flash overlay - applied after all normal mask rendering so it shows on top
+        if self.flash_overlap_in_progress and self.flash_overlap_on and self.flash_overlap_computed is not None:
+            overlap_mask = self.flash_overlap_computed
+            # Resize overlap mask if it doesn't match the current display frame dimensions
+            fh, fw = display_frame.shape[:2]
+            if overlap_mask.shape != (fh, fw):
+                from PIL import Image as PILImage
+                mask_pil = PILImage.fromarray(overlap_mask.astype(np.uint8) * 255)
+                mask_pil = mask_pil.resize((fw, fh), PILImage.NEAREST)
+                overlap_mask = np.array(mask_pil) > 0
+            # Bright red-orange overlay to make conflict regions stand out
+            red_overlay = np.zeros_like(display_frame)
+            red_overlay[overlap_mask] = [255, 60, 0]  # BGR: orange-red
+            display_frame = cv2.addWeighted(display_frame, 0.4, red_overlay, 0.6, 0)
+
         # Draw click points only for the current frame
         flash_pts = self.flash_points_in_progress and self.flash_points_on
         for i, (x, y, is_positive, obj_id, frame_idx) in enumerate(self.click_points):
@@ -4843,7 +5014,7 @@ class SAM2VideoUI:
         self._clear_temporary_masks()
 
         # Ask for output directory for results
-        initial_dir = os.path.dirname(self.last_export_dir) if self.last_export_dir else os.path.expanduser("~")
+        initial_dir = os.path.dirname(self.last_export_dir) if self.last_export_dir else self.working_dir
         output_base_dir = filedialog.askdirectory(
             title="Select Output Directory for Segmentation Results (Cancel to abort)",
             initialdir=initial_dir
@@ -4972,7 +5143,8 @@ class SAM2VideoUI:
                     offload_video_to_cpu=True,
                     offload_state_to_cpu=True,
                     calculate_quality_metrics=True,
-                    cleanup_temp_frames=False  # Don't cleanup session cache
+                    cleanup_temp_frames=False,  # Don't cleanup session cache
+                    exclusive_masks=self.exclusive_masks_var.get()
                 )
 
                 # Create progress callback
@@ -5450,7 +5622,7 @@ class SAM2VideoUI:
         else:
             output_dir = filedialog.askdirectory(
                 title="Select Output Directory for Refined Results",
-                initialdir=os.path.dirname(self.last_export_dir) if self.last_export_dir else os.path.expanduser("~")
+                initialdir=os.path.dirname(self.last_export_dir) if self.last_export_dir else self.working_dir
             )
             if not output_dir:
                 return
@@ -5581,7 +5753,8 @@ class SAM2VideoUI:
                     enable_backward_propagation=True,
                     frames_to_keep=20,
                     calculate_quality_metrics=False,  # We'll update metrics separately
-                    cleanup_temp_frames=True
+                    cleanup_temp_frames=True,
+                    exclusive_masks=self.exclusive_masks_var.get()
                 )
 
                 self.status_label.config(text="Running range segmentation...")
@@ -6406,7 +6579,8 @@ class SAM2VideoUI:
                 (f"{export_format.upper()} files", f"*.{export_format}"),
                 ("All files", "*.*")
             ],
-            default_ext=f".{export_format}"
+            default_ext=f".{export_format}",
+            last_dir_attr='last_dir_video_export'
         )
         
         if not file_path:
@@ -6508,21 +6682,29 @@ class SAM2VideoUI:
             self.progress_bar.pack_forget()
             raise e
         
-    def _get_export_file_path_with_creation(self, title, default_name, file_types, default_ext):
-        """Get file path for export with directory creation support"""
+    def _get_export_file_path_with_creation(self, title, default_name, file_types, default_ext,
+                                            last_dir_attr='last_dir_video_export'):
+        """Get file path for export with directory creation support.
+
+        last_dir_attr: name of the instance attribute used to remember the last directory
+        for this dialog type (e.g. 'last_dir_annotations', 'last_dir_video_export').
+        """
+        initial = getattr(self, last_dir_attr, None) or self.working_dir
         file_path = filedialog.asksaveasfilename(
             title=title,
             defaultextension=default_ext,
             filetypes=file_types,
-            initialfile=default_name
+            initialfile=default_name,
+            initialdir=initial
         )
-        
+
         if file_path:
+            setattr(self, last_dir_attr, os.path.dirname(file_path))
             # Create parent directory if it doesn't exist
             parent_dir = os.path.dirname(file_path)
             if parent_dir and not os.path.exists(parent_dir):
                 os.makedirs(parent_dir, exist_ok=True)
-        
+
         return file_path
 
     def _rgb_to_hex(self, rgb):
@@ -7099,6 +7281,21 @@ class SAM2VideoUI:
 
 def main():
     """Main application entry point"""
+    parser = argparse.ArgumentParser(description="SAM2 Video Annotation Tool")
+    parser.add_argument(
+        "--working-dir", "-w",
+        default=None,
+        help="Starting directory for all file/folder dialogs (load video, import/export annotations, etc.)"
+    )
+    args = parser.parse_args()
+
+    working_dir = None
+    if args.working_dir:
+        working_dir = os.path.abspath(args.working_dir)
+        if not os.path.isdir(working_dir):
+            print(f"Warning: --working-dir '{working_dir}' does not exist, using current directory")
+            working_dir = None
+
     root = tk.Tk()
     root.update_idletasks()
     width = root.winfo_width()
@@ -7106,8 +7303,8 @@ def main():
     x = (root.winfo_screenwidth() // 2) - (width // 2)
     y = (root.winfo_screenheight() // 2) - (height // 2)
     root.geometry(f'{width}x{height}+{x}+{y}')
-    
-    app = SAM2VideoUI(root)
+
+    app = SAM2VideoUI(root, working_dir=working_dir)
     
     def on_closing():
         # Check for active exports and segmentation
