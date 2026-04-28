@@ -131,6 +131,7 @@ class SegmentationConfig:
     calculate_quality_metrics: bool = True
     cleanup_temp_frames: bool = True
     frame_format: str = "jpg"  # "jpg" (default, smaller) or "png" (lossless)
+    exclusive_masks: bool = False  # Winner-takes-all per pixel: highest-logit object wins (incompatible with --only-updated)
 
     @property
     def masks_output_dir(self) -> str:
@@ -617,7 +618,8 @@ class VideoSegmenter:
         quality_calculator: Optional[IncrementalQualityMetricsCalculator],
         frames_to_keep: int,
         enable_backward: bool,
-        frame_offset: int = 0
+        frame_offset: int = 0,
+        exclusive_masks: bool = False
     ) -> Dict[int, Dict[int, Any]]:
         """
         Propagate masks through the video in forward and backward directions.
@@ -652,7 +654,8 @@ class VideoSegmenter:
             frames_to_keep=frames_to_keep,
             reverse=False,
             masks_metadata=masks_metadata,
-            frame_offset=frame_offset
+            frame_offset=frame_offset,
+            exclusive_masks=exclusive_masks
         )
 
         # Backward propagation (optional)
@@ -668,7 +671,8 @@ class VideoSegmenter:
                 frames_to_keep=frames_to_keep,
                 reverse=True,
                 masks_metadata=masks_metadata,
-                frame_offset=frame_offset
+                frame_offset=frame_offset,
+                exclusive_masks=exclusive_masks
             )
 
         return masks_metadata
@@ -685,7 +689,8 @@ class VideoSegmenter:
         frames_to_keep: int,
         reverse: bool,
         masks_metadata: Dict[int, Dict[int, Any]],
-        frame_offset: int = 0
+        frame_offset: int = 0,
+        exclusive_masks: bool = False
     ) -> Dict[int, Dict[int, Any]]:
         """
         Propagate masks in a single direction (forward or backward).
@@ -763,13 +768,29 @@ class VideoSegmenter:
                 frame_masks: Dict[int, Any] = {}
                 frame_masks_for_quality: Dict[int, np.ndarray] = {}
 
+                # Exclusive masks: winner-takes-all per pixel.
+                # Stack logits [N,1,H,W] → [N,H,W], prepend background (logit=0),
+                # then argmax gives the winning object index (0 = background).
+                if exclusive_masks and len(out_obj_ids) > 0:
+                    logits_2d = out_mask_logits.squeeze(1)  # [N, H, W]
+                    bg = torch.zeros(1, logits_2d.shape[1], logits_2d.shape[2],
+                                     device=logits_2d.device, dtype=logits_2d.dtype)
+                    all_logits = torch.cat([bg, logits_2d], dim=0)  # [N+1, H, W]
+                    winners = torch.argmax(all_logits, dim=0)  # [H, W]
+                    del logits_2d, all_logits
+                else:
+                    winners = None
+
                 for i, obj_id in enumerate(out_obj_ids):
                     # Only process annotated objects
                     if obj_id not in annotated_objects:
                         continue
 
                     # Convert mask to numpy
-                    mask = (out_mask_logits[i] > 0.0).cpu().numpy().squeeze()
+                    if winners is not None:
+                        mask = (winners == i + 1).cpu().numpy()
+                    else:
+                        mask = (out_mask_logits[i] > 0.0).cpu().numpy().squeeze()
 
                     # Get object info
                     obj_name = object_names.get(obj_id, object_names.get(str(obj_id), f"Object_{obj_id}"))
@@ -810,6 +831,8 @@ class VideoSegmenter:
                 del frame_masks_for_quality
 
                 # Delete tensors to free memory
+                if winners is not None:
+                    del winners
                 del out_mask_logits
                 if self.is_sam3:
                     del out_low_res_masks
@@ -971,7 +994,8 @@ class VideoSegmenter:
                 quality_calculator=quality_calculator,
                 frames_to_keep=config.frames_to_keep,
                 enable_backward=config.enable_backward_propagation,
-                frame_offset=config.frame_offset
+                frame_offset=config.frame_offset,
+                exclusive_masks=config.exclusive_masks
             )
 
             # Get quality metrics

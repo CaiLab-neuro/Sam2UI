@@ -242,7 +242,7 @@ class ConsoleProgressCallback:
 
 
 class SAM2Processor:
-    def __init__(self, config_file=None, checkpoint_file=None, model_name="sam2.1-base+", offload_to_cpu=False, async_loading=False, smooth_masks=False, use_bfloat16=False, device=None, frame_format="jpg"):
+    def __init__(self, config_file=None, checkpoint_file=None, model_name="sam2.1-base+", offload_to_cpu=False, async_loading=False, smooth_masks=False, use_bfloat16=False, device=None, frame_format="jpg", exclusive_masks=False):
         """
         Initialize SAM2 Processor
 
@@ -306,6 +306,7 @@ class SAM2Processor:
         self.smooth_masks = smooth_masks
         self.use_bfloat16 = use_bfloat16
         self.no_backward_propagation = False  # Will be set from command line args
+        self.exclusive_masks = exclusive_masks  # Winner-takes-all per pixel
         self.requested_device = device  # User-requested device (None = auto-detect)
         self.device = None  # Will be set after loading model
         self.frame_format = frame_format  # Format for extracted frames
@@ -580,7 +581,7 @@ class SAM2Processor:
     #     """Process segmentation using SAM2"""
     #     return self.process_segmentation_full(video_path, annotations_data, output_dir, frame_dir=frame_dir)
 
-    def process_segmentation(self, video_path, annotations_data, output_dir, frame_dir=None):
+    def process_segmentation(self, video_path, annotations_data, output_dir, frame_dir=None, skip_quality_save=False):
         """Process segmentation with streaming mask export to reduce memory usage"""
         print("Starting segmentation process (streaming export mode)...")
 
@@ -813,8 +814,24 @@ class SAM2Processor:
                     frame_masks = {}
                     frame_masks_for_quality = {}  # For quality metrics calculation
 
+                    # Exclusive masks: winner-takes-all per pixel.
+                    # Stack logits [N,1,H,W] → [N,H,W], prepend background (logit=0),
+                    # argmax gives winning object index (0 = background).
+                    if self.exclusive_masks and len(out_obj_ids) > 0:
+                        _logits_2d = out_mask_logits.squeeze(1)  # [N, H, W]
+                        _bg = torch.zeros(1, _logits_2d.shape[1], _logits_2d.shape[2],
+                                          device=_logits_2d.device, dtype=_logits_2d.dtype)
+                        _all_logits = torch.cat([_bg, _logits_2d], dim=0)  # [N+1, H, W]
+                        _winners = torch.argmax(_all_logits, dim=0)  # [H, W]
+                        del _logits_2d, _all_logits
+                    else:
+                        _winners = None
+
                     for i, obj_id in enumerate(out_obj_ids):
-                        mask = (out_mask_logits[i] > 0.0).cpu().numpy().squeeze()
+                        if _winners is not None:
+                            mask = (_winners == i + 1).cpu().numpy()
+                        else:
+                            mask = (out_mask_logits[i] > 0.0).cpu().numpy().squeeze()
 
                         # Get object info
                         obj_name = object_names.get(str(obj_id), f"Object_{obj_id}")
@@ -848,6 +865,8 @@ class SAM2Processor:
 
                     # CRITICAL: Delete ALL tensor variables to prevent memory accumulation
                     # SAM3 returns 5 values, SAM2 returns 3 - delete all applicable tensors
+                    if _winners is not None:
+                        del _winners
                     del out_mask_logits  # High-res masks (always present)
 
                     if self.use_sam3:
@@ -931,8 +950,22 @@ class SAM2Processor:
                         frame_masks = {}
                         frame_masks_for_quality = {}  # For quality metrics calculation
 
+                        # Exclusive masks: winner-takes-all per pixel.
+                        if self.exclusive_masks and len(out_obj_ids) > 0:
+                            _logits_2d = out_mask_logits.squeeze(1)  # [N, H, W]
+                            _bg = torch.zeros(1, _logits_2d.shape[1], _logits_2d.shape[2],
+                                              device=_logits_2d.device, dtype=_logits_2d.dtype)
+                            _all_logits = torch.cat([_bg, _logits_2d], dim=0)  # [N+1, H, W]
+                            _winners = torch.argmax(_all_logits, dim=0)  # [H, W]
+                            del _logits_2d, _all_logits
+                        else:
+                            _winners = None
+
                         for i, obj_id in enumerate(out_obj_ids):
-                            mask = (out_mask_logits[i] > 0.0).cpu().numpy().squeeze()
+                            if _winners is not None:
+                                mask = (_winners == i + 1).cpu().numpy()
+                            else:
+                                mask = (out_mask_logits[i] > 0.0).cpu().numpy().squeeze()
 
                             # Get object info
                             obj_name = object_names.get(str(obj_id), f"Object_{obj_id}")
@@ -965,6 +998,8 @@ class SAM2Processor:
 
                         # CRITICAL: Delete ALL tensor variables to prevent memory accumulation
                         # SAM3 returns 5 values, SAM2 returns 3 - delete all applicable tensors
+                        if _winners is not None:
+                            del _winners
                         del out_mask_logits  # High-res masks (always present)
 
                         if self.use_sam3:
@@ -1026,9 +1061,15 @@ class SAM2Processor:
             print(f"OK: Cleaned {model_type} memory")
 
             # Save quality metrics calculated during propagation
-            inter_frame_changes, background_ratios, overlap_ratios = quality_calculator.get_results()
-            quality_calculator.print_summary()
-            save_quality_metrics(str(output_dir), inter_frame_changes, background_ratios, overlap_ratios)
+            # Skip saving when --only-updated is used with unchanged objects: the metrics here
+            # only cover updated objects (high background ratio due to missing unchanged masks).
+            # The caller will recalculate and save with all objects merged.
+            if not skip_quality_save:
+                inter_frame_changes, background_ratios, overlap_ratios = quality_calculator.get_results()
+                quality_calculator.print_summary()
+                save_quality_metrics(str(output_dir), inter_frame_changes, background_ratios, overlap_ratios)
+            else:
+                print("  Skipping partial quality metrics save (will be recalculated with all objects after merging unchanged masks)")
 
             print(f"\nOK: Generated masks for {len(masks_metadata)} frames")
             # Return frame_dir to allow reuse during export, defer cleanup to caller
@@ -1222,6 +1263,8 @@ Examples:
                        help="Directory with previous segmentation results to reuse masks from (used with --only-updated). Defaults to the output directory.")
     parser.add_argument("--video-only", action="store_true",
                        help="Skip segmentation entirely; create/recreate the output video from existing masks in the output directory.")
+    parser.add_argument("--exclusive-masks", action="store_true", dest="exclusive_masks",
+                       help="Winner-takes-all per pixel: for each pixel, only the object with the highest logit is assigned (background wins if all logits < 0). Incompatible with --only-updated.")
 
     args = parser.parse_args()
 
@@ -1230,6 +1273,10 @@ Examples:
         parser.error("--config requires --checkpoint")
     if args.checkpoint and not args.config:
         parser.error("--checkpoint requires --config")
+
+    # Exclusive masks requires all objects to be segmented in the same run
+    if getattr(args, 'exclusive_masks', False) and args.only_updated:
+        parser.error("--exclusive-masks is incompatible with --only-updated: winner-takes-all requires all objects' logits to be present in the same segmentation run")
 
     # Auto-select model if not specified
     if args.model is None and not args.config:
@@ -1266,31 +1313,48 @@ Examples:
         for item in existing_items:
             print(f"  - {item}")
 
-        print("\nOptions:")
-        print("  1. Delete all and proceed")
-        print("  2. Proceed without deleting (may overwrite)")
-        print("  3. Abort")
+        if args.only_updated or args.video_only:
+            # Deleting would destroy masks that --only-updated or --video-only needs to reuse
+            print("\nOptions:")
+            print("  1. Proceed without deleting (existing masks will be reused)")
+            print("  2. Abort")
 
-        while True:
-            choice = input("\nEnter choice (1/2/3): ").strip()
-            if choice == '1':
-                # Delete existing
-                if masks_dir.exists():
-                    shutil.rmtree(masks_dir)
-                if video_file.exists():
-                    video_file.unlink()
-                if metadata_file.exists():
-                    metadata_file.unlink()
-                print("Deleted existing files. Proceeding...")
-                break
-            elif choice == '2':
-                print("Proceeding without deletion...")
-                break
-            elif choice == '3':
-                print("Aborted by user")
-                return 1
-            else:
-                print("Invalid choice. Please enter 1, 2, or 3")
+            while True:
+                choice = input("\nEnter choice (1/2): ").strip()
+                if choice == '1':
+                    print("Proceeding without deletion...")
+                    break
+                elif choice == '2':
+                    print("Aborted by user")
+                    return 1
+                else:
+                    print("Invalid choice. Please enter 1 or 2")
+        else:
+            print("\nOptions:")
+            print("  1. Delete all and proceed")
+            print("  2. Proceed without deleting (may overwrite)")
+            print("  3. Abort")
+
+            while True:
+                choice = input("\nEnter choice (1/2/3): ").strip()
+                if choice == '1':
+                    # Delete existing
+                    if masks_dir.exists():
+                        shutil.rmtree(masks_dir)
+                    if video_file.exists():
+                        video_file.unlink()
+                    if metadata_file.exists():
+                        metadata_file.unlink()
+                    print("Deleted existing files. Proceeding...")
+                    break
+                elif choice == '2':
+                    print("Proceeding without deletion...")
+                    break
+                elif choice == '3':
+                    print("Aborted by user")
+                    return 1
+                else:
+                    print("Invalid choice. Please enter 1, 2, or 3")
 
     print("=" * 60)
     print("SAM2 Annotation Processor")
@@ -1352,12 +1416,14 @@ Examples:
             processor = SAM2Processor(config_file=args.config, checkpoint_file=args.checkpoint,
                                      offload_to_cpu=args.offload_to_cpu, async_loading=args.async_loading,
                                      smooth_masks=args.smooth_masks, use_bfloat16=args.use_bfloat16,
-                                     device=args.device, frame_format=args.frame_format)
+                                     device=args.device, frame_format=args.frame_format,
+                                     exclusive_masks=args.exclusive_masks)
         else:
             processor = SAM2Processor(model_name=args.model, offload_to_cpu=args.offload_to_cpu,
                                      async_loading=args.async_loading, smooth_masks=args.smooth_masks,
                                      use_bfloat16=args.use_bfloat16, device=args.device,
-                                     frame_format=args.frame_format)
+                                     frame_format=args.frame_format,
+                                     exclusive_masks=args.exclusive_masks)
 
         # Set no_backward flag
         processor.no_backward_propagation = args.no_backward
@@ -1409,8 +1475,12 @@ Examples:
 
     try:
         # Process segmentation
+        # Skip the intermediate quality metrics save when --only-updated has unchanged objects:
+        # those objects' masks aren't included in this run, so the metrics would be misleading.
+        # The merged quality metrics are calculated below after reusing unchanged masks.
         result = processor.process_segmentation(
-            args.video_file, annotations_data, output_dir, frame_dir=args.frame_dir
+            args.video_file, annotations_data, output_dir, frame_dir=args.frame_dir,
+            skip_quality_save=bool(unchanged_ids)
         )
         masks_by_frame, object_names, object_colors, num_frames, frame_dir_used, is_persistent = result
 
