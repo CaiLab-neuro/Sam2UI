@@ -57,7 +57,12 @@ During setup, you'll be prompted to choose which model checkpoints to download:
 
 Only models whose checkpoints are downloaded will be available at runtime.
 
-## 2. Using the SAM2 Video UI
+## 2. Using the SAM2 Video UI (`sam2_ui.py`)
+
+### Launch the App
+```bash
+python sam2_ui.py
+```
 
 ### Initial Setup
 1. Load a video file
@@ -70,7 +75,7 @@ Only models whose checkpoints are downloaded will be available at runtime.
 4. Export annotations as a JSON file
 
 ### Segmentation
-Select a model from the dropdown (larger models such as Base+ or Large generally produce better masks but are slower; only downloaded checkpoints appear), then either segment within the UI or use the processing script:
+Select a model from the dropdown (larger models such as Base+ or Large generally produce better masks but are slower; only downloaded checkpoints appear), then either segment within the UI or use the processing script (more details in the next section):
 ```bash
 python process_annotations.py annotations.json video.mp4
 ```
@@ -127,19 +132,22 @@ python process_annotations.py annotations.json video.mp4 \
 
 ## 4. Gaze-Target Annotation with Segmented Results (`process_gaze_mask_alignment.py`)
 
-**Purpose**: Assign each gaze sample to the most likely segmented object by combining gaze coordinates, world-camera timestamps, and SAM2/SAM3 mask outputs.
+**Purpose**: Use exported segmentation masks together with gaze and world-camera timestamps to assign each gaze sample to the most likely object.
 
-**Current features**:
-- Auto-discovers subjects and camera IDs from `{subject}_{camera}_gaze.csv` files when `--subject-id` or `--camera-id` is omitted.
-- Supports both mask folder layouts: `{subject}/{camera}/masks/` and legacy `{subject}_{camera}/masks/`.
-- Optionally labels blink periods and removes gaze points that fall within blinks before object assignment.
-- Optionally excludes named objects or mask IDs with `--ignore-object-list`; filtered CSV/PKL outputs receive an `_excluding_ignored_objects` suffix.
-- Can process subject-camera pairs in parallel with `--num-workers`.
+This component is intended for a workflow where segmentation is completed first in Sam2UI, and the resulting masks are then matched against gaze coordinates frame by frame. For each gaze point, the script compares the gaze location to the available object masks in the corresponding frame and outputs the most likely gazed object together with a confidence score. Multiple subjects and cameras can be processed in a single run, or auto-discovered from the filenames in the gaze directory.
+
+**Required inputs**:
+- **Gaze/world-camera directory** containing files named like `{subject_id}_{camera}_gaze.csv` and `{subject_id}_{camera}_world_timestamps.csv`
+- **Segmentation mask directory** containing folders named like `{subject_id}/{camera}/masks/` (or legacy `{subject_id}_{camera}/masks/`)
+- **Output directory** for gaze-target annotation results
+
+**Optional inputs**:
+- **Blink directory** containing `{subject_id}_{camera}_blinks.csv` files if you want to label or remove gaze points during blinks
 
 **Expected CSV structure**:
-- **`{subject_id}_{camera}_gaze.csv`**: one row per gaze sample, ordered by time. Required columns are `timestamp [ns]`, `gaze x [px]`, and `gaze y [px]`. Additional columns are preserved in the output.
-- **`{subject_id}_{camera}_world_timestamps.csv`**: one row per world-camera frame, ordered by time. Required column is `timestamp [ns]`. Additional columns are allowed; the script rebuilds `frame_idx` and `frame_timestamp` during alignment and preserves `source_frame_idx` when present.
-- **`{subject_id}_{camera}_blinks.csv`**: used only with `--blink-dir`. Required columns are `start timestamp [ns]`, `end timestamp [ns]`, and `blink id`.
+- **`{subject_id}_{camera}_gaze.csv`**: one row per gaze sample, ordered by time. Required columns are `timestamp [ns]`, `gaze x [px]`, and `gaze y [px]`. Additional columns are allowed and are preserved in the merged/output tables.
+- **`{subject_id}_{camera}_world_timestamps.csv`**: one row per world-camera frame, ordered by time. Required column is `timestamp [ns]`. Additional columns are allowed, but the script rebuilds `frame_idx` and `frame_timestamp` from this file during alignment.
+- **`{subject_id}_{camera}_blinks.csv`**: used only with `--blink-dir`. The code expects `start timestamp [ns]`, `end timestamp [ns]`, and `blink id`, because those columns are used to mark whether a gaze sample falls inside a blink interval.
 
 **Minimum column examples**:
 ```csv
@@ -166,22 +174,27 @@ blink id,start timestamp [ns],end timestamp [ns]
 
 **Usage**:
 ```bash
+# Process one subject/camera pair
+python process_gaze_mask_alignment.py \
+  /path/to/gaze_world_data \
+  /path/to/segmentation_masks \
+  /path/to/output_dir \
+  --subject-id 27 \
+  --camera-id child
 
-# Process multiple subjects and cameras in parallel
+# Process multiple subjects and cameras in one run
 python process_gaze_mask_alignment.py \
   /path/to/gaze_world_data \
   /path/to/segmentation_masks \
   /path/to/output_dir \
   --subject-id 27,28 \
-  --camera-id child,parent \
-  --num-workers 4
+  --camera-id child,parent
 
-# Auto-discover all subjects and cameras from CSV filenames and process in parallel
+# Auto-discover all subjects and cameras from CSV filenames
 python process_gaze_mask_alignment.py \
   /path/to/gaze_world_data \
   /path/to/segmentation_masks \
-  /path/to/output_dir \
-  --num-workers 4
+  /path/to/output_dir
 
 # Remove gaze points during blinks
 python process_gaze_mask_alignment.py \
@@ -192,13 +205,13 @@ python process_gaze_mask_alignment.py \
   --camera-id child \
   --blink-dir /path/to/blink_data
 
-# Exclude objects from assignment, such as hands or calibration targets
+# Restrict method-figure plots to a time window
 python process_gaze_mask_alignment.py \
   /path/to/gaze_world_data \
   /path/to/segmentation_masks \
   /path/to/output_dir \
-  --ignore-object-list /path/to/ignore_objects.txt
-
+  --subject-id 27 --camera-id child \
+  --start-plot-time 10.0 --end-plot-time 60.0
 ```
 
 ### `process_gaze_mask_alignment.py` Options
@@ -211,28 +224,21 @@ python process_gaze_mask_alignment.py \
 | `--subject-id` | Subject ID(s), e.g. `27` or `27,28`. Auto-discovered if omitted. |
 | `--camera-id` | Camera ID(s), e.g. `child` or `child,parent`. Auto-discovered if omitted. |
 | `--blink-dir` | Directory with `{subject}_{camera}_blinks.csv` files for blink labeling/removal |
-| `--log-path` | Path for the log file; default is `{output_dir}/gaze_object.log` |
-| `--ignore-object-list` | Text file of object labels, IDs, numeric IDs, or exact mask filenames to exclude from scoring |
-| `--num-workers` | Number of subject-camera pairs to process in parallel; default is `1` |
-| `--skip-figures` | Skip trajectory and confidence heatmap figure generation |
-| `--start-plot-time` | Start time in seconds for method-figure plots |
-| `--end-plot-time` | End time in seconds for method-figure plots |
+| `--log-path` | Path for the log file (default: `{output_dir}/gaze_object.log`) |
+| `--start-plot-time` | Start time in seconds for method-figure plots (optional) |
+| `--end-plot-time` | End time in seconds for method-figure plots (optional) |
 
 **Output files**:
-- **`output_dir/{subject_id}/{camera}/{subject_id}_{camera}_gazed_object.csv`** - Gaze samples with assigned object labels and confidence
-- **`output_dir/{subject_id}/{camera}/{subject_id}_{camera}_gaze_object_probabilities.pkl`** - Per-gaze probabilities for all available masks
-- **`output_dir/{subject_id}/{camera}/{subject_id}_{camera}_gaze_blink_labeled.csv`** - Blink-labeled gaze data when `--blink-dir` is used
-- **`output_dir/{subject_id}/{camera}/{subject_id}_{camera}_gaze_blink_removed.csv`** - Blink-removed gaze data when `--blink-dir` is used
-- **`output_dir/{subject_id}/{camera}/figures/{subject_id}_{camera}_trajectory_plot.png`** and **`.pdf`** - Gaze-object trajectory over time, unless `--skip-figures` is used
-- **`output_dir/{subject_id}/{camera}/figures/{subject_id}_{camera}_confidence_heatmap.png`** and **`.pdf`** - Confidence heatmap by object over time, unless `--skip-figures` is used
-- **`output_dir/gaze_object.log`** - Processing log, unless `--log-path` is provided
-
-When `--ignore-object-list` is used, the main CSV and probability PKL filenames receive `_excluding_ignored_objects` before the extension.
+- **`output_dir/{subject_id}_gazed_object/{subject_id}_{camera}_gazed_object.csv`** - Gaze samples with assigned object labels and confidence
+- **`output_dir/{subject_id}_gazed_object/{subject_id}_{camera}_gaze_object_probabilities.pkl`** - Per-gaze probabilities for all available masks
+- **`output_dir/{subject_id}_gazed_object/{subject_id}_{camera}_gaze_blink_labeled.csv`** - Blink-labeled gaze data when `--blink-dir` is used
+- **`output_dir/{subject_id}_gazed_object/{subject_id}_{camera}_gaze_blink_removed.csv`** - Blink-removed gaze data when `--blink-dir` is used
+- **`output_dir/{subject_id}_gazed_object/figures/`** - Trajectory plots and confidence heatmaps (PNG and PDF)
+- **`output_dir/gaze_object.log`** - Processing log (or path set by `--log-path`)
 
 The main output CSV keeps the original gaze columns and any extra gaze metadata, then adds the alignment/object-assignment fields below:
 - `frame_idx`: world-camera frame index matched to the gaze sample
 - `frame_timestamp`: timestamp of the matched world-camera frame
-- `source_frame_idx`: preserved when present in the world-camera timestamp file
 - `in_blink`: added only when `--blink-dir` is used
 - `blink id`: added only when `--blink-dir` is used
 - `gazed_object_id`: mask/object ID parsed from the exported mask filename
@@ -358,79 +364,4 @@ python -c "from sam3.model_builder import build_sam3_video_predictor; print('SAM
 3. **Verify Python version**: `python --version` (must be 3.10+)
 4. **Check file paths**: Ensure annotation and video files exist
 
-## UI Video Loading Frame Inaccurate
 
-### Issue
-
-`sam2_ui.py` uses OpenCV lazy seeking when loading frames in the UI:
-
-```python
-cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-ret, frame = cap.read()
-```
-
-For some inter-frame-compressed MP4 files, this seek is not frame-accurate: OpenCV can return a frame earlier than the requested `frame_idx`. This can make UI annotations appear to target the wrong frame even when the annotation data itself is valid.
-
-`process_annotations.py` and `process_gaze_mask_alignment.py` rely on decoded video frames, so downstream processing should tolerate both the original inter-frame-compressed MP4s and intra-frame MJPEG AVI files. Reencoding is recommended when frame-accurate random access is needed in the UI or during quality checking.
-
-### Solution
-
-Reencode inter-frame-compressed MP4s into an intra-frame format such as MJPEG AVI. Intra-frame videos store each frame independently, which makes OpenCV random seeks much more reliable.
-
-Use the seek-safe reencoding utility:
-
-```bash
-python reencode_seek_safe_videos.py --dry-run
-python reencode_seek_safe_videos.py --verify --overwrite
-```
-
-To process selected subjects or cameras:
-
-```bash
-python reencode_seek_safe_videos.py --subjects 1,10,13 --camera child --verify --overwrite
-python reencode_seek_safe_videos.py --camera child,parent --overwrite
-```
-
-Omit `--camera` to process all discovered cameras. Camera identifiers are general strings parsed from filenames like `{subject}_{camera}_...mp4`; they are not limited to `child` and `parent`.
-
-### `reencode_seek_safe_videos.py` Options
-
-| Option | Description |
-|--------|-------------|
-| `--source-dir` | Directory containing the original aligned MP4 files |
-| `--output-dir` | Directory where seek-safe AVI files are written |
-| `--manifest-path` | JSON summary path for the reencoding run |
-| `--log-path` | Path for the run log; defaults to `{output_dir}/reencode_seek_safe_videos.log` |
-| `--camera` | Camera ID(s) to process, e.g. `child` or `child,parent`; auto-discovers all cameras if omitted |
-| `--subjects` | Subject ID(s), e.g. `1` or `1,10,13`; processes all discovered subjects if omitted |
-| `--source-mode` | Use sequential MP4 decoding with `video`, or rebuild from PNG frames with `frames` |
-| `--frames-root-dir` | Root containing non-legacy frame folders named `{camera}_frames` |
-| `--child-frames-dir` | Legacy extracted PNG frame directory for child videos |
-| `--parent-frames-dir` | Legacy extracted PNG frame directory for parent videos |
-| `--suffix` | Suffix appended before `.avi`; default is `_seeksafe` |
-| `--frame-limit` | Optional frame cap for smoke tests |
-| `--progress-every` | Print progress every N encoded frames |
-| `--verify` | Verify lazy random seeks against sequential reads on the output AVI |
-| `--verify-frames` | Comma-separated frame indices to verify; auto-selected if omitted |
-| `--overwrite` | Replace existing output AVI files |
-| `--dry-run` | Print planned jobs without encoding videos |
-
-### Output Files
-
-By default, an input video like:
-
-```text
-aligned_video_YB_finalized_version/1_child_0_35662.mp4
-```
-
-is written as:
-
-```text
-videos/child/1_child_0_35662_seeksafe.avi
-```
-
-The reencoding run also writes:
-
-- **`{output_dir}/{camera}/{source_stem}{suffix}.avi`** - seek-safe MJPEG AVI for each processed source video
-- **`{output_dir}/reencode_seek_safe_videos.log`** - run log unless `--log-path` is provided
-- **`last_run_manifest.json`** - JSON manifest unless `--manifest-path` is provided
