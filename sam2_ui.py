@@ -2675,8 +2675,18 @@ class SAM2VideoUI:
             return None
 
         try:
-            # Seek to the frame
+            # Seek to the frame, then verify and advance if seek landed short.
+            # cv2.CAP_PROP_POS_FRAMES seeking is approximate for compressed video:
+            # OpenCV seeks to the nearest preceding keyframe, so the actual position
+            # after the seek can be earlier than requested. Reading forward the
+            # remaining frames (at most one GOP, ~15-60 frames) corrects this.
             self.video_cap_lazy.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            actual = int(self.video_cap_lazy.get(cv2.CAP_PROP_POS_FRAMES))
+            while actual < frame_idx:
+                ret, _ = self.video_cap_lazy.read()
+                if not ret:
+                    break
+                actual = int(self.video_cap_lazy.get(cv2.CAP_PROP_POS_FRAMES))
             ret, frame = self.video_cap_lazy.read()
 
             if not ret:
