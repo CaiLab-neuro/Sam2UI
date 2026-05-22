@@ -57,7 +57,12 @@ During setup, you'll be prompted to choose which model checkpoints to download:
 
 Only models whose checkpoints are downloaded will be available at runtime.
 
-## 2. Using the SAM2 Video UI
+## 2. Using the SAM2 Video UI (`sam2_ui.py`)
+
+### Launch the App
+```bash
+python sam2_ui.py
+```
 
 ### Initial Setup
 1. Load a video file
@@ -70,7 +75,7 @@ Only models whose checkpoints are downloaded will be available at runtime.
 4. Export annotations as a JSON file
 
 ### Segmentation
-Select a model from the dropdown (larger models such as Base+ or Large generally produce better masks but are slower; only downloaded checkpoints appear), then either segment within the UI or use the processing script:
+Select a model from the dropdown (larger models such as Base+ or Large generally produce better masks but are slower; only downloaded checkpoints appear), then either segment within the UI or use the processing script (more details in the next section):
 ```bash
 python process_annotations.py annotations.json video.mp4
 ```
