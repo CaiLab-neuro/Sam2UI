@@ -11,7 +11,10 @@ import matplotlib.pyplot as plt
 import logging, sys
 import argparse
 import re
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime
+from logging.handlers import QueueHandler, QueueListener
+from multiprocessing import Manager
 from pathlib import Path
 from typing import Optional
 
@@ -80,7 +83,7 @@ Inputs:
 
 Outputs:
     1) Output directory: /path/to/output_directory
-    Within this directory, the code will create new folders named as *{subject_id}_gazed_object/*
+    Within this directory, the code will create folders named as *{subject_id}/{camera}/*
 
         Each folder contains:
         A csv file containing the aligned gaze rows and their assigned gazed object.
@@ -120,22 +123,60 @@ class RawDescriptionDefaultsHelpFormatter(
 ):
     pass
 
-def setup_logging(log_path: Path):
-        log_path.parent.mkdir(parents=True, exist_ok=True)
+def make_log_handlers(log_path: Path):
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+    handlers = [
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler(log_path, mode="w"),
+    ]
+    for handler in handlers:
+        handler.setFormatter(formatter)
+    return handlers
+
+
+def setup_logging(log_path: Path, use_queue: bool = False):
+    handlers = make_log_handlers(log_path)
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+
+    if not use_queue:
         logging.basicConfig(
             level=logging.INFO,
-            format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-            handlers=[
-                logging.StreamHandler(sys.stdout),
-                logging.FileHandler(log_path, mode="w"),
-            ],
+            handlers=handlers,
             force=True,  # important if running in notebooks / reused envs
         )
+        return None, None, None
+
+    log_manager = Manager()
+    log_queue = log_manager.Queue()
+    listener = QueueListener(log_queue, *handlers, respect_handler_level=True)
+    listener.start()
+    root_logger.handlers = [QueueHandler(log_queue)]
+    return log_queue, listener, log_manager
+
+
+def setup_worker_logging(log_queue):
+    if log_queue is None:
+        return
+
+    root_logger = logging.getLogger()
+    root_logger.handlers = [QueueHandler(log_queue)]
+    root_logger.setLevel(logging.INFO)
+
+
+class SubjectCameraLoggerAdapter(logging.LoggerAdapter):
+    def process(self, msg, kwargs):
+        return f"subj={self.extra['subject_id']} camera={self.extra['camera']} | {msg}", kwargs
+
+
+def pair_logger(logger, subject_id, camera):
+    return SubjectCameraLoggerAdapter(logger, {"subject_id": subject_id, "camera": camera})
 
 
 def format_log_datetime(dt: Optional[datetime] = None) -> str:
-        dt = dt or datetime.now().astimezone()
-        return dt.strftime("%Y-%m-%d %H:%M:%S %Z%z")
+    dt = dt or datetime.now().astimezone()
+    return dt.strftime("%Y-%m-%d %H:%M:%S %Z%z")
 
 
 class GazeObjectAligner:
@@ -147,6 +188,8 @@ class GazeObjectAligner:
         blink_dir: Optional[str] = None,
         start_plot_time: Optional[float] = None,
         end_plot_time: Optional[float] = None,
+        ignore_object_list: Optional[str] = None,
+        plot_figures: bool = True,
         logger: Optional[logging.Logger] = None,
     ):
         self.gaze_world_dir = gaze_world_dir
@@ -156,6 +199,56 @@ class GazeObjectAligner:
         self.start_plot_time = start_plot_time
         self.end_plot_time = end_plot_time
         self.logger = logger or logging.getLogger(__name__)
+        self.ignore_object_list = ignore_object_list
+        self.plot_figures = plot_figures
+        self.ignore_objects = self.load_ignore_objects(ignore_object_list)
+        if self.ignore_objects:
+            self.logger.info(
+                "Ignoring %d object mask labels from %s: %s",
+                len(self.ignore_objects),
+                ignore_object_list,
+                sorted(self.ignore_objects),
+            )
+
+    def normalize_object_label(self, label):
+        """Normalize object labels so txt entries can use spaces or underscores."""
+        return label.strip().lower().replace(" ", "_")
+
+    def mask_labels(self, mask_path):
+        """Return labels that can be used to match one mask filename."""
+        filename = os.path.basename(mask_path)
+        stem = os.path.splitext(filename)[0]
+        parts = stem.split('_')
+        labels = {self.normalize_object_label(filename), self.normalize_object_label(stem)}
+
+        if len(parts) >= 4 and parts[0] == "mask" and parts[1].startswith("f"):
+            object_name = '_'.join(parts[2:-1])
+            object_id = parts[-1]
+            labels.add(self.normalize_object_label(object_name))
+            labels.add(self.normalize_object_label(object_id))
+            if object_id.startswith("id"):
+                labels.add(object_id[2:])
+
+        return labels
+
+    def load_ignore_objects(self, ignore_object_list):
+        """Load optional object labels to ignore, one per line."""
+        if not ignore_object_list:
+            return set()
+
+        ignore_path = Path(ignore_object_list)
+        with ignore_path.open("r") as f:
+            labels = {
+                self.normalize_object_label(line.split("#", 1)[0])
+                for line in f
+                if line.split("#", 1)[0].strip()
+            }
+
+        return labels
+
+    def excluded_objects_output_suffix(self):
+        """Label outputs that were generated after excluding ignored objects."""
+        return "_excluding_ignored_objects" if self.ignore_objects else ""
 
     def resolve_mask_dir(self, subj: str, camera: str) -> Path:
         """Resolve the mask directory for a subject/camera across supported layouts."""
@@ -228,6 +321,9 @@ class GazeObjectAligner:
         masks = {}
 
         for mask_path in mask_paths:
+            if self.ignore_objects and self.mask_labels(mask_path) & self.ignore_objects:
+                continue
+
             mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
             if mask is None:
                 continue
@@ -640,7 +736,7 @@ class GazeObjectAligner:
             "Subject-camera run started at (local time): %s",
             format_log_datetime(subject_run_started_at),
         )
-        out_dir= Path(self.output_dir) / f'{subject_id_temp}_gazed_object'
+        out_dir = Path(self.output_dir) / str(subject_id_temp) / str(camera_temp)
         out_dir.mkdir(parents=True, exist_ok=True)
         run_status = "completed"
         try:
@@ -785,19 +881,24 @@ class GazeObjectAligner:
                     subject_id_temp,
                     camera_temp,
                 )
-            output_path = os.path.join(out_dir, f"{subject_id_temp}_{camera_temp}_gazed_object.csv")
+            excluded_objects_suffix = self.excluded_objects_output_suffix()
+            output_path = os.path.join(out_dir, f"{subject_id_temp}_{camera_temp}_gazed_object{excluded_objects_suffix}.csv")
             gaze_blink_removed.to_csv(output_path, index=False)
             self.logger.info(f"Saved gaze object results to {output_path}")
-            with open(os.path.join(out_dir, f"{subject_id_temp}_{camera_temp}_gaze_object_probabilities.pkl"), 'wb') as f:
+            probabilities_path = os.path.join(out_dir, f"{subject_id_temp}_{camera_temp}_gaze_object_probabilities{excluded_objects_suffix}.pkl")
+            with open(probabilities_path, 'wb') as f:
                 pickle.dump(subject_gaze_probabilities, f)
-            self.logger.info(f"Saved probabilities of each mask for each eye gaze to {os.path.join(out_dir, f'{subject_id_temp}_{camera_temp}_gaze_object_probabilities.pkl')}")
-            self.plot_method_figures(
-                subject_id_temp=subject_id_temp,
-                camera_temp=camera_temp,
-                gaze_df=gaze_blink_removed,
-                subject_gaze_probabilities=subject_gaze_probabilities,
-                out_dir=out_dir,
-            )
+            self.logger.info(f"Saved probabilities of each mask for each eye gaze to {probabilities_path}")
+            if self.plot_figures:
+                self.plot_method_figures(
+                    subject_id_temp=subject_id_temp,
+                    camera_temp=camera_temp,
+                    gaze_df=gaze_blink_removed,
+                    subject_gaze_probabilities=subject_gaze_probabilities,
+                    out_dir=out_dir,
+                )
+            else:
+                self.logger.info("Skipping method figures because --skip-figures was provided.")
         except Exception:
             run_status = "failed"
             raise
@@ -808,7 +909,41 @@ class GazeObjectAligner:
                 run_status,
                 format_log_datetime(subject_run_finished_at),
             )
-        
+
+
+def process_subject_camera_pair(args):
+    """Worker entry point for one subject-camera pair."""
+    (
+        subject_id_temp,
+        camera_temp,
+        gaze_world_dir,
+        mask_dir,
+        output_dir,
+        blink_dir,
+        start_plot_time,
+        end_plot_time,
+        ignore_object_list,
+        plot_figures,
+        log_queue,
+    ) = args
+
+    setup_worker_logging(log_queue)
+    logger = pair_logger(logging.getLogger(__name__), subject_id_temp, camera_temp)
+    gaze_aligner = GazeObjectAligner(
+        gaze_world_dir,
+        mask_dir,
+        output_dir,
+        blink_dir=blink_dir,
+        start_plot_time=start_plot_time,
+        end_plot_time=end_plot_time,
+        ignore_object_list=ignore_object_list,
+        plot_figures=plot_figures,
+        logger=logger,
+    )
+    logger.info("Processing started.")
+    gaze_aligner.process_subject(subject_id_temp, camera_temp)
+    return subject_id_temp, camera_temp
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -848,9 +983,11 @@ def main():
         '  - If --blink-dir is provided, blink CSVs must be named\n'
         '    {subject}_{camera}_blinks.csv and include start timestamp [ns],\n'
         '    end timestamp [ns], and blink id.\n'
-        '  - Output folders are created as {output_dir}/{subject}_gazed_object/.\n'
-        '  - Method figures are always written under each subject output folder in\n'
-        '    the figures/ subdirectory.'
+        '  - Output folders are created as {output_dir}/{subject}/{camera}/.\n'
+        '  - If --ignore-object-list is provided, ignored masks are excluded and\n'
+        '    final CSV/PKL outputs receive an _excluding_ignored_objects suffix.\n'
+        '  - Method figures are written under each subject-camera output folder unless\n'
+        '    --skip-figures is provided.'
     ))
 
     # Required positional arguments (already required by argparse)
@@ -861,6 +998,9 @@ def main():
     parser.add_argument('--camera-id', help='Camera ID e.g. child or child,parent')
     parser.add_argument('--blink-dir', help='If remove gaze during blinks', required=False)
     parser.add_argument('--log-path', help='Path to the log file', required=False)
+    parser.add_argument('--ignore-object-list', default=None, help='Optional txt file with object mask labels to ignore, one per line. Entries can be object names like toy_bags, ids like id29, numeric ids like 29, or exact mask filenames.')
+    parser.add_argument('--num-workers', type=int, default=1, help='Number of subject-camera pairs to process in parallel. Use 1 for sequential processing.')
+    parser.add_argument('--skip-figures', action='store_true', help='Skip trajectory and confidence heatmap figure generation.')
     parser.add_argument(
         '--start-plot-time',
         type=float,
@@ -875,6 +1015,8 @@ def main():
     )
 
     args = parser.parse_args()
+    if args.num_workers < 1:
+        parser.error("--num-workers must be >= 1.")
     if args.start_plot_time is not None and args.start_plot_time < 0:
         parser.error("--start-plot-time must be >= 0.")
     if args.end_plot_time is not None and args.end_plot_time < 0:
@@ -886,83 +1028,116 @@ def main():
     ):
         parser.error("--start-plot-time must be <= --end-plot-time.")
 
-    # Setup logging
-    if args.log_path is None:
-        args.log_path = os.path.join(args.output_dir, 'gaze_object.log')
-    log_path = Path(args.log_path)
-    setup_logging(log_path)
-    logger = logging.getLogger(__name__)
-    logger.info(f"Logging to: {log_path.resolve()}")
-    pipeline_run_started_at = datetime.now().astimezone()
-    logger.info("Pipeline run started at (local time): %s", format_log_datetime(pipeline_run_started_at))
-
     if args.subject_id:
-        subj_ids = [int(id.strip()) for id in args.subject_id.split(',')]
+        subj_ids = [id.strip() for id in args.subject_id.split(',')]
     else:
         gaze_worldcam_dir = Path(args.gaze_world_dir)
-        subj_ids = np.unique([
-            int(p.stem.split('_')[0])
+        subj_ids = sorted({
+            p.stem.split('_')[0]
             for p in gaze_worldcam_dir.iterdir()
             if p.is_file() and p.suffix.lower() in {".csv"}
-        ])
+        })
 
     if args.camera_id:
         camera_list = [i.strip() for i in args.camera_id.split(',')]
     else:
         gaze_worldcam_dir = Path(args.gaze_world_dir)
-        camera_list = np.unique([
-            p.stem.split('_')[1] for p in gaze_worldcam_dir.iterdir()
-            if p.is_file() and p.suffix.lower() in {".csv"}
-        ])
-    
-    if args.blink_dir is not None:
-        gaze_aligner = GazeObjectAligner(
-        args.gaze_world_dir,
-        args.mask_dir,
-        args.output_dir,
-        blink_dir=args.blink_dir,
-        start_plot_time=args.start_plot_time,
-        end_plot_time=args.end_plot_time,
-        logger=logger,
-        )
-        logger.info("------- Loaded Files and Directories -------")
+        camera_list = sorted({
+            p.stem.split('_')[1]
+            for p in gaze_worldcam_dir.iterdir()
+            if p.is_file() and p.suffix.lower() in {".csv"} and len(p.stem.split('_')) >= 2
+        })
 
+    subject_camera_pairs = [
+        (str(subject_id_temp), str(camera_temp))
+        for subject_id_temp in subj_ids
+        for camera_temp in camera_list
+    ]
+
+    if args.log_path is None:
+        args.log_path = os.path.join(args.output_dir, 'gaze_object.log')
+    log_path = Path(args.log_path)
+    use_queue_logging = args.num_workers > 1 and len(subject_camera_pairs) > 1
+    log_queue, log_listener, log_manager = setup_logging(log_path, use_queue=use_queue_logging)
+
+    try:
+        logger = logging.getLogger(__name__)
+        logger.info(f"Logging to: {log_path.resolve()}")
+        pipeline_run_started_at = datetime.now().astimezone()
+        logger.info("Pipeline run started at (local time): %s", format_log_datetime(pipeline_run_started_at))
+
+        logger.info("------- Loaded Files and Directories -------")
         logger.info(f"Subjects: {subj_ids}, Cameras: {camera_list}")
         logger.info(f"Gaze Directory: {args.gaze_world_dir}")
         logger.info(f"Mask Directory: {args.mask_dir}")
         logger.info(f"Output Directory: {args.output_dir}")
         logger.info(f"Blink Directory: {args.blink_dir}")
+        logger.info(f"Ignore Object List: {args.ignore_object_list}")
         logger.info(f"Plot Start Time (s): {args.start_plot_time}")
         logger.info(f"Plot End Time (s): {args.end_plot_time}")
+        logger.info(f"Plot Figures: {not args.skip_figures}")
+        logger.info(f"Num Workers: {args.num_workers}")
+        logger.info(f"Queue Logging: {use_queue_logging}")
+        if args.blink_dir is None:
+            logger.info("No blink directory provided, skipping blink labeling.")
 
-    else:
-        gaze_aligner = GazeObjectAligner(
-        args.gaze_world_dir,
-        args.mask_dir,
-        args.output_dir,
-        start_plot_time=args.start_plot_time,
-        end_plot_time=args.end_plot_time,
-        logger=logger,
-        )
-        logger.info("------- Loaded Files and Directories -------")
-        logger.info(f"Subjects: {subj_ids}, Cameras: {camera_list}")
-        logger.info(f"Gaze Directory: {args.gaze_world_dir}")
-        logger.info(f"Mask Directory: {args.mask_dir}")
-        logger.info(f"Output Directory: {args.output_dir}")
-        logger.info(f"Plot Start Time (s): {args.start_plot_time}")
-        logger.info(f"Plot End Time (s): {args.end_plot_time}")
-        logger.info(f"No blink directory provided, skipping blink labeling.")
+        if args.num_workers <= 1 or len(subject_camera_pairs) <= 1:
+            for subj, cam in subject_camera_pairs:
+                logger.info("------- Start Gaze Mask Processing -------")
+                logger.info(f"------- Processing subject {subj}, camera {cam} -------")
+                gaze_aligner = GazeObjectAligner(
+                    args.gaze_world_dir,
+                    args.mask_dir,
+                    args.output_dir,
+                    blink_dir=args.blink_dir,
+                    start_plot_time=args.start_plot_time,
+                    end_plot_time=args.end_plot_time,
+                    ignore_object_list=args.ignore_object_list,
+                    plot_figures=not args.skip_figures,
+                    logger=pair_logger(logger, subj, cam),
+                )
+                gaze_aligner.process_subject(subj, cam)
+                logger.info(f"------- Finished processing subject {subj}, camera {cam} -------")
+        else:
+            max_workers = min(args.num_workers, len(subject_camera_pairs))
+            logger.info(f"Processing {len(subject_camera_pairs)} subject-camera pairs with {max_workers} workers.")
+            worker_args = [
+                (
+                    subj,
+                    cam,
+                    args.gaze_world_dir,
+                    args.mask_dir,
+                    args.output_dir,
+                    args.blink_dir,
+                    args.start_plot_time,
+                    args.end_plot_time,
+                    args.ignore_object_list,
+                    not args.skip_figures,
+                    log_queue,
+                )
+                for subj, cam in subject_camera_pairs
+            ]
+            with ProcessPoolExecutor(max_workers=max_workers) as executor:
+                future_to_pair = {
+                    executor.submit(process_subject_camera_pair, worker_arg): (worker_arg[0], worker_arg[1])
+                    for worker_arg in worker_args
+                }
+                for future in as_completed(future_to_pair):
+                    subj, cam = future_to_pair[future]
+                    try:
+                        future.result()
+                    except Exception:
+                        logger.exception(f"Failed processing subject {subj} and camera {cam}.")
+                        raise
+                    logger.info(f"------- Finished processing subject {subj}, camera {cam} -------")
 
-
-    
-    for subj in subj_ids:
-        for cam in camera_list:
-            logger.info("------- Start Gaze Mask Processing -------")
-            logger.info(f"------- Processing subject {subj}, camera {cam} -------")
-            gaze_aligner.process_subject(str(subj), cam)
-            logger.info(f"------- Finished processing subject {subj}, camera {cam} -------")
-    logger.info("Gaze object detection complete!")
-    logger.info("Pipeline run finished at (local time): %s", format_log_datetime(datetime.now().astimezone()))
+        logger.info("Gaze object detection complete!")
+        logger.info("Pipeline run finished at (local time): %s", format_log_datetime(datetime.now().astimezone()))
+    finally:
+        if log_listener is not None:
+            log_listener.stop()
+        if log_manager is not None:
+            log_manager.shutdown()
 
 if __name__ == "__main__":
     main()
