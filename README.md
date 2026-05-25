@@ -1,12 +1,16 @@
 # SAM2 Graphic User Interface and Gaze-Target Annotation (Gaze Target Annotator)
 
-Gaze Target Annotator, as a part of GazeBehavior Annotation Toolkit (GBAT), provides a generic-purpose graphical user interface to annotate objects in a video with a few points, and utilize SAM2 or SAM3 to segment objects in the video. 
+`Gaze Target Annotator`, as a part of `GazeBehavior Annotation Toolkit (GBAT)`, provides a generic-purpose graphical user interface to annotate objects in a video with a few points, and utilize SAM2 or SAM3 to segment objects in the video. 
 For eye-tracking research, it further includes utility to map eye-gaze coordinate in the scene video of head-mounted eye-tracker to categories of gaze target.
 
-The toolkit includes three main components: an interactive segmentation UI, an offline processing script, and a script for using segmentation outputs and eye-tracker gaze coordiate data to generate time series of gaze target. For gaze coordinate data, we follow the format of Pupil Labs output.
+## Main Scripts
 
+- `sam2_ui.py`: an interactive UI allows users to provide annotation prompts for model to perform segmentation
+- `process_annotation.py`: an offline processing script allows users to process annotations from UI and segment objects for the whole video
+- `process_gaze_mask_alignment.py`: a script for using segmentation outputs and eye-tracker gaze coordiates to generate time series of gaze targets
 
-## Prerequisites
+## Installation
+### Prerequisites
 
 **IMPORTANT**: Before running setup, create and activate a dedicated conda environment or virtualenv. This prevents dependency conflicts and ensures proper package installation.
 
@@ -29,7 +33,7 @@ source sam_env/bin/activate  # Linux/Mac
 sam_env\Scripts\activate  # Windows
 ```
 
-## 1. Setup Script (`install.py`)
+### 1. Setup Script (`install.py`)
 
 **Purpose**: Automatically install SAM2, dependencies, and model checkpoints
 
@@ -134,14 +138,64 @@ python process_annotations.py annotations.json video.mp4 \
 
 **Purpose**: Use exported segmentation masks together with gaze and world-camera timestamps to assign each gaze sample to the most likely object.
 
-This component is intended for a workflow where segmentation is completed first in Sam2UI, and the resulting masks are then matched against gaze coordinates frame by frame. For each gaze point, the script compares the gaze location to the available object masks in the corresponding frame and outputs the most likely gazed object together with a confidence score. Multiple subjects and cameras can be processed in a single run, or auto-discovered from the filenames in the gaze directory.
+**Usage**:
+```bash
+# Process selected subject/camera pair
+python process_gaze_mask_alignment.py \
+  /path/to/gaze_world_data \
+  /path/to/segmentation_masks \
+  /path/to/output_dir \
+  --subject-id <e.g. 27,28> \
+  --camera-id <e.g. child,parent>
 
-**Required inputs**:
+# Auto-discover all subjects and cameras from CSV filenames and process three subjects in parallel
+python process_gaze_mask_alignment.py \
+  /path/to/gaze_world_data \
+  /path/to/segmentation_masks \
+  /path/to/output_dir \
+  --num-workers <e.g. 3>
+
+# Remove gaze points during blinks
+python process_gaze_mask_alignment.py \
+  /path/to/gaze_world_data \
+  /path/to/segmentation_masks \
+  /path/to/output_dir \
+  --subject-id 27 \
+  --camera-id child \
+  --blink-dir /path/to/blink_data
+
+# Restrict method-figure plots to a time window
+python process_gaze_mask_alignment.py \
+  /path/to/gaze_world_data \
+  /path/to/segmentation_masks \
+  /path/to/output_dir \
+  --subject-id 27 --camera-id child \
+  --start-plot-time 10.0 --end-plot-time 60.0
+```
+### `process_gaze_mask_alignment.py` Options
+
+| Option | Description |
+|--------|-------------|
+| `gaze_world_dir` | Directory with `{subject}_{camera}_gaze.csv` and `{subject}_{camera}_world_timestamps.csv` |
+| `mask_dir` | Directory with `{subject}/{camera}/masks/` or `{subject}_{camera}/masks/` subfolders |
+| `output_dir` | Directory to save output files |
+| `--subject-id` | Subject ID(s), e.g. `27` or `27,28`. Auto-discovered if omitted. |
+| `--camera-id` | Camera ID(s), e.g. `child` or `child,parent`. Auto-discovered if omitted. |
+| `--blink-dir` | Directory with `{subject}_{camera}_blinks.csv` files for blink labeling/removal |
+| `--log-path` | Path for the log file (default: `{output_dir}/gaze_object.log`) |
+| `--ignore-object-list`| optional txt file with object mask labels to ignore, one per line. Entries can be object names like toy_bags, ids like id29, numeric ids like 29, or exact mask filenames. |
+| `--skip-figures` |Skip trajectory and confidence heatmap figure generation. |
+| `--start-plot-time` | Start time in seconds for method-figure plots (optional) |
+| `--end-plot-time` | End time in seconds for method-figure plots (optional) |
+| `--num-workers`| Number of subject-camera pairs to process in parallel. Use 1 for sequential processing.'|
+
+
+### Required Data Structure
+
+**File Naming**:
 - **Gaze/world-camera directory** containing files named like `{subject_id}_{camera}_gaze.csv` and `{subject_id}_{camera}_world_timestamps.csv`
 - **Segmentation mask directory** containing folders named like `{subject_id}/{camera}/masks/` (or legacy `{subject_id}_{camera}/masks/`)
 - **Output directory** for gaze-target annotation results
-
-**Optional inputs**:
 - **Blink directory** containing `{subject_id}_{camera}_blinks.csv` files if you want to label or remove gaze points during blinks
 
 **Expected CSV structure**:
@@ -172,63 +226,7 @@ blink id,start timestamp [ns],end timestamp [ns]
 1,1001000000,1001200000
 ```
 
-**Usage**:
-```bash
-# Process one subject/camera pair
-python process_gaze_mask_alignment.py \
-  /path/to/gaze_world_data \
-  /path/to/segmentation_masks \
-  /path/to/output_dir \
-  --subject-id 27 \
-  --camera-id child
-
-# Process multiple subjects and cameras in one run
-python process_gaze_mask_alignment.py \
-  /path/to/gaze_world_data \
-  /path/to/segmentation_masks \
-  /path/to/output_dir \
-  --subject-id 27,28 \
-  --camera-id child,parent
-
-# Auto-discover all subjects and cameras from CSV filenames
-python process_gaze_mask_alignment.py \
-  /path/to/gaze_world_data \
-  /path/to/segmentation_masks \
-  /path/to/output_dir
-
-# Remove gaze points during blinks
-python process_gaze_mask_alignment.py \
-  /path/to/gaze_world_data \
-  /path/to/segmentation_masks \
-  /path/to/output_dir \
-  --subject-id 27 \
-  --camera-id child \
-  --blink-dir /path/to/blink_data
-
-# Restrict method-figure plots to a time window
-python process_gaze_mask_alignment.py \
-  /path/to/gaze_world_data \
-  /path/to/segmentation_masks \
-  /path/to/output_dir \
-  --subject-id 27 --camera-id child \
-  --start-plot-time 10.0 --end-plot-time 60.0
-```
-
-### `process_gaze_mask_alignment.py` Options
-
-| Option | Description |
-|--------|-------------|
-| `gaze_world_dir` | Directory with `{subject}_{camera}_gaze.csv` and `{subject}_{camera}_world_timestamps.csv` |
-| `mask_dir` | Directory with `{subject}/{camera}/masks/` or `{subject}_{camera}/masks/` subfolders |
-| `output_dir` | Directory to save output files |
-| `--subject-id` | Subject ID(s), e.g. `27` or `27,28`. Auto-discovered if omitted. |
-| `--camera-id` | Camera ID(s), e.g. `child` or `child,parent`. Auto-discovered if omitted. |
-| `--blink-dir` | Directory with `{subject}_{camera}_blinks.csv` files for blink labeling/removal |
-| `--log-path` | Path for the log file (default: `{output_dir}/gaze_object.log`) |
-| `--start-plot-time` | Start time in seconds for method-figure plots (optional) |
-| `--end-plot-time` | End time in seconds for method-figure plots (optional) |
-
-**Output files**:
+**Outputs**:
 - **`output_dir/{subject_id}_gazed_object/{subject_id}_{camera}_gazed_object.csv`** - Gaze samples with assigned object labels and confidence
 - **`output_dir/{subject_id}_gazed_object/{subject_id}_{camera}_gaze_object_probabilities.pkl`** - Per-gaze probabilities for all available masks
 - **`output_dir/{subject_id}_gazed_object/{subject_id}_{camera}_gaze_blink_labeled.csv`** - Blink-labeled gaze data when `--blink-dir` is used
@@ -236,7 +234,7 @@ python process_gaze_mask_alignment.py \
 - **`output_dir/{subject_id}_gazed_object/figures/`** - Trajectory plots and confidence heatmaps (PNG and PDF)
 - **`output_dir/gaze_object.log`** - Processing log (or path set by `--log-path`)
 
-The main output CSV keeps the original gaze columns and any extra gaze metadata, then adds the alignment/object-assignment fields below:
+The main output CSV keeps the original gaze columns and any extra gaze metadata, then adds the alignment/object-assignment columns below:
 - `frame_idx`: world-camera frame index matched to the gaze sample
 - `frame_timestamp`: timestamp of the matched world-camera frame
 - `in_blink`: added only when `--blink-dir` is used
@@ -244,15 +242,6 @@ The main output CSV keeps the original gaze columns and any extra gaze metadata,
 - `gazed_object_id`: mask/object ID parsed from the exported mask filename
 - `gazed_object`: object label parsed from the exported mask filename
 - `gazed_object_confidence`: fraction of pixels inside the 20 px gaze-radius circle that overlap the winning object mask
-
-## Output Files
-
-After processing, you'll get:
-
-- **`output_dir/masks/`** - Individual mask images (PNG files)
-- **`output_dir/segmented_video.mp4`** - Video with colored mask overlays
-- **`output_dir/processing_metadata.json`** - Processing statistics
-- **`output_dir/{subject_id}_gazed_object/`** - Gaze-target annotation outputs generated from segmentation masks
 
 ## SAM3 Support (Optional)
 
