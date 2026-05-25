@@ -189,6 +189,13 @@ python process_gaze_mask_alignment.py \
 | `--end-plot-time` | End time in seconds for method-figure plots (optional) |
 | `--num-workers`| Number of subject-camera pairs to process in parallel. Use 1 for sequential processing.'|
 
+**Outputs**:
+- **`output_dir/{subject_id}_gazed_object/{subject_id}_{camera}_gazed_object.csv`** - Gaze samples with assigned object labels and confidence
+- **`output_dir/{subject_id}_gazed_object/{subject_id}_{camera}_gaze_object_probabilities.pkl`** - Per-gaze probabilities for all available masks
+- **`output_dir/{subject_id}_gazed_object/{subject_id}_{camera}_gaze_blink_labeled.csv`** - Blink-labeled gaze data when `--blink-dir` is used
+- **`output_dir/{subject_id}_gazed_object/{subject_id}_{camera}_gaze_blink_removed.csv`** - Blink-removed gaze data when `--blink-dir` is used
+- **`output_dir/{subject_id}_gazed_object/figures/`** - Trajectory plots and confidence heatmaps (PNG and PDF)
+- **`output_dir/gaze_object.log`** - Processing log (or path set by `--log-path`)
 
 ### Required Data Structure
 
@@ -225,14 +232,6 @@ blink id,start timestamp [ns],end timestamp [ns]
 0,1000200000,1000400000
 1,1001000000,1001200000
 ```
-
-**Outputs**:
-- **`output_dir/{subject_id}_gazed_object/{subject_id}_{camera}_gazed_object.csv`** - Gaze samples with assigned object labels and confidence
-- **`output_dir/{subject_id}_gazed_object/{subject_id}_{camera}_gaze_object_probabilities.pkl`** - Per-gaze probabilities for all available masks
-- **`output_dir/{subject_id}_gazed_object/{subject_id}_{camera}_gaze_blink_labeled.csv`** - Blink-labeled gaze data when `--blink-dir` is used
-- **`output_dir/{subject_id}_gazed_object/{subject_id}_{camera}_gaze_blink_removed.csv`** - Blink-removed gaze data when `--blink-dir` is used
-- **`output_dir/{subject_id}_gazed_object/figures/`** - Trajectory plots and confidence heatmaps (PNG and PDF)
-- **`output_dir/gaze_object.log`** - Processing log (or path set by `--log-path`)
 
 The main output CSV keeps the original gaze columns and any extra gaze metadata, then adds the alignment/object-assignment columns below:
 - `frame_idx`: world-camera frame index matched to the gaze sample
