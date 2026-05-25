@@ -33,7 +33,7 @@ source sam_env/bin/activate  # Linux/Mac
 sam_env\Scripts\activate  # Windows
 ```
 
-### 1. Setup Script (`install.py`)
+### Setup Script (`install.py`)
 
 **Purpose**: Automatically install SAM2, dependencies, and model checkpoints
 
@@ -61,7 +61,7 @@ During setup, you'll be prompted to choose which model checkpoints to download:
 
 Only models whose checkpoints are downloaded will be available at runtime.
 
-## 2. Using the SAM2 Video UI (`sam2_ui.py`)
+## 1. Using the SAM2 Video UI (`sam2_ui.py`)
 
 ### Launch the App
 ```bash
@@ -91,7 +91,7 @@ For videos longer than a few hundred frames, using the processing script is reco
 3. Add or adjust annotation points and re-segment the frame to verify
 4. Re-export the updated annotations and re-run the processing script, or run segmentation in refinement mode for a range of frames within UI
 
-## 3. Processing Script (`process_annotations.py`)
+## 2. Processing Script (`process_annotations.py`)
 
 **Purpose**: Process annotation JSON from SAM2 Video UI to generate segmented video and masks
 
@@ -134,7 +134,7 @@ python process_annotations.py annotations.json video.mp4 \
 | `--offload-to-cpu` | Offload video frames to CPU to reduce GPU memory usage | — |
 | `--frame-dir` | Persistent directory for extracted frames (avoids re-extraction) | temp dir |
 
-## 4. Gaze-Target Annotation with Segmented Results (`process_gaze_mask_alignment.py`)
+## 3. Gaze-Target Annotation with Segmented Results (`process_gaze_mask_alignment.py`)
 
 **Purpose**: Use exported segmentation masks together with gaze and world-camera timestamps to assign each gaze sample to the most likely object.
 
