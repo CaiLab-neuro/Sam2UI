@@ -230,6 +230,9 @@ def patch_sam3_modules_for_device(device: str):
     _patch_sam3_tracker_predictor()
     _patch_sam3_tracker_base()
 
+    # Patch 8: SAM3.1 multiplex model (VideoTrackingDynamicMultiplex.init_state)
+    _patch_sam3_multiplex_init_state(device)
+
     print(f"  [SAM3] All modules patched for device: {device}")
 
 
@@ -836,6 +839,47 @@ def _patch_sam3_tracker_base():
     print("  [patch_sam3_for_device] Patched Sam3TrackerBase._prepare_memory_conditioned_features")
 
 
+def _patch_sam3_multiplex_init_state(device: str):
+    """Patch VideoTrackingMultiplexDemo._get_image_feature to use the target device.
+
+    _get_image_feature hardcodes .cuda() on the raw image tensor. We replace
+    it with .to(inference_state["device"]).
+
+    The inference_state device fields themselves are fixed in segment.py after
+    calling VideoTrackingMultiplexDemo.init_state() directly (necessary because
+    Sam3VideoTrackingMultiplexDemo.init_state — what the builder returns — does not
+    accept a video_path at all and is meant for pre-computed feature caching).
+    """
+    try:
+        from sam3.model.video_tracking_multiplex_demo import VideoTrackingMultiplexDemo
+    except ImportError:
+        return  # SAM3.1 not installed
+
+    if hasattr(VideoTrackingMultiplexDemo, '_get_image_feature_device_patched'):
+        return
+
+    def patched_get_image_feature(self, inference_state, frame_idx, batch_size):
+        image, backbone_out = inference_state["cached_features"].get(frame_idx, (None, None))
+        if backbone_out is None:
+            # PATCHED: use inference_state["device"] instead of hardcoded .cuda()
+            dev = inference_state.get("device", torch.device("cuda"))
+            image = inference_state["images"][frame_idx].to(dev).float().unsqueeze(0)
+            from sam3.model.data_misc import NestedTensor
+            backbone_out = self.forward_image(
+                NestedTensor(tensors=image, mask=None),
+                need_sam3_out=False,  # SAM3 detector outputs are top-level tensors that break the cloning loop; tracking only needs interactive + sam2_backbone_out
+                need_interactive_out=True,
+                need_propagation_out=True,
+            )
+            inference_state["cached_features"] = {frame_idx: (image, backbone_out)}
+        features = self._prepare_backbone_features(backbone_out)
+        return image, features
+
+    VideoTrackingMultiplexDemo._get_image_feature = patched_get_image_feature
+    VideoTrackingMultiplexDemo._get_image_feature_device_patched = True
+    print("  [patch_sam3_for_device] Patched VideoTrackingMultiplexDemo._get_image_feature")
+
+
 # =============================================================================
 # Mask Filename Utilities
 # =============================================================================
@@ -977,8 +1021,68 @@ def load_mask(
                 mask_path_fallback = os.path.join(mask_dir, filename)
                 return cv2.imread(mask_path_fallback, cv2.IMREAD_GRAYSCALE)
 
+    # Try 4: NPZ bundle (masks_f{frame:06d}.npz with a key matching the object id)
+    npz_path = os.path.join(mask_dir, f"masks_f{frame_idx:06d}.npz")
+    if os.path.exists(npz_path):
+        try:
+            data = np.load(npz_path)
+            for key in data.files:
+                m = re.match(rf'mask_f{frame_idx:06d}_(.+)_id{obj_id}$', key)
+                if m:
+                    return (data[key] > 0).astype(np.uint8) * 255
+        except Exception:
+            pass
+
     print(f"WARNING: Mask file not found for frame {frame_idx}, obj {obj_id}")
     return None
+
+
+def load_all_masks_for_frame(
+    mask_dir: str,
+    frame_idx: int,
+) -> List[Tuple[int, str, np.ndarray]]:
+    """
+    Load every object mask for one frame, merging PNG files and NPZ bundle.
+
+    PNG takes priority over NPZ when both contain the same object ID.
+    Returns a list of (obj_id, obj_name, mask_uint8) tuples where mask_uint8 is
+    a (H, W) uint8 array with values 0 or 255.
+    """
+    mask_dir_path = Path(mask_dir)
+    # Use dict keyed by obj_id so PNG can override NPZ on collision
+    results: dict[int, Tuple[str, np.ndarray]] = {}
+
+    # --- PNG files ---
+    png_files = sorted(mask_dir_path.glob(f"mask_f{frame_idx:06d}_*.png"))
+    for mask_file in png_files:
+        parsed = parse_mask_filename(mask_file.name)
+        if parsed is None:
+            continue
+        _, obj_name, obj_id = parsed
+        mask = cv2.imread(str(mask_file), cv2.IMREAD_GRAYSCALE)
+        if mask is not None:
+            results[obj_id] = (obj_name, mask)
+
+    # --- NPZ bundle (adds objects not found as PNG) ---
+    npz_path = mask_dir_path / f"masks_f{frame_idx:06d}.npz"
+    if npz_path.exists():
+        _npz_key_pat = re.compile(r"^mask_f(\d{6})_(.+)_id(\d+)$")
+        try:
+            data = np.load(str(npz_path))
+            for key in data.files:
+                m = _npz_key_pat.match(key)
+                if not m:
+                    continue
+                obj_id = int(m.group(3))
+                if obj_id in results:
+                    continue  # PNG already loaded — PNG wins
+                obj_name = m.group(2)
+                arr = (data[key] > 0).astype(np.uint8) * 255
+                results[obj_id] = (obj_name, arr)
+        except Exception:
+            pass
+
+    return [(oid, oname, mask) for oid, (oname, mask) in results.items()]
 
 
 def export_mask_to_disk(
@@ -2206,9 +2310,17 @@ def export_video_from_dict(
             return result
 
         for obj_id, mask_data in masks_by_frame[frame_idx].items():
-            # Load mask from disk
+            # Load mask from disk (PNG or compressed NPZ bundle)
             mask_path = masks_dir / mask_data['filename']
-            mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+            if mask_data['filename'].endswith('.npz'):
+                try:
+                    npz_data = np.load(str(mask_path))
+                    npz_key = mask_data.get('npz_key', '')
+                    mask = (npz_data[npz_key] > 0).astype(np.uint8) * 255 if npz_key in npz_data.files else None
+                except Exception:
+                    mask = None
+            else:
+                mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
             if mask is None:
                 print(f"WARNING: Could not load mask: {mask_path}")
                 continue

@@ -23,9 +23,15 @@ Examples:
 
 import os
 import sys
+
+# Reduce GPU memory fragmentation — set before any torch import
+if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 import json
 import time
 import argparse
+import re
 import tempfile
 import shutil
 from pathlib import Path
@@ -35,6 +41,8 @@ import torch
 from PIL import Image
 
 import psutil
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 # Import lazy loader BEFORE importing SAM2
 from sam_lazy_loader import enable_lazy_loading
@@ -85,6 +93,52 @@ def _check_sam3_available():
         return False
 
 SAM3_AVAILABLE = _check_sam3_available()
+
+
+def _write_png_batch(write_tasks, sem):
+    """Write a list of (path, uint8_array) pairs to PNG files, then release semaphore."""
+    try:
+        for path, arr in write_tasks:
+            cv2.imwrite(str(path), arr)
+    finally:
+        sem.release()
+
+
+def _write_npz_frame(path, arrays, sem):
+    """Write all masks for one frame to a compressed NPZ file, then release semaphore."""
+    try:
+        np.savez_compressed(str(path), **arrays)
+    finally:
+        sem.release()
+
+
+def _write_npz_frame_merging_unchanged(path, new_arrays, unchanged_ids, key_pattern, sem):
+    """
+    Write an NPZ frame bundle, preserving any pre-existing keys that belong to
+    unchanged objects (identified by obj-id parsed from the key name).
+
+    This is the streaming alternative to pre-loading: we read the old file
+    immediately before overwriting it, so only one frame's data is ever in RAM
+    at a time.  Safe to call from a background thread as long as no other thread
+    touches the same path concurrently (guaranteed by shutting down the write
+    pool between forward and backward passes).
+    """
+    try:
+        merged = {}
+        if path.exists():
+            try:
+                old = np.load(str(path))
+                for k in old.files:
+                    m = key_pattern.match(k)
+                    if m and int(m.group(3)) in unchanged_ids:
+                        merged[k] = old[k]
+            except Exception:
+                pass
+        merged.update(new_arrays)          # updated-object keys always win
+        np.savez_compressed(str(path), **merged)
+    finally:
+        sem.release()
+
 
 # Model configuration mappings
 # NOTE: Config paths are absolute filesystem paths to sam_models/sam2/sam2/configs/
@@ -242,7 +296,7 @@ class ConsoleProgressCallback:
 
 
 class SAM2Processor:
-    def __init__(self, config_file=None, checkpoint_file=None, model_name="sam2.1-base+", offload_to_cpu=False, async_loading=False, smooth_masks=False, use_bfloat16=False, device=None, frame_format="jpg", exclusive_masks=False):
+    def __init__(self, config_file=None, checkpoint_file=None, model_name="sam2.1-base+", offload_to_cpu=False, async_loading=False, smooth_masks=False, device=None, frame_format="jpg", exclusive_masks=False, mask_format="png", vos_optimized=False):
         """
         Initialize SAM2 Processor
 
@@ -253,12 +307,17 @@ class SAM2Processor:
             offload_to_cpu: Use SAM2's CPU offloading for memory optimization
             async_loading: Use async frame loading (experimental, may reduce memory)
             smooth_masks: Apply morphological smoothing to reduce pixelation in masks
-            use_bfloat16: Use BFloat16 precision for faster inference (requires compatible GPU)
             device: Device to use (e.g., 'cpu', 'cuda', 'cuda:0', 'cuda:1'). If None, auto-detect.
             frame_format: Format for extracted frames ("jpg" or "png")
+            vos_optimized: Use torch.compile on SAM2's core components for faster propagation.
+                The first run will be very slow (5-30 min) while kernels are compiled and cached.
+                Subsequent videos in the same process reuse the cache and run faster.
+                Only useful for SAM2 batch jobs processing many videos; ignored for SAM3.
+                Requires PyTorch 2.5.1+. (default: False)
         """
         # Store model name for detection
         self.model_name = model_name
+        self.vos_optimized = vos_optimized
 
         # Check if SAM3 was requested but is not available
         if model_name == "sam3" and not SAM3_AVAILABLE:
@@ -287,7 +346,7 @@ class SAM2Processor:
         else:
             raise ValueError(f"Unknown model name: {model_name}. Available: {list(MODEL_CONFIGS.keys())}")
 
-        # Validate paths exist (skip config validation for SAM3)
+        # Validate paths exist (skip config validation for SAM3 — config is bundled in the package)
         if self.model_name != "sam3" and self.config_file and not os.path.exists(self.config_file):
             raise FileNotFoundError(f"Config file not found: {self.config_file}")
 
@@ -304,12 +363,12 @@ class SAM2Processor:
         self.offload_to_cpu = offload_to_cpu
         self.async_loading = async_loading
         self.smooth_masks = smooth_masks
-        self.use_bfloat16 = use_bfloat16
         self.no_backward_propagation = False  # Will be set from command line args
         self.exclusive_masks = exclusive_masks  # Winner-takes-all per pixel
         self.requested_device = device  # User-requested device (None = auto-detect)
         self.device = None  # Will be set after loading model
         self.frame_format = frame_format  # Format for extracted frames
+        self.mask_format = mask_format  # Output format for masks: "png" or "npz"
 
     @property
     def use_sam3(self):
@@ -351,41 +410,47 @@ class SAM2Processor:
                 # Determine GPU ID for TF32 check
                 gpu_id = 0 if device == "cuda" else int(device.split(":")[1])
 
+                # Set default CUDA device so internal SAM2 ops that don't specify
+                # a device (e.g. position encoding warmup, freqs_cis) land on the
+                # correct GPU instead of defaulting to cuda:0, which would cause
+                # CUDA illegal memory access errors when mixing tensors across devices.
+                torch.cuda.set_device(gpu_id)
+
                 # Enable TF32 for Ampere GPUs (RTX 30xx+, A100) for better performance
                 if torch.cuda.get_device_properties(gpu_id).major >= 8:
                     torch.backends.cuda.matmul.allow_tf32 = True
                     torch.backends.cudnn.allow_tf32 = True
                     print("  TensorFloat32 (TF32) enabled for Ampere GPU")
 
-                if self.use_bfloat16:
-                    # CRITICAL: Enable GLOBAL autocast before any SAM2/SAM3 operations
-                    # This stays active for entire program to handle bfloat16 memory features
-                    torch.autocast(device_type="cuda", dtype=torch.bfloat16).__enter__()
-                    print("  BFloat16 mode: GLOBAL autocast enabled")
-                    print("  Model weights remain in float32 (checkpoint dtype)")
-                else:
-                    print("  Float32 mode: native precision (no autocast)")
+                # Both SAM2 and SAM3/SAM3.1 unconditionally store maskmem_features in
+                # bfloat16 internally. Global autocast is required so that all other
+                # operations also run in bfloat16, avoiding "BFloat16 vs Float" matmul
+                # errors during propagation. The --use-bfloat16 flag is now a no-op on
+                # CUDA (autocast is always enabled), but kept for backward compatibility.
+                torch.autocast(device_type="cuda", dtype=torch.bfloat16).__enter__()
+                print("  BFloat16 mode: GLOBAL autocast enabled")
+                print("  Model weights remain in float32 (checkpoint dtype)")
 
             # Load model based on type
             # Use context manager to prevent hardcoded CUDA allocations when using
             # CPU or a specific GPU other than cuda:0
             if self.use_sam3:
-                # SAM3 loading
+                # SAM3 / SAM3.1 loading
                 if not SAM3_AVAILABLE:
                     raise ImportError("SAM3 not available. Run setup.py to install.")
 
-                # IMPORTANT: Must patch SAM3 modules BEFORE importing build_sam3_video_model
+                # IMPORTANT: Must patch SAM3 modules BEFORE importing model builders
                 # because the import triggers the full module chain with hardcoded "cuda"
                 patch_sam3_modules_for_device(device)
 
                 from sam3.model_builder import build_sam3_video_model
-
                 print("  Building SAM3 model ...")
-
+                ckpt_path = self.checkpoint_file
                 # Build SAM3 model and extract tracker with SAM2-compatible API
-                # (Matches sam2_ui.py implementation)
-                sam3_model = build_sam3_video_model(device=device)
-
+                if ckpt_path and os.path.exists(ckpt_path):
+                    sam3_model = build_sam3_video_model(checkpoint_path=ckpt_path, device=device)
+                else:
+                    sam3_model = build_sam3_video_model(device=device)
                 # Extract the tracker component (has init_state, add_new_points, etc.)
                 self.video_predictor = sam3_model.tracker
                 # Attach backbone for feature extraction
@@ -403,14 +468,16 @@ class SAM2Processor:
                     with DisableCUDADuringInit():
                         self.video_predictor = build_sam2_video_predictor(
                             config_file=config_for_hydra,
-                            ckpt_path=self.checkpoint_file,  # Optional parameter
-                            device=device
+                            ckpt_path=self.checkpoint_file,
+                            device=device,
+                            vos_optimized=self.vos_optimized,
                         )
                 else:
                     self.video_predictor = build_sam2_video_predictor(
                         config_file=config_for_hydra,
-                        ckpt_path=self.checkpoint_file,  # Optional parameter
-                        device=device
+                        ckpt_path=self.checkpoint_file,
+                        device=device,
+                        vos_optimized=self.vos_optimized,
                     )
 
             print(f"OK: {model_type} model loaded successfully")
@@ -581,7 +648,7 @@ class SAM2Processor:
     #     """Process segmentation using SAM2"""
     #     return self.process_segmentation_full(video_path, annotations_data, output_dir, frame_dir=frame_dir)
 
-    def process_segmentation(self, video_path, annotations_data, output_dir, frame_dir=None, skip_quality_save=False):
+    def process_segmentation(self, video_path, annotations_data, output_dir, frame_dir=None, skip_quality_save=False, mask_format=None, unchanged_ids=None):
         """Process segmentation with streaming mask export to reduce memory usage"""
         print("Starting segmentation process (streaming export mode)...")
 
@@ -664,10 +731,10 @@ class SAM2Processor:
             # Build init_state parameters
             init_params = {'video_path': str(temp_dir)}
 
-            # Add offloading if configured
-            if hasattr(self, 'offload_to_cpu') and self.offload_to_cpu:
-                init_params['offload_video_to_cpu'] = True
-                init_params['offload_state_to_cpu'] = True
+            offload = bool(getattr(self, 'offload_to_cpu', False))
+            if offload:
+                init_params['offload_video_to_cpu'] = offload
+                init_params['offload_state_to_cpu'] = offload
                 print("  Using CPU offloading for memory optimization")
 
             # Add async loading if configured
@@ -675,17 +742,17 @@ class SAM2Processor:
                 init_params['async_loading_frames'] = True
                 print("  Using async frame loading (experimental)")
 
-            # Get device from the model
-            device = str(self.video_predictor.device)
+            # Get device from stored attribute (self.video_predictor.device works for SAM2 but
+            # SAM3's Sam3VideoTrackingMultiplexDemo doesn't expose .device on the module)
+            device = self.device or "cpu"
 
-            # No local autocast needed - global autocast was enabled in load_model() if using bfloat16
+            # No local autocast needed - global autocast is always enabled on CUDA in load_model()
             # (see benchmark.py line 20 for this pattern)
-            if device == "cuda" and self.use_bfloat16:
+            if device == "cuda":
                 autocast_mode = "BFloat16 (global autocast)"
             else:
-                autocast_mode = "Float32 (native)" if device == "cuda" else "CPU"
+                autocast_mode = "CPU"
 
-            # No 'with autocast_context' wrapper needed - global autocast already active
             inference_state = self.video_predictor.init_state(**init_params)
             num_frames = inference_state["num_frames"]
 
@@ -715,65 +782,69 @@ class SAM2Processor:
 
             print(f"Processing {len(objects_with_annotations)} objects...")
 
-            # Add annotation points for each object
-            for obj_id, obj_frames in objects_with_annotations.items():
-                obj_name = object_names.get(str(obj_id), f"Object_{obj_id}")
-                print(f"\nProcessing {obj_name} (ID: {obj_id})...")
+            # Build flat (frame_idx, obj_id, annotations) list for iteration.
+            _all_ann_tuples = [
+                (frame_idx, obj_id, annotations)
+                for obj_id, obj_frames in objects_with_annotations.items()
+                for frame_idx, annotations in sorted(obj_frames.items())
+            ]
 
-                for frame_idx, annotations in sorted(obj_frames.items()):
-                    if frame_idx >= num_frames:
-                        print(f"  WARNING: Skipping frame {frame_idx} (beyond video length)")
-                        continue
+            _last_obj_id = None
+            for frame_idx, obj_id, annotations in _all_ann_tuples:
+                if obj_id != _last_obj_id:
+                    obj_name = object_names.get(str(obj_id), f"Object_{obj_id}")
+                    print(f"\nProcessing {obj_name} (ID: {obj_id})...")
+                    _last_obj_id = obj_id
 
-                    points = []
-                    labels = []
+                if frame_idx >= num_frames:
+                    print(f"  WARNING: Skipping frame {frame_idx} (beyond video length)")
+                    continue
 
-                    for annotation in annotations:
-                        x, y = annotation["x"], annotation["y"]
-                        is_positive = annotation["is_positive"]
-                        points.append([x, y])
-                        labels.append(1 if is_positive else 0)
+                points = []
+                labels = []
 
-                    if not points:
-                        continue
+                for annotation in annotations:
+                    x, y = annotation["x"], annotation["y"]
+                    is_positive = annotation["is_positive"]
+                    points.append([x, y])
+                    labels.append(1 if is_positive else 0)
 
-                    # Convert points for SAM3 if needed
+                if not points:
+                    continue
+
+                print(f"  Frame {frame_idx}: {len(points)} points")
+
+                try:
                     if self.use_sam3:
-                        # SAM3 requires relative [0-1] coordinates
+                        # SAM3 (non-multiplex): direct add_new_points on tracker
                         rel_points = [[x / frame_width, y / frame_height] for x, y in points]
-                        points_np = np.array(rel_points, dtype=np.float32)
-                        print(f"    SAM3 coordinate conversion: Pixel {points[0]} → Relative [{rel_points[0][0]:.4f}, {rel_points[0][1]:.4f}]")
+                        points_t = torch.tensor(rel_points, dtype=torch.float32)
+                        labels_t = torch.tensor(labels, dtype=torch.int32)
+                        print(f"    SAM3 coord: pixel {points[0]} → rel [{rel_points[0][0]:.4f}, {rel_points[0][1]:.4f}]")
+                        _ = self.video_predictor.add_new_points(
+                            inference_state=inference_state,
+                            frame_idx=frame_idx,
+                            obj_id=obj_id,
+                            points=points_t,
+                            labels=labels_t,
+                        )
                     else:
-                        # SAM2 uses pixel coordinates
+                        # SAM2: pixel coordinates
                         points_np = np.array(points, dtype=np.float32)
+                        labels_np = np.array(labels, dtype=np.int32)
+                        _, out_obj_ids, out_mask_logits = self.video_predictor.add_new_points(
+                            inference_state=inference_state,
+                            frame_idx=frame_idx,
+                            obj_id=obj_id,
+                            points=points_np,
+                            labels=labels_np,
+                        )
+                except Exception as e:
+                    import traceback as _tb
+                    print(f"    WARNING: Error adding points: {e}")
+                    _tb.print_exc()
+                    continue
 
-                    labels_np = np.array(labels, dtype=np.int32)
-
-                    print(f"  Frame {frame_idx}: {len(points)} points")
-
-                    try:
-                        # SAM3 returns 4 values, SAM2 returns 3
-                        if self.use_sam3:
-                            _, out_obj_ids, low_res_masks, video_res_masks = self.video_predictor.add_new_points(
-                                inference_state=inference_state,
-                                frame_idx=frame_idx,
-                                obj_id=obj_id,
-                                points=points_np,
-                                labels=labels_np,
-                            )
-                        else:
-                            _, out_obj_ids, out_mask_logits = self.video_predictor.add_new_points(
-                                inference_state=inference_state,
-                                frame_idx=frame_idx,
-                                obj_id=obj_id,
-                                points=points_np,
-                                labels=labels_np,
-                            )
-                    except Exception as e:
-                        print(f"    WARNING: Error adding points: {e}")
-                        continue
-
-            
             # Create output directories for streaming export
             masks_dir = Path(output_dir) / "masks"
             masks_dir.mkdir(parents=True, exist_ok=True)
@@ -784,106 +855,138 @@ class SAM2Processor:
 
             masks_metadata = {}  # Only metadata, not actual mask arrays
 
+            # Async mask writer: GPU loop submits writes to a background thread so it never
+            # blocks on disk I/O.  A semaphore caps the number of in-flight frames to 8
+            # (~80 MB at 1080p × 5 objects) so memory stays bounded even when GPU >> disk.
+            _mask_format = mask_format if mask_format is not None else self.mask_format
+            _unchanged_ids = set(unchanged_ids) if unchanged_ids else set()
+            # Pre-compile the key pattern once; only needed for NPZ merge-write.
+            _npz_key_pat = re.compile(r"^mask_f(\d{6})_(.+)_id(\d+)$") if (_mask_format == "npz" and _unchanged_ids) else None
+            _write_pool = ThreadPoolExecutor(max_workers=2)
+            _io_sem = threading.Semaphore(8)
+            _write_futures = []
+
+            # Free any cached GPU memory before the propagation loop
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
             # CRITICAL: Nested autocast context to handle bfloat16 tensors from CPU offloading
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                # Construct propagation call based on model type
+                # Build forward propagation iterator
                 if self.use_sam3:
-                    # SAM3 requires explicit frame range
                     propagate_iterator = self.video_predictor.propagate_in_video(
                         inference_state,
-                        start_frame_idx=0,  # Start from beginning for full coverage
+                        start_frame_idx=0,
                         max_frame_num_to_track=num_frames,
                         reverse=False,
-                        propagate_preflight=True  # Consolidate points before propagation
+                        propagate_preflight=True,
                     )
                 else:
-                    # SAM2: Use default propagation (starts from annotation frames and goes forward)
-                    # Note: SAM2 doesn't support explicit start_frame_idx, so we rely on reverse=False
-                    # covering from annotations forward to end
                     propagate_iterator = self.video_predictor.propagate_in_video(
                         inference_state, reverse=False
                     )
 
                 for result in propagate_iterator:
-                    # Unpack based on model type (SAM3 returns 5 values, SAM2 returns 3)
+                    # Unpack result
                     if self.use_sam3:
                         out_frame_idx, out_obj_ids, out_low_res_masks, out_mask_logits, out_obj_scores = result
                     else:
                         out_frame_idx, out_obj_ids, out_mask_logits = result
+                        out_low_res_masks = None
+                        out_obj_scores = None
 
                     frame_masks = {}
-                    frame_masks_for_quality = {}  # For quality metrics calculation
+                    frame_masks_for_quality = {}
 
-                    # Exclusive masks: winner-takes-all per pixel.
-                    # Stack logits [N,1,H,W] → [N,H,W], prepend background (logit=0),
-                    # argmax gives winning object index (0 = background).
+                    # Exclusive masks: winner-takes-all per pixel
                     if self.exclusive_masks and len(out_obj_ids) > 0:
-                        _logits_2d = out_mask_logits.squeeze(1)  # [N, H, W]
+                        _logits_2d = out_mask_logits.squeeze(1)
                         _bg = torch.zeros(1, _logits_2d.shape[1], _logits_2d.shape[2],
                                           device=_logits_2d.device, dtype=_logits_2d.dtype)
-                        _all_logits = torch.cat([_bg, _logits_2d], dim=0)  # [N+1, H, W]
-                        _winners = torch.argmax(_all_logits, dim=0)  # [H, W]
+                        _all_logits = torch.cat([_bg, _logits_2d], dim=0)
+                        _winners = torch.argmax(_all_logits, dim=0)
                         del _logits_2d, _all_logits
                     else:
                         _winners = None
 
+                    _frame_png_writes = []
+                    _frame_npz_arrays = {}
+
+                    _n_masks = out_mask_logits.shape[0] if out_mask_logits is not None else 0
                     for i, obj_id in enumerate(out_obj_ids):
+                        if i >= _n_masks:
+                            continue
+                        # Extract mask
                         if _winners is not None:
                             mask = (_winners == i + 1).cpu().numpy()
                         else:
                             mask = (out_mask_logits[i] > 0.0).cpu().numpy().squeeze()
 
-                        # Get object info
                         obj_name = object_names.get(str(obj_id), f"Object_{obj_id}")
                         obj_color = object_colors.get(str(obj_id), [255, 0, 0])
-
-                        # Export mask to disk immediately (streaming export)
-                        mask_filename = f"mask_f{out_frame_idx:06d}_{obj_name}_id{obj_id}.png"
-                        mask_path = masks_dir / mask_filename
-                        cv2.imwrite(str(mask_path), (mask * 255).astype(np.uint8))
-
-                        # Store metadata only (no mask array!)
-                        score = out_obj_scores[i] if self.use_sam3 else 1.0
-                        frame_masks[obj_id] = {
-                            'filename': mask_filename,
-                            'score': float(score),
-                            'name': obj_name,
-                            'color': obj_color
-                        }
-
-                        # Store mask for quality metrics (as uint8 for efficiency)
-                        frame_masks_for_quality[obj_id] = (mask * 255).astype(np.uint8)
-
-                        # Explicitly delete mask array
+                        score = (float(out_obj_scores[i]) if out_obj_scores is not None else 1.0)
+                        mask_u8 = (mask * 255).astype(np.uint8)
                         del mask
 
+                        if _mask_format == "npz":
+                            _npz_key = f"mask_f{out_frame_idx:06d}_{obj_name}_id{obj_id}"
+                            _frame_npz_arrays[_npz_key] = mask_u8
+                            frame_masks[obj_id] = {
+                                'filename': f"masks_f{out_frame_idx:06d}.npz",
+                                'npz_key': _npz_key,
+                                'score': score,
+                                'name': obj_name,
+                                'color': obj_color,
+                            }
+                        else:
+                            mask_filename = f"mask_f{out_frame_idx:06d}_{obj_name}_id{obj_id}.png"
+                            _frame_png_writes.append((masks_dir / mask_filename, mask_u8))
+                            frame_masks[obj_id] = {
+                                'filename': mask_filename,
+                                'score': score,
+                                'name': obj_name,
+                                'color': obj_color,
+                            }
+
+                        frame_masks_for_quality[obj_id] = mask_u8
+
+                    _io_sem.acquire()
+                    if _mask_format == "npz":
+                        _npz_out = masks_dir / f"masks_f{out_frame_idx:06d}.npz"
+                        if _unchanged_ids:
+                            _write_futures.append(_write_pool.submit(
+                                _write_npz_frame_merging_unchanged,
+                                _npz_out, _frame_npz_arrays, _unchanged_ids, _npz_key_pat, _io_sem,
+                            ))
+                        else:
+                            _write_futures.append(_write_pool.submit(
+                                _write_npz_frame, _npz_out, _frame_npz_arrays, _io_sem,
+                            ))
+                    else:
+                        _write_futures.append(_write_pool.submit(
+                            _write_png_batch, _frame_png_writes, _io_sem
+                        ))
+
                     masks_metadata[out_frame_idx] = frame_masks
-
-                    # Update quality metrics incrementally during forward pass
                     quality_calculator.update_forward(out_frame_idx, frame_masks_for_quality)
-                    del frame_masks_for_quality  # Free memory after calculation
+                    del frame_masks_for_quality
 
-                    # CRITICAL: Delete ALL tensor variables to prevent memory accumulation
-                    # SAM3 returns 5 values, SAM2 returns 3 - delete all applicable tensors
+                    # Delete output tensors/arrays
                     if _winners is not None:
                         del _winners
-                    del out_mask_logits  # High-res masks (always present)
+                    if out_mask_logits is not None:
+                        del out_mask_logits
+                    if out_low_res_masks is not None:
+                        del out_low_res_masks
+                    if out_obj_scores is not None:
+                        del out_obj_scores
+                    del result
 
-                    if self.use_sam3:
-                        # SAM3-specific tensors that must be deleted
-                        del out_low_res_masks  # Low-res masks (can accumulate ~2-3MB per frame)
-                        del out_obj_scores     # Confidence scores
-                        del out_obj_ids        # Object ID tensor/list
-
-                    del result  # Delete the unpacked tuple itself
-
-                    # CRITICAL: Clean up old frames EVERY frame to prevent memory growth
-                    # This matches the UI behavior (sam2_ui.py:3799)
-                    # IMPORTANT: Pass reverse=False for forward propagation (delete frames behind, not ahead)
-                    self._cleanup_inference_state(inference_state, out_frame_idx, frames_to_keep=20, reverse=False, verbose=True)
+                    # SAM2/SAM3 only: clean up cached frames to bound memory
+                    if inference_state is not None:
+                        self._cleanup_inference_state(inference_state, out_frame_idx, frames_to_keep=20, reverse=False, verbose=True)
 
                     if (out_frame_idx + 1) % 50 == 0:
-                        # Monitor GPU and RAM usage
                         cuda_device_index = _get_cuda_device_index(device)
                         if cuda_device_index is not None:
                             gpu_allocated = torch.cuda.memory_allocated(device=cuda_device_index) / (1024**3)
@@ -893,20 +996,21 @@ class SAM2Processor:
                             gpu_peak = 0.0
                         process = psutil.Process()
                         ram_used = process.memory_info().rss / (1024**3)
-
                         print(f"  Forward: Frame {out_frame_idx + 1}/{num_frames} | "
                               f"GPU: {gpu_allocated:.2f}GB (peak: {gpu_peak:.2f}GB) | "
                               f"RAM: {ram_used:.2f}GB")
-
-                        # Verify tensors are deleted (should show NameError if properly deleted)
-                        if self.use_sam3:
-                            try:
-                                _ = out_low_res_masks
-                                print(f"  WARNING: out_low_res_masks still in scope!")
-                            except NameError:
-                                pass  # Expected - variable was deleted
-
                         torch.cuda.reset_peak_memory_stats()
+
+            # Always flush forward writes before starting the backward pass.
+            # Both passes write to the same per-frame files (forward and backward cover
+            # overlapping frame indices), so in-flight forward writes must complete before
+            # backward writes begin to avoid concurrent writes to the same path.
+            _write_pool.shutdown(wait=True)
+            for _wf in _write_futures:
+                _wf.result()
+            _write_futures.clear()
+            _write_pool = ThreadPoolExecutor(max_workers=2)
+            print("  Forward mask writes flushed.")
 
             # Propagate annotations - BACKWARD direction (last frame → 0)
             # IMPORTANT: Always propagate backward to ensure full video coverage from both directions
@@ -918,105 +1022,124 @@ class SAM2Processor:
             else:
                 print(f"\nPropagating annotations BACKWARD (frames {num_frames-1} to 0)...")
 
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    # Construct propagation call based on model type
+                    # Build backward propagation iterator
                     if self.use_sam3:
-                        # SAM3 requires explicit frame range for backward propagation
-                        propagate_iterator = self.video_predictor.propagate_in_video(
-                            inference_state,
-                            start_frame_idx=num_frames - 1,  # Start from end
-                            max_frame_num_to_track=num_frames,
-                            reverse=True,
-                            propagate_preflight=True
-                        )
-                    else:
-                        # SAM2: Need explicit frame range for backward propagation
                         propagate_iterator = self.video_predictor.propagate_in_video(
                             inference_state,
                             start_frame_idx=num_frames - 1,
                             max_frame_num_to_track=num_frames,
-                            reverse=True
+                            reverse=True,
+                            propagate_preflight=True,
+                        )
+                    else:
+                        propagate_iterator = self.video_predictor.propagate_in_video(
+                            inference_state,
+                            start_frame_idx=num_frames - 1,
+                            max_frame_num_to_track=num_frames,
+                            reverse=True,
                         )
 
                     for result in propagate_iterator:
-                        # Unpack based on model type
-                        # SAM3 returns 5 values for BOTH forward and backward
-                        # SAM2 returns 3 values
+                        # Unpack result
                         if self.use_sam3:
                             out_frame_idx, out_obj_ids, out_low_res_masks, out_mask_logits, out_obj_scores = result
                         else:
                             out_frame_idx, out_obj_ids, out_mask_logits = result
+                            out_low_res_masks = None
+                            out_obj_scores = None
 
                         frame_masks = {}
-                        frame_masks_for_quality = {}  # For quality metrics calculation
+                        frame_masks_for_quality = {}
 
-                        # Exclusive masks: winner-takes-all per pixel.
                         if self.exclusive_masks and len(out_obj_ids) > 0:
-                            _logits_2d = out_mask_logits.squeeze(1)  # [N, H, W]
+                            _logits_2d = out_mask_logits.squeeze(1)
                             _bg = torch.zeros(1, _logits_2d.shape[1], _logits_2d.shape[2],
                                               device=_logits_2d.device, dtype=_logits_2d.dtype)
-                            _all_logits = torch.cat([_bg, _logits_2d], dim=0)  # [N+1, H, W]
-                            _winners = torch.argmax(_all_logits, dim=0)  # [H, W]
+                            _all_logits = torch.cat([_bg, _logits_2d], dim=0)
+                            _winners = torch.argmax(_all_logits, dim=0)
                             del _logits_2d, _all_logits
                         else:
                             _winners = None
 
+                        _frame_png_writes = []
+                        _frame_npz_arrays = {}
+
+                        _n_masks = out_mask_logits.shape[0] if out_mask_logits is not None else 0
                         for i, obj_id in enumerate(out_obj_ids):
+                            if i >= _n_masks:
+                                continue
                             if _winners is not None:
                                 mask = (_winners == i + 1).cpu().numpy()
                             else:
                                 mask = (out_mask_logits[i] > 0.0).cpu().numpy().squeeze()
 
-                            # Get object info
                             obj_name = object_names.get(str(obj_id), f"Object_{obj_id}")
                             obj_color = object_colors.get(str(obj_id), [255, 0, 0])
-
-                            # Export mask to disk immediately
-                            mask_filename = f"mask_f{out_frame_idx:06d}_{obj_name}_id{obj_id}.png"
-                            mask_path = masks_dir / mask_filename
-                            cv2.imwrite(str(mask_path), (mask * 255).astype(np.uint8))
-
-                            # Store metadata with confidence score for SAM3
-                            score = out_obj_scores[i].item() if self.use_sam3 else 1.0
-                            frame_masks[obj_id] = {
-                                'filename': mask_filename,
-                                'score': float(score),
-                                'name': obj_name,
-                                'color': obj_color
-                            }
-
-                            # Store mask for quality metrics (as uint8 for efficiency)
-                            frame_masks_for_quality[obj_id] = (mask * 255).astype(np.uint8)
-
+                            score = (float(out_obj_scores[i]) if out_obj_scores is not None else 1.0)
+                            mask_u8 = (mask * 255).astype(np.uint8)
                             del mask
 
+                            if _mask_format == "npz":
+                                _npz_key = f"mask_f{out_frame_idx:06d}_{obj_name}_id{obj_id}"
+                                _frame_npz_arrays[_npz_key] = mask_u8
+                                frame_masks[obj_id] = {
+                                    'filename': f"masks_f{out_frame_idx:06d}.npz",
+                                    'npz_key': _npz_key,
+                                    'score': score,
+                                    'name': obj_name,
+                                    'color': obj_color,
+                                }
+                            else:
+                                mask_filename = f"mask_f{out_frame_idx:06d}_{obj_name}_id{obj_id}.png"
+                                _frame_png_writes.append((masks_dir / mask_filename, mask_u8))
+                                frame_masks[obj_id] = {
+                                    'filename': mask_filename,
+                                    'score': score,
+                                    'name': obj_name,
+                                    'color': obj_color,
+                                }
+
+                            frame_masks_for_quality[obj_id] = mask_u8
+
+                        _io_sem.acquire()
+                        if _mask_format == "npz":
+                            _npz_out = masks_dir / f"masks_f{out_frame_idx:06d}.npz"
+                            if _unchanged_ids:
+                                _write_futures.append(_write_pool.submit(
+                                    _write_npz_frame_merging_unchanged,
+                                    _npz_out, _frame_npz_arrays, _unchanged_ids, _npz_key_pat, _io_sem,
+                                ))
+                            else:
+                                _write_futures.append(_write_pool.submit(
+                                    _write_npz_frame, _npz_out, _frame_npz_arrays, _io_sem,
+                                ))
+                        else:
+                            _write_futures.append(_write_pool.submit(
+                                _write_png_batch, _frame_png_writes, _io_sem
+                            ))
+
                         masks_metadata[out_frame_idx] = frame_masks
-
-                        # Update quality metrics incrementally during backward pass
                         quality_calculator.update_backward(out_frame_idx, frame_masks_for_quality)
-                        del frame_masks_for_quality  # Free memory after calculation
+                        del frame_masks_for_quality
 
-                        # CRITICAL: Delete ALL tensor variables to prevent memory accumulation
-                        # SAM3 returns 5 values, SAM2 returns 3 - delete all applicable tensors
                         if _winners is not None:
                             del _winners
-                        del out_mask_logits  # High-res masks (always present)
+                        if out_mask_logits is not None:
+                            del out_mask_logits
+                        if out_low_res_masks is not None:
+                            del out_low_res_masks
+                        if out_obj_scores is not None:
+                            del out_obj_scores
+                        del result
 
-                        if self.use_sam3:
-                            # SAM3-specific tensors that must be deleted
-                            del out_low_res_masks  # Low-res masks (can accumulate ~2-3MB per frame)
-                            del out_obj_scores     # Confidence scores
-                            del out_obj_ids        # Object ID tensor/list
-
-                        del result  # Delete the unpacked tuple itself
-
-                        # CRITICAL: Clean up old frames EVERY frame to prevent memory growth
-                        # This matches the UI behavior (sam2_ui.py:3799)
-                        # IMPORTANT: Pass reverse=True for backward propagation (delete frames ahead, not behind)
-                        self._cleanup_inference_state(inference_state, out_frame_idx, frames_to_keep=20, reverse=True, verbose=True)
+                        if inference_state is not None:
+                            self._cleanup_inference_state(inference_state, out_frame_idx, frames_to_keep=20, reverse=True, verbose=True)
 
                         if (out_frame_idx + 1) % 50 == 0:
-                            # Monitor GPU and RAM usage
                             cuda_device_index = _get_cuda_device_index(device)
                             if cuda_device_index is not None:
                                 gpu_allocated = torch.cuda.memory_allocated(device=cuda_device_index) / (1024**3)
@@ -1026,39 +1149,29 @@ class SAM2Processor:
                                 gpu_peak = 0.0
                             process = psutil.Process()
                             ram_used = process.memory_info().rss / (1024**3)
-
                             print(f"  Backward: Frame {out_frame_idx + 1}/{num_frames} | "
                                   f"GPU: {gpu_allocated:.2f}GB (peak: {gpu_peak:.2f}GB) | "
                                   f"RAM: {ram_used:.2f}GB")
-
-                            # Verify tensors are deleted (should show NameError if properly deleted)
-                            if self.use_sam3:
-                                try:
-                                    _ = out_low_res_masks
-                                    print(f"  WARNING: out_low_res_masks still in scope!")
-                                except NameError:
-                                    pass  # Expected - variable was deleted
-
                             torch.cuda.reset_peak_memory_stats()
 
-            # Phase 2: Clear inference state frame outputs (safe after propagation)
+            # Flush all pending mask writes
+            _write_pool.shutdown(wait=True)
+            for _wf in _write_futures:
+                _wf.result()
+            print(f"  All mask writes complete ({len(_write_futures)} frames flushed).")
+
+            # Clean up inference state memory
             model_type = "SAM3" if self.use_sam3 else "SAM2"
             print(f"\nCleaning up {model_type} inference state...")
-
-            # Handle SAM3 structure (direct attribute access)
             if hasattr(inference_state, 'non_cond_frame_outputs'):
                 inference_state.non_cond_frame_outputs.clear()
-
-            # Handle SAM2 structure (per-object dict access)
             elif isinstance(inference_state, dict) and "output_dict_per_obj" in inference_state:
                 for obj_idx in range(len(inference_state.get("obj_ids", []))):
                     obj_output_dict = inference_state["output_dict_per_obj"][obj_idx]
-                    # Clear non-conditioning frames (keep conditioning for potential refinement)
-                    non_cond = obj_output_dict.get("non_cond_frame_outputs", {})
-                    non_cond.clear()
+                    obj_output_dict.get("non_cond_frame_outputs", {}).clear()
+            print(f"OK: Cleaned {model_type} memory")
 
             torch.cuda.empty_cache()
-            print(f"OK: Cleaned {model_type} memory")
 
             # Save quality metrics calculated during propagation
             # Skip saving when --only-updated is used with unchanged objects: the metrics here
@@ -1086,17 +1199,22 @@ class SAM2Processor:
             raise
     
     def export_masks(self, masks_by_frame, video_path, object_names, output_dir):
-        """Verify mask images (already exported during propagation)"""
-        print("Verifying mask images...")
+        """Verify mask files (already written during propagation)."""
+        print("Verifying mask files...")
 
         masks_dir = Path(output_dir) / "masks"
         verified_count = 0
         missing_count = 0
+        checked_files = set()  # NPZ files are shared across objects; only check each path once
 
         for frame_idx in sorted(masks_by_frame.keys()):
             frame_masks = masks_by_frame[frame_idx]
             for obj_id, mask_data in frame_masks.items():
                 mask_path = masks_dir / mask_data['filename']
+                if mask_path in checked_files:
+                    verified_count += 1  # already confirmed present
+                    continue
+                checked_files.add(mask_path)
                 if not mask_path.exists():
                     print(f"WARNING: Missing mask file: {mask_path}")
                     missing_count += 1
@@ -1104,8 +1222,8 @@ class SAM2Processor:
                     verified_count += 1
 
         if missing_count > 0:
-            print(f"WARNING: {missing_count} mask files are missing!")
-        print(f"OK: Verified {verified_count} mask files in {masks_dir}")
+            print(f"WARNING: {missing_count} mask entries are missing!")
+        print(f"OK: Verified {verified_count} mask entries in {masks_dir}")
         return verified_count
 
     def export_metadata(self, annotations_data, masks_by_frame, output_dir, num_frames=None, video_path=None, overlay_opacity=0.4):
@@ -1164,31 +1282,52 @@ class SAM2Processor:
 def _load_masks_metadata(masks_dir: Path, obj_ids=None):
     """
     Scan a masks directory and return metadata dicts keyed by frame_idx.
-    Filename pattern: mask_f{frame:06d}_{name}_id{obj_id}.png
+    Supports both PNG (mask_f{frame:06d}_{name}_id{obj_id}.png) and
+    NPZ bundles (masks_f{frame:06d}.npz with matching keys inside).
 
     Returns: (masks_by_frame, object_names_by_id)
     """
-    import re
-    pattern = re.compile(r"^mask_f(\d{6})_(.+)_id(\d+)\.png$")
+    png_pattern = re.compile(r"^mask_f(\d{6})_(.+)_id(\d+)\.png$")
+    npz_key_pattern = re.compile(r"^mask_f(\d{6})_(.+)_id(\d+)$")
     masks_by_frame = {}
     object_names_found = {}
 
     if not masks_dir.exists():
         return masks_by_frame, object_names_found
 
+    # Scan individual PNG files
     for filepath in sorted(masks_dir.glob("mask_f*.png")):
-        m = pattern.match(filepath.name)
+        m = png_pattern.match(filepath.name)
         if not m:
             continue
         frame_idx = int(m.group(1))
         obj_name = m.group(2)
         obj_id = int(m.group(3))
-
         if obj_ids is not None and obj_id not in obj_ids:
             continue
-
         masks_by_frame.setdefault(frame_idx, {})[obj_id] = {"filename": filepath.name}
         object_names_found[obj_id] = obj_name
+
+    # Scan NPZ bundles (masks_f{frame:06d}.npz)
+    for filepath in sorted(masks_dir.glob("masks_f*.npz")):
+        try:
+            data = np.load(str(filepath))
+            for key in data.files:
+                km = npz_key_pattern.match(key)
+                if not km:
+                    continue
+                frame_idx = int(km.group(1))
+                obj_name = km.group(2)
+                obj_id = int(km.group(3))
+                if obj_ids is not None and obj_id not in obj_ids:
+                    continue
+                masks_by_frame.setdefault(frame_idx, {})[obj_id] = {
+                    "filename": filepath.name,
+                    "npz_key": key,
+                }
+                object_names_found[obj_id] = obj_name
+        except Exception:
+            continue
 
     return masks_by_frame, object_names_found
 
@@ -1245,8 +1384,6 @@ Examples:
                        help="Use async frame loading (not much benefit. Just kept this feature as it is available)")
     parser.add_argument("--smooth-masks", action="store_true",
                        help="Apply morphological smoothing to reduce pixelation in exported masks (preserves binary masks)")
-    parser.add_argument("--use-bfloat16", action="store_true",
-                       help="Use BFloat16 mixed precision for faster inference and reduced memory usage (requires Ampere+ GPU with BFloat16 support, e.g., RTX 30xx+, A100). Uses torch.autocast following SAM2's official benchmark pattern.")
     parser.add_argument("--frame-dir", type=str, default=None,
                        help="Persistent directory for video frames (default: auto-generated in /tmp). If specified, frames will be reused from previous runs and not deleted after processing.")
     parser.add_argument("--frame-cache-size", type=int, default=20,
@@ -1265,6 +1402,15 @@ Examples:
                        help="Skip segmentation entirely; create/recreate the output video from existing masks in the output directory.")
     parser.add_argument("--exclusive-masks", action="store_true", dest="exclusive_masks",
                        help="Winner-takes-all per pixel: for each pixel, only the object with the highest logit is assigned (background wins if all logits < 0). Incompatible with --only-updated.")
+    parser.add_argument("--mask-format", type=str, default="png", choices=["png", "npz"],
+                       help="Output format for segmentation masks (default: png). Use 'npz' to write one compressed archive per frame (all objects bundled); ~3x faster to load in downstream tools, ~50%% smaller files on disk.")
+    parser.add_argument("--vos-optimized", action="store_true", dest="vos_optimized",
+                       help="Enable torch.compile on SAM2's core components for faster propagation. "
+                            "WARNING: the first run compiles and profiles GPU kernels, which takes 5-30 min. "
+                            "Subsequent videos in the same process reuse the compiled cache and run faster. "
+                            "Only useful for SAM2 batch jobs; ignored for SAM3. Requires PyTorch 2.5.1+.")
+    parser.add_argument("--overwrite", action="store_true",
+                       help="If the output directory has existing results, proceed without deleting them and overwrite on name conflicts (non-interactive).")
 
     args = parser.parse_args()
 
@@ -1315,46 +1461,52 @@ Examples:
 
         if args.only_updated or args.video_only:
             # Deleting would destroy masks that --only-updated or --video-only needs to reuse
-            print("\nOptions:")
-            print("  1. Proceed without deleting (existing masks will be reused)")
-            print("  2. Abort")
+            if args.overwrite:
+                print("Proceeding without deletion (--overwrite)...")
+            else:
+                print("\nOptions:")
+                print("  1. Proceed without deleting (existing masks will be reused)")
+                print("  2. Abort")
 
-            while True:
-                choice = input("\nEnter choice (1/2): ").strip()
-                if choice == '1':
-                    print("Proceeding without deletion...")
-                    break
-                elif choice == '2':
-                    print("Aborted by user")
-                    return 1
-                else:
-                    print("Invalid choice. Please enter 1 or 2")
+                while True:
+                    choice = input("\nEnter choice (1/2): ").strip()
+                    if choice == '1':
+                        print("Proceeding without deletion...")
+                        break
+                    elif choice == '2':
+                        print("Aborted by user")
+                        return 1
+                    else:
+                        print("Invalid choice. Please enter 1 or 2")
         else:
-            print("\nOptions:")
-            print("  1. Delete all and proceed")
-            print("  2. Proceed without deleting (may overwrite)")
-            print("  3. Abort")
+            if args.overwrite:
+                print("Proceeding without deletion (--overwrite)...")
+            else:
+                print("\nOptions:")
+                print("  1. Delete all and proceed")
+                print("  2. Proceed without deleting (may overwrite)")
+                print("  3. Abort")
 
-            while True:
-                choice = input("\nEnter choice (1/2/3): ").strip()
-                if choice == '1':
-                    # Delete existing
-                    if masks_dir.exists():
-                        shutil.rmtree(masks_dir)
-                    if video_file.exists():
-                        video_file.unlink()
-                    if metadata_file.exists():
-                        metadata_file.unlink()
-                    print("Deleted existing files. Proceeding...")
-                    break
-                elif choice == '2':
-                    print("Proceeding without deletion...")
-                    break
-                elif choice == '3':
-                    print("Aborted by user")
-                    return 1
-                else:
-                    print("Invalid choice. Please enter 1, 2, or 3")
+                while True:
+                    choice = input("\nEnter choice (1/2/3): ").strip()
+                    if choice == '1':
+                        # Delete existing
+                        if masks_dir.exists():
+                            shutil.rmtree(masks_dir)
+                        if video_file.exists():
+                            video_file.unlink()
+                        if metadata_file.exists():
+                            metadata_file.unlink()
+                        print("Deleted existing files. Proceeding...")
+                        break
+                    elif choice == '2':
+                        print("Proceeding without deletion...")
+                        break
+                    elif choice == '3':
+                        print("Aborted by user")
+                        return 1
+                    else:
+                        print("Invalid choice. Please enter 1, 2, or 3")
 
     print("=" * 60)
     print("SAM2 Annotation Processor")
@@ -1415,15 +1567,19 @@ Examples:
         if args.config:
             processor = SAM2Processor(config_file=args.config, checkpoint_file=args.checkpoint,
                                      offload_to_cpu=args.offload_to_cpu, async_loading=args.async_loading,
-                                     smooth_masks=args.smooth_masks, use_bfloat16=args.use_bfloat16,
+                                     smooth_masks=args.smooth_masks,
                                      device=args.device, frame_format=args.frame_format,
-                                     exclusive_masks=args.exclusive_masks)
+                                     exclusive_masks=args.exclusive_masks,
+                                     mask_format=args.mask_format,
+                                     vos_optimized=args.vos_optimized)
         else:
             processor = SAM2Processor(model_name=args.model, offload_to_cpu=args.offload_to_cpu,
                                      async_loading=args.async_loading, smooth_masks=args.smooth_masks,
-                                     use_bfloat16=args.use_bfloat16, device=args.device,
+                                     device=args.device,
                                      frame_format=args.frame_format,
-                                     exclusive_masks=args.exclusive_masks)
+                                     exclusive_masks=args.exclusive_masks,
+                                     mask_format=args.mask_format,
+                                     vos_optimized=args.vos_optimized)
 
         # Set no_backward flag
         processor.no_backward_propagation = args.no_backward
@@ -1480,7 +1636,8 @@ Examples:
         # The merged quality metrics are calculated below after reusing unchanged masks.
         result = processor.process_segmentation(
             args.video_file, annotations_data, output_dir, frame_dir=args.frame_dir,
-            skip_quality_save=bool(unchanged_ids)
+            skip_quality_save=bool(unchanged_ids),
+            unchanged_ids=unchanged_ids if unchanged_ids else None,
         )
         masks_by_frame, object_names, object_colors, num_frames, frame_dir_used, is_persistent = result
 
@@ -1495,16 +1652,52 @@ Examples:
             prev_masks_dir = prev_results_dir / "masks"
             prev_masks, prev_names = _load_masks_metadata(prev_masks_dir, unchanged_ids)
             if prev_masks:
-                # Copy unchanged mask files to output dir if different directory
-                if prev_results_dir.resolve() != output_dir.resolve():
-                    out_masks_dir = output_dir / "masks"
-                    out_masks_dir.mkdir(exist_ok=True)
+                out_masks_dir = output_dir / "masks"
+                out_masks_dir.mkdir(exist_ok=True)
+
+                if prev_results_dir.resolve() != output_dir.resolve() and args.mask_format != "npz":
+                    # PNG: copy individual per-object files only when coming from a different dir
                     for frame_masks in prev_masks.values():
                         for data in frame_masks.values():
                             src = prev_masks_dir / data["filename"]
                             dst = out_masks_dir / data["filename"]
                             if src.exists() and not dst.exists():
                                 shutil.copy2(str(src), str(dst))
+
+                elif prev_results_dir.resolve() != output_dir.resolve() and args.mask_format == "npz":
+                    # NPZ + different output dir: process_segmentation wrote only updated objects
+                    # into the new dir (its merge-at-write reads the OUTPUT dir which was empty).
+                    # Merge unchanged objects from prev dir into each output NPZ bundle now.
+                    print(f"Merging unchanged NPZ masks from {prev_masks_dir} into {out_masks_dir}...")
+                    for frame_idx, frame_obj_map in sorted(prev_masks.items()):
+                        npz_out = out_masks_dir / f"masks_f{frame_idx:06d}.npz"
+                        bundle: dict = {}
+                        if npz_out.exists():
+                            try:
+                                existing = np.load(str(npz_out))
+                                bundle = {k: existing[k] for k in existing.files}
+                            except Exception:
+                                pass
+                        for oid, data in frame_obj_map.items():
+                            src_path = prev_masks_dir / data["filename"]
+                            if not src_path.exists():
+                                continue
+                            npz_key = data.get("npz_key", "")
+                            if data["filename"].endswith(".npz") and npz_key:
+                                try:
+                                    src_data = np.load(str(src_path))
+                                    if npz_key in src_data.files:
+                                        bundle[npz_key] = src_data[npz_key]
+                                except Exception:
+                                    pass
+                            elif data["filename"].endswith(".png"):
+                                arr = cv2.imread(str(src_path), cv2.IMREAD_GRAYSCALE)
+                                if arr is not None:
+                                    obj_name = prev_names.get(oid, f"Object_{oid}")
+                                    bundle[f"mask_f{frame_idx:06d}_{obj_name}_id{oid}"] = arr
+                        if bundle:
+                            np.savez_compressed(str(npz_out), **bundle)
+
                 # Merge metadata into masks_by_frame, enriching each dict with 'name' and 'color'
                 # so export_video_from_dict can use them (it falls back to object_names[int_key]
                 # but the dict has string keys from JSON, causing "Object_N" names)
@@ -1527,6 +1720,13 @@ Examples:
                     if obj_data is None:
                         return None
                     mask_path = _merged_masks_dir / obj_data['filename']
+                    if obj_data['filename'].endswith('.npz'):
+                        try:
+                            d = np.load(str(mask_path))
+                            k = obj_data.get('npz_key', '')
+                            return (d[k] > 0).astype(np.uint8) * 255 if k in d.files else None
+                        except Exception:
+                            return None
                     m = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
                     return (m > 0).astype(np.uint8) * 255 if m is not None else None
                 from utils import calculate_quality_metrics

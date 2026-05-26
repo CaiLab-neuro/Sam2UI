@@ -11,12 +11,50 @@ import matplotlib.pyplot as plt
 import logging, sys
 import argparse
 import re
+import functools
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime
 from logging.handlers import QueueHandler, QueueListener
 from multiprocessing import Manager
 from pathlib import Path
 from typing import Optional
+
+
+@functools.lru_cache(maxsize=8)
+def _disk_template(r: int) -> np.ndarray:
+    """Pre-compute a boolean disk of radius r, shape (2r+1, 2r+1). Cached across calls."""
+    yy, xx = np.ogrid[-r:r+1, -r:r+1]
+    return xx ** 2 + yy ** 2 <= r ** 2
+
+
+def _score_gaze_all_masks(
+    stacked: np.ndarray, xi: int, yi: int, r: int, disk: np.ndarray
+) -> np.ndarray:
+    """Score one gaze point against N stacked binary masks in a single vectorized pass.
+
+    Args:
+        stacked: (N, H, W) uint8 array of binary masks.
+        xi, yi: Gaze pixel coordinates (col, row).
+        r: Radius in pixels.
+        disk: Pre-computed boolean disk of shape (2r+1, 2r+1) from _disk_template(r).
+
+    Returns:
+        (N,) float array of per-mask confidence scores.
+    """
+    N, H, W = stacked.shape
+    if xi < 0 or xi >= W or yi < 0 or yi >= H:
+        return np.zeros(N, dtype=float)
+    x0 = max(0, xi - r);  x1 = min(W, xi + r + 1)
+    y0 = max(0, yi - r);  y1 = min(H, yi + r + 1)
+    dy0 = y0 - (yi - r);  dy1 = dy0 + (y1 - y0)
+    dx0 = x0 - (xi - r);  dx1 = dx0 + (x1 - x0)
+    circle_local = disk[dy0:dy1, dx0:dx1]
+    circle_area = int(circle_local.sum())
+    if circle_area == 0:
+        return np.zeros(N, dtype=float)
+    patch = stacked[:, y0:y1, x0:x1]          # (N, h, w)
+    hits = (patch[:, circle_local] > 0).sum(axis=1)  # (N,)
+    return hits.astype(float) / circle_area
 
 """
 Published-version aligner to assign an object label to each gaze sample using
@@ -270,12 +308,13 @@ class GazeObjectAligner:
 
     def summarize_mask_frames(self, mask_dir: Path) -> dict[str, object]:
         """Summarize which frame ids are present in a mask directory."""
-        # mask_f000123.png → match.group(1) = "000123" -> int("000123") = 123
-        frame_pattern = re.compile(r"mask_f(\d{6})")
+        frame_pattern = re.compile(r"(?:masks?_f|mask_f)(\d{6})")
+        mask_dir = Path(mask_dir)
+        # Collect frame IDs from both NPZ files (masks_f000123.npz) and PNG files (mask_f000123_*.png)
         frame_ids = sorted(
             {
                 int(match.group(1))
-                for mask_path in Path(mask_dir).glob("*.png")
+                for mask_path in list(mask_dir.glob("masks_f*.npz")) + list(mask_dir.glob("*.png"))
                 for match in [frame_pattern.search(mask_path.name)]
                 if match is not None
             }
@@ -309,17 +348,21 @@ class GazeObjectAligner:
             masks (dict): A dictionary containing the segmentation masks for one frame as numpy arrays (each array for one object).
         """
         frame_id_str = f"{frame_id:06d}"
-        # print(frame_id_str)   # "003000"
 
+        # Try NPZ first (3x faster: one file open vs N glob+imread)
+        npz_path = Path(mask_dir) / f"masks_f{frame_id_str}.npz"
+        if npz_path.exists():
+            data = np.load(str(npz_path))
+            return {k + ".png": (data[k] > 0).astype(np.uint8) for k in data.files}
+
+        # Fall back to PNG (original behavior)
         pattern = os.path.join(mask_dir, f"*mask_f{frame_id_str}*.png")
         mask_paths = sorted(glob.glob(pattern))
-        # print(f"{mask_paths}")
         if not mask_paths:
             self.logger.debug("No masks found for frame %s in %s", frame_id, mask_dir)
             return {}
-        
-        masks = {}
 
+        masks = {}
         for mask_path in mask_paths:
             if self.ignore_objects and self.mask_labels(mask_path) & self.ignore_objects:
                 continue
@@ -327,11 +370,7 @@ class GazeObjectAligner:
             mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
             if mask is None:
                 continue
-
-            # Convert to strict binary {0, 1}
-            # Any non-zero pixel → 1
             binary_mask = np.where(mask > 0, 1, 0).astype(np.uint8)
-
             masks[os.path.basename(mask_path)] = binary_mask
 
         return masks
@@ -703,9 +742,11 @@ class GazeObjectAligner:
         y0 = max(0, yi - r)
         y1 = min(H, yi + r + 1)
 
-        # ---- Local circle in bbox coordinates ----
-        yy, xx = np.ogrid[y0:y1, x0:x1]          # yy: (h,1), xx: (1,w)
-        circle_local = (xx - xi) ** 2 + (yy - yi) ** 2 <= r ** 2  # (h,w) boolean
+        # ---- Slice the pre-computed disk to match the (possibly clipped) bounding box ----
+        disk = _disk_template(r)
+        dy0 = y0 - (yi - r);  dy1 = dy0 + (y1 - y0)
+        dx0 = x0 - (xi - r);  dx1 = dx0 + (x1 - x0)
+        circle_local = disk[dy0:dy1, dx0:dx1]
 
         # ---- Chunk the whole mask into small region (same size as original mask) ----
         mask_patch = mask[y0:y1, x0:x1]
@@ -823,25 +864,26 @@ class GazeObjectAligner:
             gaze_blink_removed['gazed_object_id'] = None
             gaze_blink_removed['gazed_object'] = None
             gaze_blink_removed['gazed_object_confidence'] = 0.0
+            _r = 20
+            _disk = _disk_template(_r)
             for frame_idx, gdf in gaze_blink_removed.groupby('frame_idx', sort=False):
                 masks_one_frame = self.load_mask(int(frame_idx), mask_subject)  # ONE disk read per frame
                 if len(masks_one_frame) == 0:
                     frames_without_masks += 1
                     continue
                 frames_with_masks += 1
-                # now score each gaze in that group against those masks
+                mask_names = list(masks_one_frame.keys())
+                stacked = np.stack(list(masks_one_frame.values()))  # (N_obj, H, W)
+                # Score each gaze point against all masks in one vectorized pass per gaze
                 for i in gdf.index:
                     row = gdf.loc[i]
-                    subject_gaze_probabilities[i]= {}
-                    x = row['gaze x [px]']
-                    y = row['gaze y [px]']
-                    best_name, best_conf = None, 0.0
-                    for mask_name, mask in masks_one_frame.items():
-                        conf = self.gaze_to_object_radius(mask, x, y, r=20)
-                        subject_gaze_probabilities[i][mask_name]= conf
-                        if conf > best_conf:
-                            best_name, best_conf = mask_name, conf
-                    if best_name:
+                    xi = int(round(row['gaze x [px]']))
+                    yi = int(round(row['gaze y [px]']))
+                    confs = _score_gaze_all_masks(stacked, xi, yi, _r, _disk)
+                    subject_gaze_probabilities[i] = dict(zip(mask_names, confs.tolist()))
+                    best_conf = float(confs.max())
+                    if best_conf > 0.0:
+                        best_name = mask_names[int(confs.argmax())]
                         gaze_blink_removed.loc[i, 'gazed_object_id'] = best_name.split('.')[0].split('_')[-1]
                         gaze_blink_removed.loc[i, 'gazed_object'] = '_'.join(best_name.split('.')[0].split('_')[2:-1])
                         gaze_blink_removed.loc[i, 'gazed_object_confidence'] = best_conf

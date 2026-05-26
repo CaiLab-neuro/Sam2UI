@@ -22,6 +22,7 @@ from collections import deque
 # Import utility functions
 from utils import (
     load_mask as load_mask_from_disk,
+    load_all_masks_for_frame,
     export_mask_to_disk as export_mask_to_disk_util,
     calculate_quality_metrics,
     save_quality_metrics,
@@ -100,6 +101,18 @@ def _check_sam3_available():
         return False
 
 SAM3_AVAILABLE = _check_sam3_available()
+
+
+def _probe_fa3() -> bool:
+    """Return True if flash_attn_interface is installed AND the current GPU is Hopper (sm_90+)."""
+    try:
+        import flash_attn_interface  # noqa: F401
+        import torch
+        if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 9:
+            return True
+    except ImportError:
+        pass
+    return False
 
 
 class TkProgressCallback:
@@ -260,7 +273,7 @@ class SAM2VideoUI:
         self.sam3_available = SAM3_AVAILABLE
         self.model_type_var = tk.StringVar(value="SAM2")  # Default to SAM2
         self.using_sam3 = False
-        
+
         # Segmentation options
         self.exclusive_masks_var = tk.BooleanVar(value=False)  # Winner-takes-all per pixel
 
@@ -355,6 +368,7 @@ class SAM2VideoUI:
         self._resize_job = None  # Debounce job for window resize
         self._left_panel_frac = 0.18  # Fraction of window width for left panel (updated on sash drag)
         self._initial_left_w = 280  # Computed in setup_ui(); used by setup_left_panel()
+        self._video_panel_frac = 0.62  # Fraction of right panel height for video canvas (updated on sash drag)
 
         # SAM2 model
         self.sam2_model = None
@@ -750,9 +764,13 @@ class SAM2VideoUI:
         
     def setup_right_panel(self, parent):
         """Setup the right video display panel"""
+        # Vertical paned window: video canvas on top, controls below; user can drag sash to resize
+        self.right_paned = tk.PanedWindow(parent, orient=tk.VERTICAL,
+                                          sashwidth=6, sashrelief=tk.RAISED, bg='#555555')
+        self.right_paned.pack(fill=tk.BOTH, expand=True)
+
         # Video display area
-        display_frame = ttk.Frame(parent)
-        display_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+        display_frame = ttk.Frame(self.right_paned)
         
         # Canvas with scrollbars
         canvas_container = ttk.Frame(display_frame)
@@ -834,13 +852,56 @@ class SAM2VideoUI:
         self.root.bind('<Command-equal>', lambda e: self._handle_keyboard_zoom(1))   # Mac unshifted
         self.root.bind('<Command-minus>', lambda e: self._handle_keyboard_zoom(-1))  # Mac
 
-        # Video controls
-        controls_frame = ttk.Frame(parent)
-        controls_frame.pack(fill=tk.X)
+        # Add video display pane to the vertical paned window
+        self.right_paned.add(display_frame, stretch="always", minsize=150)
+
+        # Video controls (lower pane — user can drag sash above to give more space to video)
+        controls_frame = ttk.Frame(self.right_paned)
         controls_frame.bind('<Button-1>', self._on_panel_click)
-        
+
+        # Scrollable wrapper: when the sash squeezes the controls pane below its
+        # natural height a scrollbar appears so every control stays reachable.
+        _ctrl_canvas = tk.Canvas(controls_frame, highlightthickness=0)
+        _ctrl_sb = ttk.Scrollbar(controls_frame, orient=tk.VERTICAL, command=_ctrl_canvas.yview)
+        _ctrl_canvas.configure(yscrollcommand=_ctrl_sb.set)
+        _ctrl_sb.pack(side=tk.RIGHT, fill=tk.Y)
+        _ctrl_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        controls_inner = ttk.Frame(_ctrl_canvas)
+        _ctrl_win = _ctrl_canvas.create_window((0, 0), window=controls_inner, anchor="nw")
+
+        def _ctrl_inner_configure(event):
+            _ctrl_canvas.configure(scrollregion=_ctrl_canvas.bbox("all"))
+            # Show/hide scrollbar depending on whether content fits
+            needed = controls_inner.winfo_reqheight()
+            available = _ctrl_canvas.winfo_height()
+            if needed > available:
+                _ctrl_sb.pack(side=tk.RIGHT, fill=tk.Y)
+            else:
+                _ctrl_sb.pack_forget()
+
+        def _ctrl_canvas_configure(event):
+            # Keep inner frame width == canvas width so controls don't wrap oddly
+            _ctrl_canvas.itemconfig(_ctrl_win, width=event.width)
+            _ctrl_inner_configure(event)
+
+        controls_inner.bind("<Configure>", _ctrl_inner_configure)
+        _ctrl_canvas.bind("<Configure>", _ctrl_canvas_configure)
+
+        # Mouse-wheel scrolling on the controls pane
+        def _ctrl_scroll(event):
+            if _ctrl_sb.winfo_ismapped():
+                _ctrl_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        def _ctrl_scroll_linux(event):
+            if _ctrl_sb.winfo_ismapped():
+                _ctrl_canvas.yview_scroll(-1 if event.num == 4 else 1, "units")
+        for _w in (controls_frame, _ctrl_canvas, controls_inner):
+            _w.bind("<MouseWheel>", _ctrl_scroll)
+            _w.bind("<Button-4>", _ctrl_scroll_linux)
+            _w.bind("<Button-5>", _ctrl_scroll_linux)
+
         # Playback controls
-        playback_frame = ttk.Frame(controls_frame)
+        playback_frame = ttk.Frame(controls_inner)
         playback_frame.pack(fill=tk.X, pady=(0, 5))
         
         self.play_button = ttk.Button(playback_frame, text="Play", command=self.toggle_play)
@@ -871,7 +932,7 @@ class SAM2VideoUI:
                    command=self.segment_current_frame_only).pack(side=tk.LEFT, padx=(10, 5))
 
         # Frame slider
-        slider_frame = ttk.Frame(controls_frame)
+        slider_frame = ttk.Frame(controls_inner)
         slider_frame.pack(fill=tk.X, pady=(0, 5))
         
         ttk.Label(slider_frame, text="Frame:").pack(side=tk.LEFT)
@@ -890,7 +951,7 @@ class SAM2VideoUI:
         self.frame_label.pack(side=tk.RIGHT)
 
         # Shared row for zoom + speed
-        zoom_speed_row = ttk.Frame(controls_frame)
+        zoom_speed_row = ttk.Frame(controls_inner)
         zoom_speed_row.pack(fill=tk.X, pady=(0, 5))
 
         # ---- Slider Zoom ----
@@ -955,7 +1016,7 @@ class SAM2VideoUI:
         self.speed_info_label.pack(side=tk.LEFT, padx=(10, 0))
 
         # ---- Step Size ----
-        step_row = ttk.Frame(controls_frame)
+        step_row = ttk.Frame(controls_inner)
         step_row.pack(fill=tk.X, pady=(0, 5))
 
         step_frame = ttk.Frame(step_row)
@@ -979,7 +1040,7 @@ class SAM2VideoUI:
         self._update_step_button_highlight()
 
         # Segmentation quality indicators
-        viz_frame = ttk.LabelFrame(controls_frame, text="Segmentation Quality Indicators", padding=5)
+        viz_frame = ttk.LabelFrame(controls_inner, text="Segmentation Quality Indicators", padding=5)
         viz_frame.pack(fill=tk.X, pady=(10, 0))
 
         # Inter-frame change visualization
@@ -1013,12 +1074,39 @@ class SAM2VideoUI:
         self.root.bind('<Configure>', self._on_root_resize)
 
         # Info panel
-        info_frame = ttk.Frame(controls_frame)
+        info_frame = ttk.Frame(controls_inner)
         info_frame.pack(fill=tk.X)
         
         self.points_label = ttk.Label(info_frame, text="No points (Left: +, Right: -)")
         self.points_label.pack(fill=tk.X)
-        
+
+        # Add controls pane to the vertical paned window and bind its sash.
+        # minsize=40 lets the sash slide almost all the way up; the scrollable
+        # inner frame keeps all controls reachable via the scroll wheel.
+        self.right_paned.add(controls_frame, stretch="never", minsize=40)
+        self.right_paned.bind('<ButtonRelease-1>', self._on_right_sash_moved)
+        self.root.after(250, self._set_initial_right_sash)
+
+    def _on_right_sash_moved(self, event):
+        """Store vertical sash fraction when user drags the video/controls divider."""
+        try:
+            rph = self.right_paned.winfo_height()
+            if rph > 0:
+                sash_y = self.right_paned.sash_coord(0)[1]
+                self._video_panel_frac = sash_y / rph
+        except Exception:
+            pass
+
+    def _set_initial_right_sash(self):
+        """Place the vertical sash at the stored fraction once the pane is sized."""
+        try:
+            rph = self.right_paned.winfo_height()
+            if rph > 1:
+                y = max(150, min(rph - 120, int(rph * self._video_panel_frac)))
+                self.right_paned.sash_place(0, 1, y)
+        except Exception:
+            pass
+
     def _on_sash_moved(self, event):
         """Update stored left-panel fraction when the user drags the sash."""
         try:
@@ -1049,10 +1137,19 @@ class SAM2VideoUI:
             if c:
                 c.configure(height=canvas_h)
 
-        # Re-apply sash position using stored fraction
+        # Re-apply horizontal sash position using stored fraction
         new_left_w = max(180, min(320, int(w * self._left_panel_frac)))
         try:
             self.paned.sash_place(0, new_left_w, 1)
+        except Exception:
+            pass
+
+        # Re-apply vertical sash position using stored fraction
+        try:
+            rph = self.right_paned.winfo_height()
+            if rph > 1:
+                new_y = max(150, min(rph - 120, int(rph * self._video_panel_frac)))
+                self.right_paned.sash_place(0, 1, new_y)
         except Exception:
             pass
 
@@ -1546,12 +1643,17 @@ class SAM2VideoUI:
                 default=None
             )
             if first_frame_with_annotations is not None:
-                # Try to find at least one mask file for the first frame
+                # Try to find at least one mask file for the first frame (PNG or NPZ bundle)
                 found_mask = False
                 for filename in os.listdir(masks_dir):
                     if filename.startswith(f"mask_f{first_frame_with_annotations:06d}_"):
                         found_mask = True
                         break
+                if not found_mask:
+                    # Check NPZ bundle
+                    npz_bundle = os.path.join(masks_dir, f"masks_f{first_frame_with_annotations:06d}.npz")
+                    if os.path.exists(npz_bundle):
+                        found_mask = True
 
                 if not found_mask:
                     print(f"WARNING: No mask files found for first annotated frame {first_frame_with_annotations}")
@@ -2463,12 +2565,8 @@ class SAM2VideoUI:
 
     def load_video(self):
         """Load video file and extract frames"""
-        # Clean up any existing lazy loading
-        if hasattr(self, 'video_cap_lazy') and self.video_cap_lazy:
-            self.video_cap_lazy.release()
-            self.video_cap_lazy = None
-        
         file_path = filedialog.askopenfilename(
+            parent=self.root,
             title="Select Video File",
             filetypes=[
                 ("Video files", "*.mp4 *.avi *.mov *.mkv *.flv *.wmv *.m4v"),
@@ -2481,6 +2579,12 @@ class SAM2VideoUI:
 
         if not file_path:
             return
+
+        # Clean up any existing lazy loading after the dialog, not before,
+        # to avoid OpenCV release interrupting Tkinter's grab on the dialog.
+        if hasattr(self, 'video_cap_lazy') and self.video_cap_lazy:
+            self.video_cap_lazy.release()
+            self.video_cap_lazy = None
 
         self.last_dir_video = os.path.dirname(file_path)
 
@@ -4580,14 +4684,14 @@ class SAM2VideoUI:
             else:
                 model_type = "SAM2"  # Default to SAM2 during initialization
 
-        # SAM3 has only one variant - use HuggingFace model
+        # SAM3 has one or two variants depending on which checkpoints are downloaded
         if model_type == "SAM3":
-            # Check if SAM3 checkpoint exists
-            sam3_checkpoint_dir = Path(self.checkpoint_dir).parent.parent / "sam_models" / "sam3" / "checkpoints"
-            if sam3_checkpoint_dir.exists() and (sam3_checkpoint_dir / "sam3.pt").exists():
-                return ["auto", "SAM3|sam3.pt|sam3_hiera_l.yaml"]
-            else:
-                return ["auto"]
+            sam3_checkpoint_dir = Path(self.checkpoint_dir).parent.parent / "sam3" / "checkpoints"
+            models = ["auto"]
+            if sam3_checkpoint_dir.exists():
+                if (sam3_checkpoint_dir / "sam3.pt").exists():
+                    models.append("SAM3|sam3.pt")
+            return models
 
         # SAM2 detection (original logic)
         checkpoint_dir = Path(self.checkpoint_dir)
@@ -4729,11 +4833,10 @@ class SAM2VideoUI:
         if selected_display == "auto":
             self.selected_model.set("auto")
         else:
-            # Find corresponding model info
-            for model in self.available_models[1:]:
-                if model.startswith(selected_display + "|"):
-                    self.selected_model.set(model)
-                    break
+            # Store only the display name so the combo shows a clean label.
+            # The full internal "Display|ckpt|cfg" string is looked up from
+            # self.available_models at load time.
+            self.selected_model.set(selected_display)
 
         # Warn user if model already loaded
         if hasattr(self, 'sam2_model') and self.sam2_model is not None:
@@ -5078,6 +5181,46 @@ class SAM2VideoUI:
                     print(f"Partial re-segmentation: updating {sorted(self.updated_objects)}, "
                           f"reusing masks for {sorted(unchanged_ids)}")
 
+        # Determine output mask format.
+        # Priority order:
+        # 1. Refinement mode (prev_masks_dir set): auto-detect from previous masks dir.
+        # 2. Chosen output dir already has results: warn + force existing format.
+        # 3. Fresh empty dir: ask the user.
+        _chosen_masks_dir = Path(masks_output_dir)
+        _existing_npz = list(_chosen_masks_dir.glob("masks_f*.npz")) if _chosen_masks_dir.exists() else []
+        _existing_png = list(_chosen_masks_dir.glob("mask_f*.png")) if _chosen_masks_dir.exists() else []
+        _chosen_has_results = bool(_existing_npz or _existing_png)
+
+        if prev_masks_dir and os.path.isdir(prev_masks_dir):
+            # Refinement: preserve the format of the previous result
+            _has_npz = any(Path(prev_masks_dir).glob("masks_f*.npz"))
+            _has_png = any(Path(prev_masks_dir).glob("mask_f*.png"))
+            _mask_format = "npz" if (_has_npz and not _has_png) else "png"
+            print(f"Mask format auto-detected from previous results: {_mask_format.upper()}")
+        elif _chosen_has_results:
+            # Output dir already contains results — force existing format and warn
+            _mask_format = "npz" if (_existing_npz and not _existing_png) else "png"
+            proceed = messagebox.askyesno(
+                "Directory Already Has Results",
+                f"The selected output directory already contains segmentation results "
+                f"({_mask_format.upper()} format).\n\n"
+                f"Continuing will overwrite the existing files using the same format "
+                f"({_mask_format.upper()}).\n\n"
+                f"Continue?"
+            )
+            if not proceed:
+                return
+            print(f"Mask format forced to match existing results: {_mask_format.upper()}")
+        else:
+            _use_npz = messagebox.askyesno(
+                "Mask Output Format",
+                "Save masks as NPZ bundles?\n\n"
+                "[Yes] NPZ  — one compressed file per frame (~5× smaller)\n"
+                "[No]  PNG  — one file per object per frame (default)"
+            )
+            _mask_format = "npz" if _use_npz else "png"
+            print(f"Mask format chosen by user: {_mask_format.upper()}")
+
         try:
             self.status_label.config(text="Preparing for segmentation...")
             self.progress_bar.pack(fill=tk.X, pady=(5, 0))
@@ -5154,7 +5297,8 @@ class SAM2VideoUI:
                     offload_state_to_cpu=True,
                     calculate_quality_metrics=True,
                     cleanup_temp_frames=False,  # Don't cleanup session cache
-                    exclusive_masks=self.exclusive_masks_var.get()
+                    exclusive_masks=self.exclusive_masks_var.get(),
+                    mask_format=_mask_format
                 )
 
                 # Create progress callback
@@ -5194,13 +5338,16 @@ class SAM2VideoUI:
                 self.masks = {}
                 for frame_idx, frame_data in result.masks_metadata.items():
                     for obj_id, mask_info in frame_data.items():
-                        mask_metadata.append({
+                        entry = {
                             'frame_idx': frame_idx,
                             'obj_id': obj_id,
                             'mask_file': mask_info['filename'],
                             'object_name': mask_info['name'],
                             'color': mask_info['color']
-                        })
+                        }
+                        if 'npz_key' in mask_info:
+                            entry['npz_key'] = mask_info['npz_key']
+                        mask_metadata.append(entry)
                         if frame_idx not in self.masks:
                             self.masks[frame_idx] = {}
                         self.masks[frame_idx][obj_id] = None  # Placeholder
@@ -5209,36 +5356,147 @@ class SAM2VideoUI:
                 if only_updated and unchanged_ids and prev_masks_dir:
                     import re as _re
                     import shutil as _shutil
-                    _mask_pattern = _re.compile(r"^mask_f(\d{6})_(.+)_id(\d+)\.png$")
                     _prev_path = Path(prev_masks_dir)
                     _new_path = Path(export_dir)
                     _merged = 0
+                    _png_pat = _re.compile(r"^mask_f(\d{6})_(.+)_id(\d+)\.png$")
+                    _npz_key_pat = _re.compile(r"^mask_f(\d{6})_(.+)_id(\d+)$")
+
+                    # Scan previous masks dir for unchanged-object data.
+                    # Store (obj_name, src_png_or_None, lazy_npz_ref_or_None) per (fidx, oid).
+                    _to_restore: dict = {}
+
+                    # PNG scan
                     for _fp in sorted(_prev_path.glob("mask_f*.png")):
-                        _m = _mask_pattern.match(_fp.name)
+                        _m = _png_pat.match(_fp.name)
                         if not _m:
                             continue
                         _oid = int(_m.group(3))
                         if _oid not in unchanged_ids:
                             continue
-                        _fidx = int(_m.group(1))
-                        _obj_name = _m.group(2)
-                        # Copy file if target dir differs
-                        if _prev_path.resolve() != _new_path.resolve():
-                            _dst = _new_path / _fp.name
-                            if not _dst.exists():
-                                _shutil.copy2(str(_fp), str(_dst))
-                        # Merge into metadata and self.masks
-                        mask_metadata.append({
-                            'frame_idx': _fidx,
-                            'obj_id': _oid,
-                            'mask_file': _fp.name,
-                            'object_name': self.object_names.get(_oid, _obj_name),
-                            'color': self.object_colors.get(_oid, (255, 0, 0))
-                        })
-                        if _fidx not in self.masks:
-                            self.masks[_fidx] = {}
-                        self.masks[_fidx][_oid] = None
-                        _merged += 1
+                        _fidx, _oname = int(_m.group(1)), _m.group(2)
+                        _to_restore.setdefault(_fidx, {})[_oid] = (_oname, _fp, None)
+
+                    # NPZ scan — lazy (path, key) refs, never load arrays during scan
+                    for _npz_fp in sorted(_prev_path.glob("masks_f*.npz")):
+                        _fn_m = _re.match(r"^masks_f(\d{6})\.npz$", _npz_fp.name)
+                        if not _fn_m:
+                            continue
+                        _fidx = int(_fn_m.group(1))
+                        try:
+                            _data = np.load(str(_npz_fp))
+                            for _key in _data.files:
+                                _km = _npz_key_pat.match(_key)
+                                if not _km:
+                                    continue
+                                _oid = int(_km.group(3))
+                                if _oid not in unchanged_ids:
+                                    continue
+                                if _fidx in _to_restore and _oid in _to_restore[_fidx]:
+                                    continue  # PNG wins
+                                _oname = _km.group(2)
+                                _to_restore.setdefault(_fidx, {})[_oid] = (_oname, None, (_npz_fp, _key))
+                        except Exception:
+                            continue
+
+                    # Write unchanged masks directly in the output format (_mask_format).
+                    # PNG format: copy PNG → PNG.
+                    # NPZ format: accumulate per-frame arrays, write one NPZ bundle per frame
+                    #             (segmenter already wrote the updated objects as NPZ, so we
+                    #              need to add unchanged objects into those same bundles or new ones).
+                    #
+                    # For NPZ output: group all unchanged objects by frame, then merge with the
+                    # already-written NPZ bundle for that frame (which holds updated objects).
+                    # One frame in RAM at a time → memory efficient.
+
+                    if _mask_format == "npz":
+                        # Group unchanged objects by frame
+                        _by_frame: dict = {}  # fidx -> {oid: (oname, src_png, lazy_ref)}
+                        for _fidx, _obj_map in _to_restore.items():
+                            for _oid, _entry in _obj_map.items():
+                                _by_frame.setdefault(_fidx, {})[_oid] = _entry
+
+                        for _fidx, _obj_map in sorted(_by_frame.items()):
+                            _npz_out = _new_path / f"masks_f{_fidx:06d}.npz"
+                            # Load existing bundle (updated objects written by segmenter)
+                            _bundle: dict = {}
+                            if _npz_out.exists():
+                                try:
+                                    _existing = np.load(str(_npz_out))
+                                    _bundle = {k: _existing[k] for k in _existing.files}
+                                except Exception:
+                                    pass
+                            # Add each unchanged object
+                            for _oid, (_oname, _src_png, _lazy_ref) in _obj_map.items():
+                                _npz_key = f"mask_f{_fidx:06d}_{_oname}_id{_oid}"
+                                if _src_png is not None:
+                                    _arr = cv2.imread(str(_src_png), cv2.IMREAD_GRAYSCALE)
+                                    if _arr is not None:
+                                        _bundle[_npz_key] = _arr
+                                elif _lazy_ref is not None:
+                                    _src_npz_fp, _src_key = _lazy_ref
+                                    try:
+                                        _sd = np.load(str(_src_npz_fp))
+                                        if _src_key in _sd.files:
+                                            _bundle[_npz_key] = (_sd[_src_key] > 0).astype(np.uint8) * 255
+                                    except Exception:
+                                        pass
+                                if _npz_key in _bundle:
+                                    mask_metadata.append({
+                                        'frame_idx': _fidx, 'obj_id': _oid,
+                                        'mask_file': f"masks_f{_fidx:06d}.npz",
+                                        'npz_key': _npz_key,
+                                        'object_name': self.object_names.get(_oid, _oname),
+                                        'color': self.object_colors.get(_oid, (255, 0, 0)),
+                                    })
+                                    if _fidx not in self.masks:
+                                        self.masks[_fidx] = {}
+                                    self.masks[_fidx][_oid] = None
+                                    _merged += 1
+                            # Write merged bundle
+                            if _bundle:
+                                np.savez_compressed(str(_npz_out), **_bundle)
+                    else:
+                        # PNG format: copy unchanged PNG → output dir as PNG
+                        for _fidx, _obj_map in _to_restore.items():
+                            for _oid, (_oname, _src_png, _lazy_ref) in _obj_map.items():
+                                if _src_png is not None:
+                                    _dst_name = f"mask_f{_fidx:06d}_{_oname}_id{_oid}.png"
+                                    _dst = _new_path / _dst_name
+                                    if _prev_path.resolve() != _new_path.resolve() and not _dst.exists():
+                                        _shutil.copy2(str(_src_png), str(_dst))
+                                    mask_metadata.append({
+                                        'frame_idx': _fidx, 'obj_id': _oid,
+                                        'mask_file': _dst_name,
+                                        'object_name': self.object_names.get(_oid, _oname),
+                                        'color': self.object_colors.get(_oid, (255, 0, 0)),
+                                    })
+                                    if _fidx not in self.masks:
+                                        self.masks[_fidx] = {}
+                                    self.masks[_fidx][_oid] = None
+                                    _merged += 1
+                                # NPZ source with PNG output: load and write as PNG
+                                elif _lazy_ref is not None:
+                                    _src_npz_fp, _src_key = _lazy_ref
+                                    try:
+                                        _sd = np.load(str(_src_npz_fp))
+                                        if _src_key in _sd.files:
+                                            _arr = (_sd[_src_key] > 0).astype(np.uint8) * 255
+                                            _dst_name = f"mask_f{_fidx:06d}_{_oname}_id{_oid}.png"
+                                            cv2.imwrite(str(_new_path / _dst_name), _arr)
+                                            mask_metadata.append({
+                                                'frame_idx': _fidx, 'obj_id': _oid,
+                                                'mask_file': _dst_name,
+                                                'object_name': self.object_names.get(_oid, _oname),
+                                                'color': self.object_colors.get(_oid, (255, 0, 0)),
+                                            })
+                                            if _fidx not in self.masks:
+                                                self.masks[_fidx] = {}
+                                            self.masks[_fidx][_oid] = None
+                                            _merged += 1
+                                    except Exception:
+                                        pass
+
                     print(f"Reused {_merged} masks for unchanged objects {sorted(unchanged_ids)} from {_prev_path}")
 
                 # Store export directory
@@ -5536,10 +5794,6 @@ class SAM2VideoUI:
         start = start_1based - 1
         end = end_1based - 1
 
-        # Warning for selecting entire video
-        if start == 0 and end == total_frames - 1:
-            return False, None, None, "You've selected the entire video. Use 'Segment Video' instead."
-
         return True, start, end, None
 
     def _prepare_annotations_for_range(self, start_frame, end_frame):
@@ -5637,11 +5891,33 @@ class SAM2VideoUI:
             if not output_dir:
                 return
 
-        # Determine if video regeneration is needed
-        # Auto-regenerate for partial refinements (not all frames)
+        # Always regenerate the video after refinement so the display stays in sync with masks
         total_frames = len(self.frames)
         is_partial_refinement = (start_frame > 0 or end_frame < total_frames - 1)
-        regenerate_video = is_partial_refinement
+        regenerate_video = True
+
+        # Warn when the range covers the entire video
+        if not is_partial_refinement:
+            updated_obj_names = ", ".join(
+                self.object_names.get(oid, f"Object_{oid}")
+                for oid in sorted({a.object_id for a in annotations_in_range})
+            )
+            if not unchanged_obj_ids_in_range:
+                # All objects updated over full range — equivalent to Segment Video
+                warn_msg = (
+                    "You've selected the entire video and all objects will be re-segmented.\n\n"
+                    "This is equivalent to clicking 'Segment Video'.\n\n"
+                    "Continue with Refine Range anyway?"
+                )
+            else:
+                # Only some objects updated over full range — still valid partial refinement
+                warn_msg = (
+                    f"You've selected the entire video.\n\n"
+                    f"Only updated objects will be re-segmented: {updated_obj_names}\n\n"
+                    "Continue?"
+                )
+            if not messagebox.askyesno("Full Video Range", warn_msg):
+                return
 
         num_frames = end_frame - start_frame + 1
         num_annotations = len(annotations_in_range)
@@ -5668,7 +5944,7 @@ class SAM2VideoUI:
             f"Annotations in range: {num_annotations}\n"
             + (partial_obj_info)
             + f"Output directory: {output_dir}\n"
-            f"Regenerate video: {'Yes (automatic)' if regenerate_video else 'No (full range)'}\n\n"
+            f"Regenerate video: Yes (always)\n\n"
             f"This will overwrite existing masks for re-segmented objects in this range.\n"
             f"Continue?"
         )
@@ -5752,6 +6028,13 @@ class SAM2VideoUI:
                 )
                 segmenter.set_progress_callback(UIProgressCallback(self))
 
+                # Detect mask format from existing output masks so refinement stays
+                # consistent with the format chosen during the original segmentation.
+                _masks_dir = Path(output_dir) / "masks"
+                _has_npz = _masks_dir.exists() and any(_masks_dir.glob("masks_f*.npz"))
+                _has_png = _masks_dir.exists() and any(_masks_dir.glob("mask_f*.png"))
+                _refine_mask_format = "npz" if (_has_npz and not _has_png) else "png"
+
                 # Configure segmentation for the range
                 # frame_range is (start, end) where end is exclusive
                 # frame_offset ensures output mask files use global frame indices
@@ -5764,7 +6047,8 @@ class SAM2VideoUI:
                     frames_to_keep=20,
                     calculate_quality_metrics=False,  # We'll update metrics separately
                     cleanup_temp_frames=True,
-                    exclusive_masks=self.exclusive_masks_var.get()
+                    exclusive_masks=self.exclusive_masks_var.get(),
+                    mask_format=_refine_mask_format
                 )
 
                 self.status_label.config(text="Running range segmentation...")
@@ -5925,22 +6209,18 @@ class SAM2VideoUI:
         prev_combined_mask = None
 
         for frame_idx in range(metrics_start, metrics_end + 1):
-            # Load all object masks for this frame and combine them
+            # Load all object masks for this frame (PNG or NPZ) and combine them
             combined_mask = None
             overlap_count = None
-            frame_pattern = f"mask_f{frame_idx:06d}_*.png"
-            mask_files = list(masks_path.glob(frame_pattern))
+            frame_masks = load_all_masks_for_frame(str(masks_path), frame_idx)
 
-            if mask_files:
-                for mask_file in mask_files:
-                    mask = cv2.imread(str(mask_file), cv2.IMREAD_GRAYSCALE)
-                    if mask is not None:
-                        if combined_mask is None:
-                            combined_mask = (mask > 0).astype(np.uint8)
-                            overlap_count = (mask > 0).astype(np.int32)
-                        else:
-                            combined_mask = np.logical_or(combined_mask, mask > 0).astype(np.uint8)
-                            overlap_count += (mask > 0).astype(np.int32)
+            for _obj_id, _obj_name, mask in frame_masks:
+                if combined_mask is None:
+                    combined_mask = (mask > 0).astype(np.uint8)
+                    overlap_count = (mask > 0).astype(np.int32)
+                else:
+                    combined_mask = np.logical_or(combined_mask, mask > 0).astype(np.uint8)
+                    overlap_count += (mask > 0).astype(np.int32)
 
             # Calculate background ratio for this frame
             if combined_mask is not None:
@@ -5953,13 +6233,31 @@ class SAM2VideoUI:
                 excess_overlaps = np.where(overlap_count > 0, overlap_count - 1, 0)
                 overlap_ratio = np.sum(excess_overlaps) / total_pixels
                 self.overlap_ratios[frame_idx] = overlap_ratio
+            else:
+                # No masks on this frame — fully background, no overlap
+                self.background_ratios[frame_idx] = 1.0
+                self.overlap_ratios[frame_idx] = 0.0
 
-            # Calculate inter-frame change (comparing to previous frame)
-            if prev_combined_mask is not None and combined_mask is not None and frame_idx > 0:
-                # Calculate pixel differences
-                changed_pixels = np.sum(prev_combined_mask != combined_mask)
-                total_pixels = combined_mask.shape[0] * combined_mask.shape[1]
-                change_ratio = changed_pixels / total_pixels
+            # Calculate inter-frame change (comparing to previous frame).
+            # Must handle the case where a mask fully disappears (combined_mask is None)
+            # or fully appears (prev_combined_mask is None), both of which are large changes.
+            if frame_idx > 0:
+                if prev_combined_mask is not None and combined_mask is not None:
+                    changed_pixels = np.sum(prev_combined_mask != combined_mask)
+                    total_pixels = combined_mask.shape[0] * combined_mask.shape[1]
+                    change_ratio = changed_pixels / total_pixels
+                elif prev_combined_mask is not None:
+                    # Mask disappeared completely — every foreground pixel changed
+                    changed_pixels = np.sum(prev_combined_mask > 0)
+                    total_pixels = prev_combined_mask.shape[0] * prev_combined_mask.shape[1]
+                    change_ratio = changed_pixels / total_pixels
+                elif combined_mask is not None:
+                    # Mask appeared from nothing — every foreground pixel is new
+                    changed_pixels = np.sum(combined_mask > 0)
+                    total_pixels = combined_mask.shape[0] * combined_mask.shape[1]
+                    change_ratio = changed_pixels / total_pixels
+                else:
+                    change_ratio = 0.0  # Both frames had no masks
                 # inter_frame_changes[i] represents change between frame i and i+1
                 change_idx = frame_idx - 1
                 if 0 <= change_idx < len(self.inter_frame_changes):
@@ -6229,34 +6527,26 @@ class SAM2VideoUI:
                 if frame.shape[1] != width or frame.shape[0] != height:
                     frame = cv2.resize(frame, (width, height))
 
-                # Overlay masks for this frame
-                frame_pattern = f"mask_f{frame_idx:06d}_*.png"
-                mask_files = list(masks_path.glob(frame_pattern))
-
-                for mask_file in mask_files:
-                    # Extract object ID from filename using utils parser
-                    parsed = parse_mask_filename(mask_file.name)
-                    if parsed is None:
-                        continue
-                    _, _, obj_id = parsed
-
-                    mask = cv2.imread(str(mask_file), cv2.IMREAD_GRAYSCALE)
-                    if mask is None:
-                        continue
-
+                # Overlay masks for this frame using single-pass blending to avoid
+                # cumulative darkening when multiple objects overlap.
+                combined_overlay = frame.copy()
+                has_any_mask = False
+                combined_mask = np.zeros((height, width), dtype=bool)
+                for obj_id, _obj_name, mask in load_all_masks_for_frame(str(masks_path), frame_idx):
                     if mask.shape[0] != height or mask.shape[1] != width:
                         mask = cv2.resize(mask, (width, height))
 
-                    # Get object color
                     color = self.object_colors.get(obj_id, [255, 0, 0])
                     if isinstance(color, list):
                         color = tuple(color)
 
-                    # Apply mask overlay
                     mask_bool = mask > 0
-                    overlay = frame.copy()
-                    overlay[mask_bool] = [color[2], color[1], color[0]]  # BGR
-                    frame = cv2.addWeighted(frame, 1 - overlay_opacity, overlay, overlay_opacity, 0)
+                    combined_overlay[mask_bool] = [color[2], color[1], color[0]]  # BGR
+                    combined_mask |= mask_bool
+                    has_any_mask = True
+
+                if has_any_mask:
+                    frame = cv2.addWeighted(frame, 1 - overlay_opacity, combined_overlay, overlay_opacity, 0)
 
                 out.write(frame)
                 frames_written += 1
@@ -6759,12 +7049,20 @@ class SAM2VideoUI:
 
             # Load model based on type
             if model_type == "SAM3":
-                # SAM3 loading with HuggingFace model and SAM2-compatible API
-                # IMPORTANT: Must patch SAM3 modules BEFORE importing build_sam3_video_model
+                # SAM3 / SAM3.1 loading
+                # IMPORTANT: Must patch SAM3 modules BEFORE importing model builders
                 # because the import triggers loading of modules with hardcoded "cuda"
                 from utils import patch_sam3_modules_for_device
                 patch_sam3_modules_for_device(device)
 
+                # Determine which SAM3 variant to load from the model dropdown selection.
+                # selected_model holds the display name; look up the full internal string
+                # ("Display|ckpt_file") from available_models for variant detection.
+                model_selection = self.selected_model.get()
+                _full_model_info = next(
+                    (m for m in self.available_models[1:] if m.split('|')[0] == model_selection),
+                    self.available_models[1] if len(self.available_models) > 1 else ""
+                )
                 try:
                     from sam3.model_builder import build_sam3_video_model
                 except ImportError:
@@ -6775,12 +7073,21 @@ class SAM2VideoUI:
                         "3. Download checkpoints from https://huggingface.co/facebook/sam3"
                     )
 
-                # Build SAM3 model with SAM2-compatible API
-                # The patch_sam3_modules_for_device() handles all device placement
                 self.status_label.config(text="Building SAM3 model (may download from HuggingFace)...")
                 self.root.update()
 
-                sam3_model = build_sam3_video_model(device=device)
+                # Parse checkpoint path from full internal model info string
+                parts = _full_model_info.split('|')
+                ckpt_filename = parts[1] if len(parts) >= 2 else "sam3.pt"
+                sam3_checkpoint_dir = os.path.join(
+                    os.path.dirname(os.path.dirname(self.checkpoint_dir)), "sam3", "checkpoints"
+                )
+                ckpt_path = os.path.join(sam3_checkpoint_dir, ckpt_filename)
+
+                if os.path.exists(ckpt_path):
+                    sam3_model = build_sam3_video_model(checkpoint_path=ckpt_path, device=device)
+                else:
+                    sam3_model = build_sam3_video_model(device=device)
 
                 # Extract the predictor using SAM2-compatible interface
                 self.sam2_model = sam3_model.tracker
@@ -6799,7 +7106,12 @@ class SAM2VideoUI:
                     if not model_info:
                         raise ValueError("No models available. Please run setup.py first to download models.")
                 else:
-                    model_info = model_selection
+                    model_info = next(
+                        (m for m in self.available_models[1:] if m.split('|')[0] == model_selection),
+                        None
+                    )
+                    if not model_info:
+                        raise ValueError(f"Model not found: {model_selection}")
 
                 # Parse model info: "Display Name|checkpoint_file|config_path"
                 parts = model_info.split('|')
@@ -6881,7 +7193,7 @@ class SAM2VideoUI:
             )
             self.status_label.config(text=f"{model_type_display} loaded: {display_name} on {device.upper()}")
 
-            # Test that the model has the required methods
+            # Test that the model has the required methods.
             if not hasattr(self.sam2_model, 'init_state'):
                 raise AttributeError("Model does not have 'init_state' method. Check SAM2 installation.")
             if not hasattr(self.sam2_model, 'add_new_points'):
