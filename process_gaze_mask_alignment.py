@@ -56,6 +56,38 @@ def _score_gaze_all_masks(
     hits = (patch[:, circle_local] > 0).sum(axis=1)  # (N,)
     return hits.astype(float) / circle_area
 
+
+def _frame_group_worker(args):
+    """Worker: load masks for one frame, score all gaze points, return partial probabilities."""
+    frame_idx, gaze_points, mask_dir, r = args
+    # gaze_points: list of (gaze_index, xi, yi)
+    disk = _disk_template(r)
+    frame_id_str = f"{frame_idx:06d}"
+
+    npz_path = Path(mask_dir) / f"masks_f{frame_id_str}.npz"
+    if npz_path.exists():
+        data = np.load(str(npz_path))
+        masks = {k + ".png": (data[k] > 0).astype(np.uint8) for k in data.files}
+    else:
+        pattern = os.path.join(mask_dir, f"*mask_f{frame_id_str}*.png")
+        masks = {}
+        for mask_path in sorted(glob.glob(pattern)):
+            mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+            if mask is not None:
+                masks[os.path.basename(mask_path)] = np.where(mask > 0, 1, 0).astype(np.uint8)
+
+    if not masks:
+        return {}, False
+
+    mask_names = list(masks.keys())
+    stacked = np.stack(list(masks.values()))
+    result = {}
+    for gaze_idx, xi, yi in gaze_points:
+        confs = _score_gaze_all_masks(stacked, xi, yi, r, disk)
+        result[gaze_idx] = dict(zip(mask_names, confs.tolist()))
+    return result, True
+
+
 """
 Published-version aligner to assign an object label to each gaze sample using
 segmentation masks and gaze/world-camera timestamps.
@@ -152,6 +184,15 @@ Outputs:
 
     2) A log file is written to *--log-path* if provided, otherwise to
        *{output_dir}/gaze_object.log*.
+
+Notes:
+    NPZ mask format: If masks_f{frame_id}.npz files exist alongside PNGs, they are used
+    automatically (no flag needed). NPZ reads are ~3x faster than per-object PNG reads.
+
+    Fast reuse from cached pkl: If {output_dir}/{subject}_gazed_object/{subject}_{camera}_gaze_object_probabilities.pkl
+    already exists from a previous run, this script will skip all mask I/O and reassign gaze
+    objects directly from the cached per-mask confidence scores. A WARNING is logged when this
+    shortcut is taken. To force recomputation from masks regardless, pass --recompute.
 """
 
 
@@ -229,6 +270,8 @@ class GazeObjectAligner:
         ignore_object_list: Optional[str] = None,
         plot_figures: bool = True,
         logger: Optional[logging.Logger] = None,
+        recompute: bool = False,
+        within_job_workers: int = 1,
     ):
         self.gaze_world_dir = gaze_world_dir
         self.mask_dir = mask_dir
@@ -237,6 +280,7 @@ class GazeObjectAligner:
         self.start_plot_time = start_plot_time
         self.end_plot_time = end_plot_time
         self.logger = logger or logging.getLogger(__name__)
+<<<<<<< HEAD
         self.ignore_object_list = ignore_object_list
         self.plot_figures = plot_figures
         self.ignore_objects = self.load_ignore_objects(ignore_object_list)
@@ -287,6 +331,10 @@ class GazeObjectAligner:
     def excluded_objects_output_suffix(self):
         """Label outputs that were generated after excluding ignored objects."""
         return "_excluding_ignored_objects" if self.ignore_objects else ""
+=======
+        self.recompute = recompute
+        self.within_job_workers = within_job_workers
+>>>>>>> 21d4988 (parallel mask scoring, SAM3 text-pipeline lazy loading, untrack sam_models)
 
     def resolve_mask_dir(self, subj: str, camera: str) -> Path:
         """Resolve the mask directory for a subject/camera across supported layouts."""
@@ -853,7 +901,6 @@ class GazeObjectAligner:
                 )
 
             subject_gaze_probabilities = {}
-            self.logger.info(f"Loading masks from {mask_subject}")
             total_gaze_points = len(gaze_blink_removed)
             total_frames = unique_post_blink_frames
             frames_with_masks = 0
@@ -866,24 +913,63 @@ class GazeObjectAligner:
             gaze_blink_removed['gazed_object_confidence'] = 0.0
             _r = 20
             _disk = _disk_template(_r)
-            for frame_idx, gdf in gaze_blink_removed.groupby('frame_idx', sort=False):
-                masks_one_frame = self.load_mask(int(frame_idx), mask_subject)  # ONE disk read per frame
-                if len(masks_one_frame) == 0:
-                    frames_without_masks += 1
-                    continue
-                frames_with_masks += 1
-                mask_names = list(masks_one_frame.keys())
-                stacked = np.stack(list(masks_one_frame.values()))  # (N_obj, H, W)
-                # Score each gaze point against all masks in one vectorized pass per gaze
-                for i in gdf.index:
-                    row = gdf.loc[i]
-                    xi = int(round(row['gaze x [px]']))
-                    yi = int(round(row['gaze y [px]']))
-                    confs = _score_gaze_all_masks(stacked, xi, yi, _r, _disk)
-                    subject_gaze_probabilities[i] = dict(zip(mask_names, confs.tolist()))
-                    best_conf = float(confs.max())
+
+            pkl_path = out_dir / f"{subject_id_temp}_{camera_temp}_gaze_object_probabilities.pkl"
+            _use_cached_pkl = not self.recompute and pkl_path.exists()
+
+            if _use_cached_pkl:
+                self.logger.warning(
+                    "Found existing probabilities at %s — skipping mask I/O and reassigning from "
+                    "cached scores. Pass --recompute to force a full run from scratch.",
+                    pkl_path,
+                )
+                with open(pkl_path, 'rb') as f:
+                    subject_gaze_probabilities = pickle.load(f)
+                for i in gaze_blink_removed.index:
+                    probs = subject_gaze_probabilities.get(i, {})
+                    if probs:
+                        best_name = max(probs, key=lambda k: probs[k])
+                        best_conf = float(probs[best_name])
+                        if best_conf > 0.0:
+                            gaze_blink_removed.loc[i, 'gazed_object_id'] = best_name.split('.')[0].split('_')[-1]
+                            gaze_blink_removed.loc[i, 'gazed_object'] = '_'.join(best_name.split('.')[0].split('_')[2:-1])
+                            gaze_blink_removed.loc[i, 'gazed_object_confidence'] = best_conf
+                            assigned_gaze_points += 1
+                            assigned_confidences.append(best_conf)
+            else:
+                self.logger.info(f"Loading masks from {mask_subject}")
+                frame_groups = []
+                for frame_idx, gdf in gaze_blink_removed.groupby('frame_idx', sort=False):
+                    gaze_points = [
+                        (i, int(round(gdf.loc[i, 'gaze x [px]'])), int(round(gdf.loc[i, 'gaze y [px]'])))
+                        for i in gdf.index
+                    ]
+                    frame_groups.append((int(frame_idx), gaze_points, str(mask_subject), _r))
+
+                if self.within_job_workers > 1:
+                    with ProcessPoolExecutor(max_workers=self.within_job_workers) as executor:
+                        for partial, has_masks in executor.map(_frame_group_worker, frame_groups):
+                            if not has_masks:
+                                frames_without_masks += 1
+                            else:
+                                frames_with_masks += 1
+                                subject_gaze_probabilities.update(partial)
+                else:
+                    for args in frame_groups:
+                        partial, has_masks = _frame_group_worker(args)
+                        if not has_masks:
+                            frames_without_masks += 1
+                        else:
+                            frames_with_masks += 1
+                            subject_gaze_probabilities.update(partial)
+
+                for i in gaze_blink_removed.index:
+                    probs = subject_gaze_probabilities.get(i, {})
+                    if not probs:
+                        continue
+                    best_name = max(probs, key=probs.__getitem__)
+                    best_conf = float(probs[best_name])
                     if best_conf > 0.0:
-                        best_name = mask_names[int(confs.argmax())]
                         gaze_blink_removed.loc[i, 'gazed_object_id'] = best_name.split('.')[0].split('_')[-1]
                         gaze_blink_removed.loc[i, 'gazed_object'] = '_'.join(best_name.split('.')[0].split('_')[2:-1])
                         gaze_blink_removed.loc[i, 'gazed_object_confidence'] = best_conf
@@ -899,30 +985,20 @@ class GazeObjectAligner:
             assignment_rate = (assigned_gaze_points / total_gaze_points * 100.0) if total_gaze_points > 0 else 0.0
             mean_conf = float(np.mean(assigned_confidences)) if assigned_confidences else 0.0
             median_conf = float(np.median(assigned_confidences)) if assigned_confidences else 0.0
-            self.logger.info(
-                (
-                    "Gaze-object assignment summary for subject=%s camera=%s: "
-                    "total_gaze_points=%d assigned=%d assignment_rate=%.2f%% "
-                    "frames_with_readable_masks=%d/%d post_blink_frames "
-                    "mean_conf=%.4f median_conf=%.4f"
-                ),
-                subject_id_temp,
-                camera_temp,
-                total_gaze_points,
-                assigned_gaze_points,
-                assignment_rate,
-                frames_with_masks,
-                total_frames,
-                mean_conf,
-                median_conf,
-            )
-            if frames_without_masks > 0:
+            if _use_cached_pkl:
                 self.logger.info(
-                    "No readable segmentation masks were found for %d post-blink frame(s) for subject=%s camera=%s.",
-                    frames_without_masks,
+                    "Gaze-object assignment summary (from cached pkl) for subject=%s camera=%s: "
+                    "total_gaze_points=%d assigned=%d assignment_rate=%.2f%% "
+                    "mean_conf=%.4f median_conf=%.4f",
                     subject_id_temp,
                     camera_temp,
+                    total_gaze_points,
+                    assigned_gaze_points,
+                    assignment_rate,
+                    mean_conf,
+                    median_conf,
                 )
+<<<<<<< HEAD
             excluded_objects_suffix = self.excluded_objects_output_suffix()
             output_path = os.path.join(out_dir, f"{subject_id_temp}_{camera_temp}_gazed_object{excluded_objects_suffix}.csv")
             gaze_blink_removed.to_csv(output_path, index=False)
@@ -941,6 +1017,47 @@ class GazeObjectAligner:
                 )
             else:
                 self.logger.info("Skipping method figures because --skip-figures was provided.")
+=======
+            else:
+                self.logger.info(
+                    (
+                        "Gaze-object assignment summary for subject=%s camera=%s: "
+                        "total_gaze_points=%d assigned=%d assignment_rate=%.2f%% "
+                        "frames_with_readable_masks=%d/%d post_blink_frames "
+                        "mean_conf=%.4f median_conf=%.4f"
+                    ),
+                    subject_id_temp,
+                    camera_temp,
+                    total_gaze_points,
+                    assigned_gaze_points,
+                    assignment_rate,
+                    frames_with_masks,
+                    total_frames,
+                    mean_conf,
+                    median_conf,
+                )
+                if frames_without_masks > 0:
+                    self.logger.info(
+                        "No readable segmentation masks were found for %d post-blink frame(s) for subject=%s camera=%s.",
+                        frames_without_masks,
+                        subject_id_temp,
+                        camera_temp,
+                    )
+            output_path = os.path.join(out_dir, f"{subject_id_temp}_{camera_temp}_gazed_object.csv")
+            gaze_blink_removed.to_csv(output_path, index=False)
+            self.logger.info(f"Saved gaze object results to {output_path}")
+            if not _use_cached_pkl:
+                with open(pkl_path, 'wb') as f:
+                    pickle.dump(subject_gaze_probabilities, f)
+                self.logger.info(f"Saved probabilities of each mask for each eye gaze to {pkl_path}")
+            self.plot_method_figures(
+                subject_id_temp=subject_id_temp,
+                camera_temp=camera_temp,
+                gaze_df=gaze_blink_removed,
+                subject_gaze_probabilities=subject_gaze_probabilities,
+                out_dir=out_dir,
+            )
+>>>>>>> 21d4988 (parallel mask scoring, SAM3 text-pipeline lazy loading, untrack sam_models)
         except Exception:
             run_status = "failed"
             raise
@@ -1055,10 +1172,27 @@ def main():
         default=None,
         help='Optional end time in seconds (from recording start) for method-figure plotting.',
     )
+    parser.add_argument(
+        '--recompute',
+        action='store_true',
+        help='Force recomputation from masks even if a cached probabilities pkl already exists.',
+    )
+    parser.add_argument(
+        '--within-job-workers',
+        type=int,
+        default=1,
+        dest='within_job_workers',
+        help='Number of parallel workers for frame-group processing within one subject-camera pair. Default 1 (sequential). Higher values parallelize mask I/O but may saturate disk.',
+    )
 
     args = parser.parse_args()
+<<<<<<< HEAD
     if args.num_workers < 1:
         parser.error("--num-workers must be >= 1.")
+=======
+    if args.within_job_workers < 1:
+        parser.error("--within-job-workers must be >= 1.")
+>>>>>>> 21d4988 (parallel mask scoring, SAM3 text-pipeline lazy loading, untrack sam_models)
     if args.start_plot_time is not None and args.start_plot_time < 0:
         parser.error("--start-plot-time must be >= 0.")
     if args.end_plot_time is not None and args.end_plot_time < 0:
@@ -1084,11 +1218,32 @@ def main():
         camera_list = [i.strip() for i in args.camera_id.split(',')]
     else:
         gaze_worldcam_dir = Path(args.gaze_world_dir)
+<<<<<<< HEAD
         camera_list = sorted({
             p.stem.split('_')[1]
             for p in gaze_worldcam_dir.iterdir()
             if p.is_file() and p.suffix.lower() in {".csv"} and len(p.stem.split('_')) >= 2
         })
+=======
+        camera_list = np.unique([
+            p.stem.split('_')[1] for p in gaze_worldcam_dir.iterdir()
+            if p.is_file() and p.suffix.lower() in {".csv"}
+        ])
+    
+    if args.blink_dir is not None:
+        gaze_aligner = GazeObjectAligner(
+        args.gaze_world_dir,
+        args.mask_dir,
+        args.output_dir,
+        blink_dir=args.blink_dir,
+        start_plot_time=args.start_plot_time,
+        end_plot_time=args.end_plot_time,
+        logger=logger,
+        recompute=args.recompute,
+        within_job_workers=args.within_job_workers,
+        )
+        logger.info("------- Loaded Files and Directories -------")
+>>>>>>> 21d4988 (parallel mask scoring, SAM3 text-pipeline lazy loading, untrack sam_models)
 
     subject_camera_pairs = [
         (str(subject_id_temp), str(camera_temp))
@@ -1123,6 +1278,7 @@ def main():
         if args.blink_dir is None:
             logger.info("No blink directory provided, skipping blink labeling.")
 
+<<<<<<< HEAD
         if args.num_workers <= 1 or len(subject_camera_pairs) <= 1:
             for subj, cam in subject_camera_pairs:
                 logger.info("------- Start Gaze Mask Processing -------")
@@ -1172,6 +1328,27 @@ def main():
                         logger.exception(f"Failed processing subject {subj} and camera {cam}.")
                         raise
                     logger.info(f"------- Finished processing subject {subj}, camera {cam} -------")
+=======
+    else:
+        gaze_aligner = GazeObjectAligner(
+        args.gaze_world_dir,
+        args.mask_dir,
+        args.output_dir,
+        start_plot_time=args.start_plot_time,
+        end_plot_time=args.end_plot_time,
+        logger=logger,
+        recompute=args.recompute,
+        within_job_workers=args.within_job_workers,
+        )
+        logger.info("------- Loaded Files and Directories -------")
+        logger.info(f"Subjects: {subj_ids}, Cameras: {camera_list}")
+        logger.info(f"Gaze Directory: {args.gaze_world_dir}")
+        logger.info(f"Mask Directory: {args.mask_dir}")
+        logger.info(f"Output Directory: {args.output_dir}")
+        logger.info(f"Plot Start Time (s): {args.start_plot_time}")
+        logger.info(f"Plot End Time (s): {args.end_plot_time}")
+        logger.info(f"No blink directory provided, skipping blink labeling.")
+>>>>>>> 21d4988 (parallel mask scoring, SAM3 text-pipeline lazy loading, untrack sam_models)
 
         logger.info("Gaze object detection complete!")
         logger.info("Pipeline run finished at (local time): %s", format_log_datetime(datetime.now().astimezone()))

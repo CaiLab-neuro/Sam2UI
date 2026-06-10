@@ -862,8 +862,8 @@ class SAM2Processor:
             _unchanged_ids = set(unchanged_ids) if unchanged_ids else set()
             # Pre-compile the key pattern once; only needed for NPZ merge-write.
             _npz_key_pat = re.compile(r"^mask_f(\d{6})_(.+)_id(\d+)$") if (_mask_format == "npz" and _unchanged_ids) else None
-            _write_pool = ThreadPoolExecutor(max_workers=2)
-            _io_sem = threading.Semaphore(8)
+            _write_pool = ThreadPoolExecutor(max_workers=4)
+            _io_sem = threading.Semaphore(16)
             _write_futures = []
 
             # Free any cached GPU memory before the propagation loop
@@ -1385,7 +1385,7 @@ Examples:
     parser.add_argument("--smooth-masks", action="store_true",
                        help="Apply morphological smoothing to reduce pixelation in exported masks (preserves binary masks)")
     parser.add_argument("--frame-dir", type=str, default=None,
-                       help="Persistent directory for video frames (default: auto-generated in /tmp). If specified, frames will be reused from previous runs and not deleted after processing.")
+                       help="Persistent directory for video frames (default: auto-generated in the system temp directory). If specified, frames will be reused from previous runs and not deleted after processing.")
     parser.add_argument("--frame-cache-size", type=int, default=20,
                        help="Number of frames to keep in memory cache (default: 20, ~2GB). Minimum: 10, Recommended: 20-50.")
     parser.add_argument("--frame-format", type=str, default="jpg", choices=["jpg", "png"],
