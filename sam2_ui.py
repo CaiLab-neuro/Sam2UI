@@ -17,6 +17,7 @@ import time
 import threading
 import re
 import argparse
+import colorsys
 from collections import deque
 
 # Import utility functions
@@ -113,6 +114,22 @@ def _probe_fa3() -> bool:
     except ImportError:
         pass
     return False
+
+
+class _AutoNameDict(dict):
+    """Dict that auto-generates 'Object_N' names for missing keys."""
+    def __missing__(self, key):
+        self[key] = f"Object_{key}"
+        return self[key]
+
+
+class _AutoColorDict(dict):
+    """Dict that auto-generates distinct HSV colors for missing keys."""
+    def __missing__(self, key):
+        hue = (key * 137.5) % 360
+        r, g, b = colorsys.hsv_to_rgb(hue / 360, 0.8 + (key % 3) * 0.1, 0.9 - (key % 2) * 0.2)
+        self[key] = [int(r * 255), int(g * 255), int(b * 255)]
+        return self[key]
 
 
 class TkProgressCallback:
@@ -224,12 +241,16 @@ class SAM2VideoUI:
         self.inference_state = None
         self.current_object_id = 1  # Currently selected object ID
         self.max_object_id = 1  # Track highest object ID used
-        self.max_total_objects = 100  # Maximum number of objects supported
-        
+
         # Enhanced object management
         self.object_names = {}  # Maps obj_id to custom name
         self.object_colors = {}  # Dynamic color assignment
         self.point_removal_mode = False
+
+        # SAM3 integration state
+        self.sam3_object_ids: set = set()
+        self.sam3_mask_dirs: dict = {}     # obj_id → (abs_mask_dir, filename_pattern)
+        self.sam3_project_dir: str | None = None
 
         # Multi-frame annotation mode (always enabled)
         self.multi_frame_annotation_mode = True
@@ -380,19 +401,12 @@ class SAM2VideoUI:
         self.setup_ui()
         
     def _initialize_objects(self):
-        """Initialize object colors and default names for up to max_total_objects"""
-        # Generate distinct colors using HSV space
-        for i in range(1, self.max_total_objects + 1):
-            # Use HSV for better color distribution
-            hue = (i * 137.5) % 360  # Golden angle approximation for good distribution
-            saturation = 0.8 + (i % 3) * 0.1  # Vary saturation slightly
-            value = 0.9 - (i % 2) * 0.2  # Vary brightness slightly
-            
-            # Convert HSV to RGB
-            import colorsys
-            r, g, b = colorsys.hsv_to_rgb(hue/360, saturation, value)
-            self.object_colors[i] = [int(r*255), int(g*255), int(b*255)]
-            self.object_names[i] = f"Object_{i}"
+        """Initialize auto-generating object name/color dicts."""
+        self.object_names = _AutoNameDict()
+        self.object_colors = _AutoColorDict()
+        # Pre-populate entry for object 1 so it exists immediately
+        _ = self.object_names[1]
+        _ = self.object_colors[1]
         
     def setup_styles(self):
         """Configure ttk styles"""
@@ -520,7 +534,7 @@ class SAM2VideoUI:
         ttk.Label(current_obj_frame, text="Current:").pack(side=tk.LEFT)
 
         self.object_var = tk.IntVar(value=1)
-        self.object_spinbox = tk.Spinbox(current_obj_frame, from_=1, to=self.max_total_objects,
+        self.object_spinbox = tk.Spinbox(current_obj_frame, from_=1, to=9999,
                                         textvariable=self.object_var, width=5,
                                         command=self.on_object_change,
                                         bg='#404040', fg='white', insertbackground='white')
@@ -1186,8 +1200,10 @@ class SAM2VideoUI:
             # Count points for this object
             point_count = sum(1 for _, _, _, oid, _ in self.click_points if oid == obj_id)
 
-            # Insert into tree (show * for objects with changed annotations)
+            # Insert into tree (show [SAM3] and/or * markers)
             display_name = self.object_names[obj_id]
+            if obj_id in self.sam3_object_ids:
+                display_name += " [SAM3]"
             if obj_id in self.updated_objects:
                 display_name += " *"
             item = self.object_tree.insert("", "end", text=str(obj_id),
@@ -1235,7 +1251,7 @@ class SAM2VideoUI:
                     if 'id' in row and 'name' in row:
                         try:
                             obj_id = int(row['id'])
-                            if 1 <= obj_id <= self.max_total_objects:
+                            if obj_id >= 1:
                                 self.object_names[obj_id] = row['name'].strip()
                                 imported_count += 1
                         except ValueError:
@@ -1275,7 +1291,7 @@ class SAM2VideoUI:
                 writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
                 writer.writeheader()
                 
-                for obj_id in range(1, self.max_total_objects + 1):
+                for obj_id in range(1, self.max_object_id + 1):
                     if obj_id in self.object_colors:
                         color = self.object_colors[obj_id]
                         writer.writerow({
@@ -1322,6 +1338,16 @@ class SAM2VideoUI:
                 "object_names": self.object_names,
                 "object_colors": {str(k): v for k, v in self.object_colors.items()},
                 "updated_objects": sorted(self.updated_objects),
+                "sam3_objects": sorted(self.sam3_object_ids),
+                "sam3_mask_dirs": {
+                    str(obj_id): {
+                        "mask_dir_rel": os.path.relpath(mask_dir, self.sam3_project_dir)
+                                        if self.sam3_project_dir else mask_dir,
+                        "mask_filename_pattern": pattern,
+                        "name": self.object_names.get(obj_id, f"Object_{obj_id}"),
+                    }
+                    for obj_id, (mask_dir, pattern) in self.sam3_mask_dirs.items()
+                },
                 "annotations": []
             }
 
@@ -1545,6 +1571,12 @@ class SAM2VideoUI:
 
             self.last_dir_results = os.path.dirname(output_dir)
 
+            # Detect SAM3 project handoff
+            handoff_path = os.path.join(output_dir, "sam2_handoff.json")
+            if os.path.exists(handoff_path):
+                self._load_from_sam3_handoff(output_dir, handoff_path)
+                return
+
             # Load metadata first
             metadata_path = os.path.join(output_dir, "processing_metadata.json")
             if not os.path.exists(metadata_path):
@@ -1691,6 +1723,109 @@ class SAM2VideoUI:
         except Exception as e:
             messagebox.showerror("Import Error", f"Failed to import masks: {str(e)}")
 
+    def _load_from_sam3_handoff(self, project_dir, handoff_path):
+        """Load a SAM3 project via its sam2_handoff.json, reading masks from native SAM3 paths."""
+        try:
+            with open(handoff_path, 'r') as f:
+                handoff = json.load(f)
+
+            mapping = handoff.get("object_mapping", {})
+            if not mapping:
+                messagebox.showerror("Error", "sam2_handoff.json has no object_mapping entries.")
+                return
+
+            num_frames = handoff.get("num_frames", 0)
+            if num_frames <= 0:
+                messagebox.showerror("Error", "sam2_handoff.json has invalid num_frames.")
+                return
+
+            # Build sam3_mask_dirs: {obj_id: (abs_mask_dir, filename_pattern)}
+            self.sam3_mask_dirs = {}
+            for k, v in mapping.items():
+                obj_id = int(k)
+                abs_mask_dir = os.path.normpath(os.path.join(project_dir, v["mask_dir_rel"]))
+                self.sam3_mask_dirs[obj_id] = (abs_mask_dir, v["mask_filename_pattern"])
+
+            # Resolve original video path; prompt relink if missing
+            video_path = handoff.get("original_video_path", "")
+            if not video_path or not os.path.exists(video_path):
+                answer = messagebox.askokcancel(
+                    "Video Not Found",
+                    f"Original video not found:\n{video_path}\n\nLocate it now?")
+                if not answer:
+                    return
+                new_path = filedialog.askopenfilename(
+                    title="Locate Original Video",
+                    filetypes=[("Video files", "*.mp4 *.avi *.mov *.mkv *.webm"),
+                               ("All files", "*.*")],
+                    initialdir=project_dir)
+                if not new_path:
+                    return
+                video_path = new_path
+                # Persist the relinked path
+                handoff["original_video_path"] = video_path
+                handoff["updated"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                with open(handoff_path, 'w') as f:
+                    json.dump(handoff, f, indent=2)
+
+            # Set up flags for dynamic (non-pre-rendered) mask display
+            self.segmented_video_displayed = False
+            self.has_prerendered_masks = False
+            self.video_path = video_path
+            self.original_video_path_for_resegment = video_path
+            self.sam3_project_dir = os.path.abspath(project_dir)
+            self.sam3_object_ids = set(int(k) for k in mapping)
+
+            # Populate object names/colors from handoff
+            object_colors_raw = handoff.get("object_colors", {})
+            self.object_names = _AutoNameDict({int(k): v["name"] for k, v in mapping.items()})
+            self.object_colors = _AutoColorDict({int(k): v for k, v in object_colors_raw.items()})
+
+            # Pre-populate self.masks placeholders for all frames/objects
+            self.masks = {
+                frame_idx: {int(k): None for k in mapping}
+                for frame_idx in range(num_frames)
+            }
+
+            self.max_object_id = max(int(k) for k in mapping)
+            self.object_var.set(self.current_object_id)
+            self.object_spinbox.config(to=self.max_object_id)
+
+            # Set mask_export_dir to sam2_results subdir for SAM2-added objects
+            sam2_results_subdir = handoff.get("sam2_results_subdir", "sam2_results")
+            sam2_masks_dir = os.path.join(project_dir, sam2_results_subdir, "masks")
+            os.makedirs(sam2_masks_dir, exist_ok=True)
+            self.mask_export_dir = sam2_masks_dir
+
+            self.results_output_dir = project_dir
+            self.loaded_from_results = True
+
+            # Load video frames
+            self.load_video_frames()
+
+            # Clear undo/redo and dirty state
+            self.undo_stack.clear()
+            self.redo_stack.clear()
+            self.annotations_dirty = False
+            self.updated_objects.clear()
+
+            self.update_object_list()
+            self.display_current_frame()
+            self._enable_flash_mask_button()
+            self._update_refine_button_state()
+
+            num_objects = len(self.sam3_object_ids)
+            self._show_auto_dismiss(
+                "SAM3 Project Loaded",
+                f"Loaded {num_objects} SAM3 object(s) from:\n{project_dir}\n\n"
+                f"Masks are read directly from SAM3 paths.\n"
+                f"New SAM2 objects will be saved to:\n{sam2_masks_dir}",
+                timeout_ms=5000)
+
+        except Exception as e:
+            messagebox.showerror("Import Error", f"Failed to load SAM3 project: {str(e)}")
+            traceback.print_exc()
+
     def _load_annotations_from_metadata(self, metadata):
         """Load annotations from processing metadata into UI state"""
         if "original_annotations" not in metadata:
@@ -1701,11 +1836,11 @@ class SAM2VideoUI:
 
         # Load object names: {int: str}
         object_names_raw = annotations.get("object_names", {})
-        self.object_names = {int(k): v for k, v in object_names_raw.items()}
+        self.object_names = _AutoNameDict({int(k): v for k, v in object_names_raw.items()})
 
         # Load object colors: {int: [R,G,B]}
         object_colors_raw = annotations.get("object_colors", {})
-        self.object_colors = {int(k): v for k, v in object_colors_raw.items()}
+        self.object_colors = _AutoColorDict({int(k): v for k, v in object_colors_raw.items()})
 
         # Load click points: [(x, y, is_positive, obj_id, frame_idx), ...]
         annotations_list = annotations.get("annotations", [])
@@ -2408,13 +2543,9 @@ class SAM2VideoUI:
                         timeout_ms=4000)
 
     def _get_next_color(self):
-        """Get next available color for a new object"""
-        # Find first unused object ID to get its color
-        for obj_id in range(1, self.max_total_objects + 1):
-            if obj_id not in self.object_colors:
-                return self.object_colors.get(obj_id, [255, 255, 255])
-        # Fallback to white if all colors used
-        return [255, 255, 255]
+        """Get the color for the next object ID (auto-generated)."""
+        next_id = self.max_object_id + 1
+        return self.object_colors[next_id]
 
     def toggle_multi_frame_annotation(self):
         """Multi-frame annotation mode is always enabled"""
@@ -2510,7 +2641,7 @@ class SAM2VideoUI:
 
     def on_object_change(self, event=None):
         obj_id = self.object_var.get()
-        if 1 <= obj_id <= self.max_total_objects:
+        if obj_id >= 1:
             self.current_object_id = obj_id
             self.object_name_var.set(self.object_names[obj_id])
             self.update_object_color_display()
@@ -2526,9 +2657,8 @@ class SAM2VideoUI:
 
     def next_object(self):
         """Go to next object in the list"""
-        if self.current_object_id < self.max_total_objects:
-            self.object_var.set(self.current_object_id + 1)
-            self.on_object_change()  # Explicitly trigger the update
+        self.object_var.set(self.current_object_id + 1)
+        self.on_object_change()
 
     def update_object_color_display(self):
         """Update the color indicator for the current object"""
@@ -2537,17 +2667,14 @@ class SAM2VideoUI:
         self.object_color_label.config(text="■", foreground=self._rgb_to_hex(color))
     def add_new_object(self):
         """Add a new object for segmentation"""
-        if self.max_object_id < self.max_total_objects:
-            self.max_object_id += 1
-            self.current_object_id = self.max_object_id
-            self.object_var.set(self.current_object_id)
-            self.object_spinbox.config(to=min(self.max_object_id, self.max_total_objects))
-            self.object_name_var.set(self.object_names[self.current_object_id])
-            self.update_object_color_display()
-            self.update_object_list()
-            self.status_label.config(text=f"Added object {self.current_object_id}: {self.object_names[self.current_object_id]}")
-        else:
-            messagebox.showwarning("Limit Reached", f"Maximum {self.max_total_objects} objects supported.")
+        self.max_object_id += 1
+        self.current_object_id = self.max_object_id
+        self.object_var.set(self.current_object_id)
+        self.object_spinbox.config(to=self.max_object_id)
+        self.object_name_var.set(self.object_names[self.current_object_id])
+        self.update_object_color_display()
+        self.update_object_list()
+        self.status_label.config(text=f"Added object {self.current_object_id}: {self.object_names[self.current_object_id]}")
             
     @staticmethod
     def _truncate_path(path, max_len=50):
@@ -3939,7 +4066,12 @@ class SAM2VideoUI:
         """Add click point for segmentation"""
         if not self.frames or not self.current_frame_idx < len(self.frames):
             return
-            
+
+        if self.current_object_id in self.sam3_object_ids:
+            self.status_label.config(
+                text=f"Object {self.current_object_id} was segmented by SAM3 — select a different object to annotate.")
+            return
+
         # Get canvas coordinates
         canvas_x = self.canvas.canvasx(event.x)
         canvas_y = self.canvas.canvasy(event.y)
@@ -7529,6 +7661,17 @@ class SAM2VideoUI:
         cache_key = (frame_idx, obj_id)
         if cache_key in self.mask_cache:
             return self.mask_cache[cache_key]
+
+        # Check SAM3 native mask paths first
+        if obj_id in self.sam3_mask_dirs:
+            mask_dir, pattern = self.sam3_mask_dirs[obj_id]
+            path = os.path.join(mask_dir, pattern.format(frame=frame_idx))
+            if os.path.exists(path):
+                mask = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+                if mask is not None:
+                    self._cache_mask(cache_key, mask)
+                return mask
+            return None
 
         if not hasattr(self, 'mask_export_dir') or self.mask_export_dir is None:
             print(f"WARNING: No mask export directory found for frame {frame_idx}, obj {obj_id}")

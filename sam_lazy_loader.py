@@ -38,7 +38,8 @@ class LazyVideoFrameLoader:
 
     def __init__(self, img_paths, image_size, offload_video_to_cpu,
                  img_mean, img_std, compute_device, cache_size=20,
-                 frame_loader_fn=None, frame_dtype=None):
+                 frame_loader_fn=None, frame_dtype=None,
+                 prefetch_ahead=8, prefetch_workers=2):
         """
         Args:
             img_paths: List of paths to image frames
@@ -52,13 +53,29 @@ class LazyVideoFrameLoader:
                              (tensor, height, width). Defaults to SAM2's loader.
             frame_dtype: Optional dtype to cast frames to after loading
                         (e.g. torch.float16 for SAM3). None = keep as-is.
+            prefetch_ahead: Decode this many frames ahead of the last access in
+                            background threads (0 disables prefetching).
+                            Propagation reads frames sequentially, so decoding
+                            ahead overlaps JPEG decode with GPU compute.
+            prefetch_workers: Number of background decoder threads.
         """
+        import threading
         self.img_paths = img_paths
         self.image_size = image_size
         self.offload_video_to_cpu = offload_video_to_cpu
         self.compute_device = compute_device
         self.cache_size = cache_size
         self.frame_dtype = frame_dtype
+        # Prefetching further than the cache holds would evict frames before use
+        self.prefetch_ahead = min(prefetch_ahead, max(cache_size - 4, 0))
+        self._lock = threading.Lock()
+        self._inflight = {}  # index -> Future
+        self._executor = None
+        if self.prefetch_ahead > 0:
+            from concurrent.futures import ThreadPoolExecutor
+            self._executor = ThreadPoolExecutor(
+                max_workers=prefetch_workers, thread_name_prefix="FramePrefetch"
+            )
 
         # Ensure mean/std are on the correct device
         target_device = torch.device('cpu') if offload_video_to_cpu else compute_device
@@ -75,6 +92,10 @@ class LazyVideoFrameLoader:
         # LRU cache: OrderedDict (most recently used at end)
         self.cache = OrderedDict()
 
+        # Last accessed index, used to detect access direction for prefetch
+        # (SAM2 backward propagation reads frames in descending order).
+        self._last_index = None
+
         # Load first frame to obtain video dimensions and seed the cache
         img, self.video_height, self.video_width = self._load_img_as_tensor(
             img_paths[0], image_size
@@ -87,20 +108,69 @@ class LazyVideoFrameLoader:
         print(f"  Video dimensions: {self.video_width}x{self.video_height}")
         print(f"  Target size: {image_size}x{image_size}")
         print(f"  Frame dtype: {frame_dtype or 'default (float32)'}")
+        print(f"  Prefetch: {self.prefetch_ahead} frames ahead"
+              f" ({prefetch_workers} threads)" if self.prefetch_ahead else
+              "  Prefetch: disabled")
 
     def __len__(self):
         return len(self.img_paths)
 
     def __getitem__(self, index):
-        """Load frame on demand with LRU caching."""
-        if index in self.cache:
-            self.cache.move_to_end(index)
-            return self.cache[index]
+        """Load frame on demand with LRU caching and direction-aware prefetch."""
+        with self._lock:
+            img = self.cache.get(index)
+            if img is not None:
+                self.cache.move_to_end(index)
+                fut = None
+            else:
+                fut = self._inflight.get(index)
 
-        img, _, _ = self._load_img_as_tensor(self.img_paths[index], self.image_size)
-        img = self._normalize_frame(img)
-        self._add_to_cache(index, img)
+        if img is None:
+            if fut is not None:
+                img = fut.result()  # prefetch already decoding this frame
+            else:
+                img = self._load_frame(index)
+                with self._lock:
+                    self._add_to_cache(index, img)
+
+        self._maybe_prefetch(index)
         return img
+
+    def _load_frame(self, index):
+        """Decode, cast, and normalize one frame (no caching)."""
+        img, _, _ = self._load_img_as_tensor(self.img_paths[index], self.image_size)
+        return self._normalize_frame(img)
+
+    def _prefetch_one(self, index):
+        """Background-thread target: decode a frame into the cache."""
+        try:
+            img = self._load_frame(index)
+            with self._lock:
+                self._add_to_cache(index, img)
+                self._inflight.pop(index, None)
+            return img
+        except Exception:
+            with self._lock:
+                self._inflight.pop(index, None)
+            raise
+
+    def _maybe_prefetch(self, index):
+        """Schedule background decode of upcoming frames in the access direction."""
+        if self._executor is None:
+            return
+        # Descending access (backward propagation) → prefetch backwards
+        step = -1 if (self._last_index is not None
+                      and index == self._last_index - 1) else 1
+        self._last_index = index
+        n = len(self.img_paths)
+        with self._lock:
+            for k in range(1, self.prefetch_ahead + 1):
+                i = index + step * k
+                if i < 0 or i >= n:
+                    break
+                if i in self.cache or i in self._inflight:
+                    continue
+                self._inflight[i] = self._executor.submit(self._prefetch_one, i)
 
     def _normalize_frame(self, img):
         """Cast dtype, move to device, normalize."""
@@ -130,7 +200,8 @@ class LazyVideoFrameLoader:
         return self.compute_device if not self.offload_video_to_cpu else torch.device('cpu')
 
 
-def enable_lazy_loading(cache_size=20, enable_sam3=True):
+def enable_lazy_loading(cache_size=20, enable_sam3=True,
+                        prefetch_ahead=8, prefetch_workers=2):
     """
     Monkey-patch SAM2 and SAM3 to use lazy frame loading.
     Call this BEFORE creating any SAM2VideoPredictor or SAM3 session.
@@ -144,6 +215,10 @@ def enable_lazy_loading(cache_size=20, enable_sam3=True):
     Args:
         cache_size: Frames to keep in LRU cache (default 20, ~2GB for 1008px frames)
         enable_sam3: Also patch SAM3 paths (default True)
+        prefetch_ahead: Background-decode this many frames ahead of the last
+            access (0 disables). Direction-aware: backward propagation
+            prefetches in descending order. Clamped to cache_size - 4.
+        prefetch_workers: Number of decoder threads per loader (default 2)
 
     Example:
         enable_lazy_loading(cache_size=20)
@@ -193,6 +268,7 @@ def enable_lazy_loading(cache_size=20, enable_sam3=True):
         lazy_images = LazyVideoFrameLoader(
             img_paths, image_size, offload_video_to_cpu,
             img_mean_t, img_std_t, compute_device, cache_size,
+            prefetch_ahead=prefetch_ahead, prefetch_workers=prefetch_workers,
         )
         return lazy_images, lazy_images.video_height, lazy_images.video_width
 
@@ -263,16 +339,23 @@ def enable_lazy_loading(cache_size=20, enable_sam3=True):
                 img_mean_t = torch.tensor(img_mean, dtype=torch.float16)[:, None, None]
                 img_std_t = torch.tensor(img_std, dtype=torch.float16)[:, None, None]
 
+                _compute_device = (
+                    torch.device(f"cuda:{torch.cuda.current_device()}")
+                    if torch.cuda.is_available()
+                    else torch.device("cpu")
+                )
                 lazy_images = LazyVideoFrameLoader(
                     img_paths=img_paths,
                     image_size=image_size,
                     offload_video_to_cpu=offload_video_to_cpu,
                     img_mean=img_mean_t,
                     img_std=img_std_t,
-                    compute_device=torch.device("cuda"),
+                    compute_device=_compute_device,
                     cache_size=cache_size,
                     frame_loader_fn=sam3_load_img,
                     frame_dtype=torch.float16,
+                    prefetch_ahead=prefetch_ahead,
+                    prefetch_workers=prefetch_workers,
                 )
                 return lazy_images, lazy_images.video_height, lazy_images.video_width
 

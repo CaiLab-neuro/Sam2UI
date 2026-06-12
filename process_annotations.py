@@ -23,6 +23,7 @@ Examples:
 
 import os
 import sys
+import contextlib
 
 # Reduce GPU memory fragmentation — set before any torch import
 if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
@@ -93,6 +94,45 @@ def _check_sam3_available():
         return False
 
 SAM3_AVAILABLE = _check_sam3_available()
+
+
+def _link_sam3_masks_to_output(sam3_project, sam3_mask_dirs_rel, obj_ids,
+                                output_dir, num_frames, mask_format="png"):
+    """
+    Link (or copy) SAM3 native masks into output_dir/masks/ using SAM2 filename conventions.
+
+    Uses hard links for zero storage overhead on the same filesystem; falls back to
+    shutil.copy2 if hard-linking fails (cross-filesystem or Windows restriction).
+
+    Returns masks_meta: {frame_idx: {obj_id: {"filename": str}}} for the linked objects.
+    """
+    out_masks_dir = Path(output_dir) / "masks"
+    out_masks_dir.mkdir(parents=True, exist_ok=True)
+
+    masks_meta: dict = {}
+    for str_obj_id, entry in sam3_mask_dirs_rel.items():
+        obj_id = int(str_obj_id)
+        if obj_id not in obj_ids:
+            continue
+        mask_dir = sam3_project / entry["mask_dir_rel"]
+        pattern = entry["mask_filename_pattern"]
+        name = entry.get("name", f"Object_{obj_id}")
+        for frame_idx in range(num_frames):
+            src = mask_dir / pattern.format(frame=frame_idx)
+            if not src.exists():
+                continue
+            dst_name = f"mask_f{frame_idx:06d}_{name}_id{obj_id}.png"
+            dst = out_masks_dir / dst_name
+            if not dst.exists():
+                try:
+                    os.link(str(src), str(dst))
+                except OSError:
+                    shutil.copy2(str(src), str(dst))
+            masks_meta.setdefault(frame_idx, {})[obj_id] = {"filename": dst_name}
+
+    linked = sum(len(v) for v in masks_meta.values())
+    print(f"SAM3 masks linked to output: {linked} files for objects {sorted(obj_ids)}")
+    return masks_meta
 
 
 def _write_png_batch(write_tasks, sem):
@@ -425,8 +465,8 @@ class SAM2Processor:
                 # Both SAM2 and SAM3/SAM3.1 unconditionally store maskmem_features in
                 # bfloat16 internally. Global autocast is required so that all other
                 # operations also run in bfloat16, avoiding "BFloat16 vs Float" matmul
-                # errors during propagation. The --use-bfloat16 flag is now a no-op on
-                # CUDA (autocast is always enabled), but kept for backward compatibility.
+                # errors during propagation. BFloat16 is always enabled on CUDA — it
+                # is not optional and there is no user-facing flag for it.
                 torch.autocast(device_type="cuda", dtype=torch.bfloat16).__enter__()
                 print("  BFloat16 mode: GLOBAL autocast enabled")
                 print("  Model weights remain in float32 (checkpoint dtype)")
@@ -856,22 +896,29 @@ class SAM2Processor:
             masks_metadata = {}  # Only metadata, not actual mask arrays
 
             # Async mask writer: GPU loop submits writes to a background thread so it never
-            # blocks on disk I/O.  A semaphore caps the number of in-flight frames to 8
-            # (~80 MB at 1080p × 5 objects) so memory stays bounded even when GPU >> disk.
+            # blocks on disk I/O.  A semaphore caps the queue depth to 8 submitted-but-not-yet-
+            # written frames (~80 MB at 1080p × 5 objects) so memory stays bounded.
             _mask_format = mask_format if mask_format is not None else self.mask_format
             _unchanged_ids = set(unchanged_ids) if unchanged_ids else set()
             # Pre-compile the key pattern once; only needed for NPZ merge-write.
             _npz_key_pat = re.compile(r"^mask_f(\d{6})_(.+)_id(\d+)$") if (_mask_format == "npz" and _unchanged_ids) else None
             _write_pool = ThreadPoolExecutor(max_workers=4)
-            _io_sem = threading.Semaphore(16)
+            _io_sem = threading.Semaphore(8)
             _write_futures = []
 
             # Free any cached GPU memory before the propagation loop
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-            # CRITICAL: Nested autocast context to handle bfloat16 tensors from CPU offloading
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            # Nested autocast mirrors the global autocast in load_model() for CPU-offloaded
+            # tensors that arrive back from RAM during propagation.  Skipped on CPU where
+            # CUDA autocast is unsupported.
+            _fwd_autocast = (
+                torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+                if "cuda" in self.device
+                else contextlib.nullcontext()
+            )
+            with _fwd_autocast:
                 # Build forward propagation iterator
                 if self.use_sam3:
                     propagate_iterator = self.video_predictor.propagate_in_video(
@@ -1025,7 +1072,12 @@ class SAM2Processor:
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
 
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                _bwd_autocast = (
+                    torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+                    if "cuda" in self.device
+                    else contextlib.nullcontext()
+                )
+                with _bwd_autocast:
                     # Build backward propagation iterator
                     if self.use_sam3:
                         propagate_iterator = self.video_predictor.propagate_in_video(
@@ -1398,6 +1450,8 @@ Examples:
                        help="Re-segment only objects marked as updated in the annotation file (updated_objects field). Unchanged objects reuse existing masks from --prev-results or the output directory.")
     parser.add_argument("--prev-results", type=str, default=None,
                        help="Directory with previous segmentation results to reuse masks from (used with --only-updated). Defaults to the output directory.")
+    parser.add_argument("--sam3-project", type=str, default=None,
+                       help="Path to SAM3 project directory. Required when the annotation file references SAM3 objects and processing runs on a different machine from where annotations were created.")
     parser.add_argument("--video-only", action="store_true",
                        help="Skip segmentation entirely; create/recreate the output video from existing masks in the output directory.")
     parser.add_argument("--exclusive-masks", action="store_true", dest="exclusive_masks",
@@ -1447,8 +1501,11 @@ Examples:
     metadata_file = output_dir / "processing_metadata.json"
 
     existing_items = []
-    if masks_dir.exists() and list(masks_dir.glob("*.png")):
-        existing_items.append(f"masks/ ({len(list(masks_dir.glob('*.png')))} files)")
+    if masks_dir.exists():
+        _mask_glob = "*.npz" if args.mask_format == "npz" else "*.png"
+        _existing_masks = list(masks_dir.glob(_mask_glob))
+        if _existing_masks:
+            existing_items.append(f"masks/ ({len(_existing_masks)} files)")
     if video_file.exists():
         existing_items.append("segmented_video.avi")
     if metadata_file.exists():
@@ -1617,11 +1674,22 @@ Examples:
                 if a["object_id"] in updated_ids
             ]
 
+    # Extract SAM3 objects from annotation data (always, not just when --only-updated)
+    sam3_obj_ids = {int(x) for x in annotations_data.get("sam3_objects", [])}
+    sam3_mask_dirs_rel = annotations_data.get("sam3_mask_dirs", {})
+    sam3_project = Path(args.sam3_project) if getattr(args, 'sam3_project', None) else None
+    if sam3_obj_ids and sam3_project:
+        # Remove SAM3 objects from unchanged_ids — they'll be linked from native paths
+        unchanged_ids -= sam3_obj_ids
+        print(f"SAM3 objects detected: {sorted(sam3_obj_ids)} (will link from {sam3_project})")
+    elif sam3_obj_ids and not sam3_project:
+        print(f"SAM3 objects detected: {sorted(sam3_obj_ids)} (no --sam3-project; treating as unchanged)")
+
     # Get video info
     frame_count, fps, width, height = processor.get_video_info(args.video_file)
     if frame_count is None:
         return 1
-    
+
     # Use video FPS if not specified
     if args.fps == 30.0 and fps:
         args.fps = fps
@@ -1737,6 +1805,20 @@ Examples:
                 print("OK: Re-saved quality metrics with all objects")
             else:
                 print(f"WARNING: No masks found in {prev_masks_dir} for unchanged objects {sorted(unchanged_ids)}")
+
+        # Link SAM3 native masks into output_dir/masks/ (zero storage via hard links)
+        if sam3_obj_ids and sam3_project and sam3_mask_dirs_rel:
+            sam3_meta = _link_sam3_masks_to_output(
+                sam3_project, sam3_mask_dirs_rel, sam3_obj_ids,
+                output_dir, num_frames, mask_format=args.mask_format)
+            # Merge SAM3 entries into masks_by_frame so video overlay + quality metrics include them
+            for frame_idx, frame_objs in sam3_meta.items():
+                masks_by_frame.setdefault(frame_idx, {}).update(frame_objs)
+            # Add SAM3 object names (from sam3_mask_dirs_rel) to object_names
+            for str_obj_id, entry in sam3_mask_dirs_rel.items():
+                obj_id = int(str_obj_id)
+                if obj_id in sam3_obj_ids:
+                    object_names[str(obj_id)] = entry.get("name", f"Object_{obj_id}")
 
         # Export results
         processor.export_masks(masks_by_frame, args.video_file, object_names, output_dir)
