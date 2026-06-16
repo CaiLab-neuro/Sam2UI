@@ -336,7 +336,7 @@ class ConsoleProgressCallback:
 
 
 class SAM2Processor:
-    def __init__(self, config_file=None, checkpoint_file=None, model_name="sam2.1-base+", offload_to_cpu=False, async_loading=False, smooth_masks=False, device=None, frame_format="jpg", exclusive_masks=False, mask_format="png", vos_optimized=False):
+    def __init__(self, config_file=None, checkpoint_file=None, model_name="sam2.1-base+", offload_to_cpu=False, async_loading=False, smooth_masks=False, device=None, frame_format="jpg", exclusive_masks=False, mask_format="png", vos_optimized=False, no_bfloat16=False):
         """
         Initialize SAM2 Processor
 
@@ -358,6 +358,7 @@ class SAM2Processor:
         # Store model name for detection
         self.model_name = model_name
         self.vos_optimized = vos_optimized
+        self.no_bfloat16 = no_bfloat16
 
         # Check if SAM3 was requested but is not available
         if model_name == "sam3" and not SAM3_AVAILABLE:
@@ -465,11 +466,41 @@ class SAM2Processor:
                 # Both SAM2 and SAM3/SAM3.1 unconditionally store maskmem_features in
                 # bfloat16 internally. Global autocast is required so that all other
                 # operations also run in bfloat16, avoiding "BFloat16 vs Float" matmul
-                # errors during propagation. BFloat16 is always enabled on CUDA — it
-                # is not optional and there is no user-facing flag for it.
-                torch.autocast(device_type="cuda", dtype=torch.bfloat16).__enter__()
-                print("  BFloat16 mode: GLOBAL autocast enabled")
-                print("  Model weights remain in float32 (checkpoint dtype)")
+                # errors during propagation.
+                major = torch.cuda.get_device_properties(gpu_id).major
+                _enable_bfloat16 = not self.no_bfloat16
+                if self.no_bfloat16:
+                    print("  BFloat16 mode: DISABLED via --no-bfloat16")
+                elif major < 8:
+                    # Pre-Ampere GPU: no native bfloat16 hardware — warn and ask.
+                    # SAM2/SAM3 store maskmem_features in bfloat16 regardless of
+                    # autocast, so disabling autocast may cause dtype mismatch errors.
+                    # Enabling it runs in software emulation, which may be slow or wrong.
+                    # Neither path is guaranteed to work; let the user decide.
+                    print(f"\n  WARNING: Your GPU has compute capability {major}.x "
+                          f"(pre-Ampere, < 8.0) with no native bfloat16 hardware.")
+                    print("  SAM2/SAM3 store internal tensors (maskmem_features) in")
+                    print("  bfloat16 regardless of this setting. Your options:")
+                    print("    [Y] Enable bfloat16 autocast (recommended — keeps compute")
+                    print("        consistent with internal tensors; may run slowly or")
+                    print("        error depending on PyTorch version and driver)")
+                    print("    [N] Disable bfloat16 autocast (may cause dtype mismatch")
+                    print("        errors because internal tensors remain bfloat16)")
+                    print("  Pass --no-bfloat16 to always choose N without this prompt.")
+                    print("  If neither option works, please report your GPU model,")
+                    print("  PyTorch version, CUDA version, and the error message at:")
+                    print("  https://github.com/MingboCai/Sam2UI/issues")
+                    try:
+                        answer = input("  Enable bfloat16 autocast? [Y/n]: ").strip().lower()
+                    except EOFError:
+                        answer = ""  # non-interactive: fall back to recommended default
+                    _enable_bfloat16 = answer not in ("n", "no")
+                    if not _enable_bfloat16:
+                        print("  BFloat16 mode: DISABLED (user choice)")
+                if _enable_bfloat16:
+                    torch.autocast(device_type="cuda", dtype=torch.bfloat16).__enter__()
+                    print("  BFloat16 mode: GLOBAL autocast enabled")
+                    print("  Model weights remain in float32 (checkpoint dtype)")
 
             # Load model based on type
             # Use context manager to prevent hardcoded CUDA allocations when using
@@ -915,7 +946,7 @@ class SAM2Processor:
             # CUDA autocast is unsupported.
             _fwd_autocast = (
                 torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-                if "cuda" in self.device
+                if "cuda" in self.device and not self.no_bfloat16
                 else contextlib.nullcontext()
             )
             with _fwd_autocast:
@@ -1430,6 +1461,12 @@ Examples:
     parser.add_argument("--checkpoint", help="Custom checkpoint path (requires --config)")
     parser.add_argument("--fps", type=float, default=30.0, help="Output video FPS (default: 30)")
     parser.add_argument("--opacity", type=float, default=0.4, help="Mask overlay opacity (default: 0.4)")
+    parser.add_argument("--no-bfloat16", action="store_true", dest="no_bfloat16",
+                       help="Disable bfloat16 autocast on CUDA. SAM2/SAM3 store internal "
+                            "tensors in bfloat16 regardless, so this may cause dtype mismatch "
+                            "errors. Primarily useful on pre-Ampere GPUs if autocast causes "
+                            "problems. On pre-Ampere GPUs without this flag you will be asked "
+                            "interactively.")
     parser.add_argument("--offload-to-cpu", action="store_true",
                        help="Offload video frames and model state to CPU to reduce GPU memory usage (slightly increases CPU memory usage and at a cost of a slightly slower speed)")
     parser.add_argument("--async-loading", action="store_true",
@@ -1628,7 +1665,8 @@ Examples:
                                      device=args.device, frame_format=args.frame_format,
                                      exclusive_masks=args.exclusive_masks,
                                      mask_format=args.mask_format,
-                                     vos_optimized=args.vos_optimized)
+                                     vos_optimized=args.vos_optimized,
+                                     no_bfloat16=args.no_bfloat16)
         else:
             processor = SAM2Processor(model_name=args.model, offload_to_cpu=args.offload_to_cpu,
                                      async_loading=args.async_loading, smooth_masks=args.smooth_masks,
@@ -1636,7 +1674,8 @@ Examples:
                                      frame_format=args.frame_format,
                                      exclusive_masks=args.exclusive_masks,
                                      mask_format=args.mask_format,
-                                     vos_optimized=args.vos_optimized)
+                                     vos_optimized=args.vos_optimized,
+                                     no_bfloat16=args.no_bfloat16)
 
         # Set no_backward flag
         processor.no_backward_propagation = args.no_backward
@@ -1678,10 +1717,22 @@ Examples:
     sam3_obj_ids = {int(x) for x in annotations_data.get("sam3_objects", [])}
     sam3_mask_dirs_rel = annotations_data.get("sam3_mask_dirs", {})
     sam3_project = Path(args.sam3_project) if getattr(args, 'sam3_project', None) else None
+
+    # SAM2 objects declared "covered by SAM3" — excluded from segmentation;
+    # their masks are computed as the union of sam3_sub_ids at output time.
+    sam2_covered_raw = annotations_data.get("sam2_covered_ids", {})
+    sam2_covered_ids = {int(k): v for k, v in sam2_covered_raw.items()}
+    if sam2_covered_ids:
+        covered_set = set(sam2_covered_ids.keys())
+        sam3_obj_ids.update(covered_set)  # treat as SAM3-managed (skip segmentation)
+        print(f"SAM2 covered IDs (declared done by SAM3, excluded from re-segmentation): "
+              f"{sorted(covered_set)}")
+
     if sam3_obj_ids and sam3_project:
         # Remove SAM3 objects from unchanged_ids — they'll be linked from native paths
         unchanged_ids -= sam3_obj_ids
-        print(f"SAM3 objects detected: {sorted(sam3_obj_ids)} (will link from {sam3_project})")
+        print(f"SAM3 objects detected: {sorted(sam3_obj_ids - set(sam2_covered_ids))} "
+              f"(will link from {sam3_project})")
     elif sam3_obj_ids and not sam3_project:
         print(f"SAM3 objects detected: {sorted(sam3_obj_ids)} (no --sam3-project; treating as unchanged)")
 
@@ -1819,6 +1870,56 @@ Examples:
                 obj_id = int(str_obj_id)
                 if obj_id in sam3_obj_ids:
                     object_names[str(obj_id)] = entry.get("name", f"Object_{obj_id}")
+
+        # Compute union masks for SAM2-covered IDs (covered_id = OR of sam3_sub_ids masks).
+        # These IDs were declared done by SAM3 but have no direct mask entry; their mask is
+        # the pixel-wise union of the sub-instance masks already linked above.
+        if sam2_covered_ids and sam3_project and sam3_mask_dirs_rel:
+            import cv2 as _cv2
+            out_masks_dir = output_dir / "masks"
+            out_masks_dir.mkdir(exist_ok=True)
+            for covered_id, info in sam2_covered_ids.items():
+                sub_ids = [int(x) for x in info.get("sam3_sub_ids", [])]
+                if not sub_ids:
+                    continue
+                covered_name = info.get("name", f"Object_{covered_id}")
+                object_names[str(covered_id)] = covered_name
+                frames_written = 0
+                for frame_idx in range(num_frames):
+                    union_mask = None
+                    for sub_id in sub_ids:
+                        sub_entry = sam3_mask_dirs_rel.get(str(sub_id))
+                        if sub_entry is None:
+                            continue
+                        mask_dir = sam3_project / sub_entry["mask_dir_rel"]
+                        pattern = sub_entry["mask_filename_pattern"]
+                        mask_path = mask_dir / pattern.format(frame=frame_idx)
+                        if not mask_path.exists():
+                            continue
+                        if mask_path.suffix == ".npz":
+                            import numpy as _np
+                            try:
+                                m = _np.load(str(mask_path))["mask"]
+                            except Exception:
+                                continue
+                        else:
+                            m = _cv2.imread(str(mask_path), _cv2.IMREAD_GRAYSCALE)
+                        if m is None:
+                            continue
+                        union_mask = m if union_mask is None else (union_mask | m)
+                    if union_mask is not None:
+                        out_path = out_masks_dir / (
+                            f"mask_f{frame_idx:06d}_{covered_name}_id{covered_id}.png")
+                        _cv2.imwrite(str(out_path), union_mask)
+                        masks_by_frame.setdefault(frame_idx, {})[covered_id] = {
+                            "filename": out_path.name, "name": covered_name}
+                        frames_written += 1
+                if frames_written:
+                    print(f"  Union mask for '{covered_name}' (id {covered_id}): "
+                          f"{frames_written} frames written.")
+                else:
+                    print(f"  WARNING: No sub-id masks found for covered '{covered_name}' "
+                          f"(id {covered_id}). Sub-ids: {sub_ids}")
 
         # Export results
         processor.export_masks(masks_by_frame, args.video_file, object_names, output_dir)
