@@ -112,6 +112,10 @@ class LazyVideoFrameLoader:
               f" ({prefetch_workers} threads)" if self.prefetch_ahead else
               "  Prefetch: disabled")
 
+    def __del__(self):
+        if self._executor is not None:
+            self._executor.shutdown(wait=False)
+
     def __len__(self):
         return len(self.img_paths)
 

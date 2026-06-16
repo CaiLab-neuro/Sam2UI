@@ -251,6 +251,9 @@ class SAM2VideoUI:
         self.sam3_object_ids: set = set()
         self.sam3_mask_dirs: dict = {}     # obj_id → (abs_mask_dir, filename_pattern)
         self.sam3_project_dir: str | None = None
+        # SAM2 objects declared "covered by SAM3" — read-only, masks are union of sub-ids
+        # {int_id: {"name": str, "color": list, "sam3_sub_ids": list[int]}}
+        self.sam2_covered_ids: dict = {}
 
         # Multi-frame annotation mode (always enabled)
         self.multi_frame_annotation_mode = True
@@ -1348,6 +1351,7 @@ class SAM2VideoUI:
                     }
                     for obj_id, (mask_dir, pattern) in self.sam3_mask_dirs.items()
                 },
+                "sam2_covered_ids": {str(k): v for k, v in self.sam2_covered_ids.items()},
                 "annotations": []
             }
 
@@ -1527,7 +1531,20 @@ class SAM2VideoUI:
                     print(f"Warning: Skipping invalid annotation: {e}")
                     skipped_count += 1
                     continue
-            
+
+            # Prune phantom entries: old files pre-populated all 100 object_names/colors
+            # even for unused objects.  Keep only IDs that have actual click points.
+            used_ids = {pt[3] for pt in self.click_points}
+            phantom_ids = set(self.object_names.keys()) - used_ids
+            if phantom_ids:
+                print(f"Pruning {len(phantom_ids)} unused object entries from imported file "
+                      f"(e.g. old pre-populated Object_1..100 names).")
+                for pid in phantom_ids:
+                    self.object_names.pop(pid, None)
+                    self.object_colors.pop(pid, None)
+            if used_ids:
+                self.max_object_id = max(used_ids)
+
             # Update UI
             self.update_points_display()
             self.update_object_list()
@@ -1781,13 +1798,26 @@ class SAM2VideoUI:
             self.object_names = _AutoNameDict({int(k): v["name"] for k, v in mapping.items()})
             self.object_colors = _AutoColorDict({int(k): v for k, v in object_colors_raw.items()})
 
+            # Load covered IDs — SAM2 objects declared done by SAM3 (read-only, no masks here;
+            # their masks are the union of sam3_sub_ids computed at process_annotations time).
+            covered_raw = handoff.get("sam2_covered_ids", {})
+            self.sam2_covered_ids = {int(k): v for k, v in covered_raw.items()}
+            for cid, info in self.sam2_covered_ids.items():
+                self.sam3_object_ids.add(cid)
+                self.object_names[cid] = info.get("name", f"Object_{cid}")
+                c = info.get("color")
+                if c:
+                    self.object_colors[cid] = c
+
             # Pre-populate self.masks placeholders for all frames/objects
+            all_obj_ids = set(int(k) for k in mapping) | set(self.sam2_covered_ids)
             self.masks = {
-                frame_idx: {int(k): None for k in mapping}
+                frame_idx: {oid: None for oid in all_obj_ids}
                 for frame_idx in range(num_frames)
             }
 
-            self.max_object_id = max(int(k) for k in mapping)
+            all_ids_in_handoff = set(int(k) for k in mapping) | set(self.sam2_covered_ids)
+            self.max_object_id = max(all_ids_in_handoff) if all_ids_in_handoff else 1
             self.object_var.set(self.current_object_id)
             self.object_spinbox.config(to=self.max_object_id)
 
@@ -1856,8 +1886,21 @@ class SAM2VideoUI:
         # Update annotated frames set
         self.annotated_frames = set(ann["frame_index"] for ann in annotations_list)
 
+        # Prune phantom entries: old files pre-populated all 100 object_names/colors.
+        # Keep only IDs that have actual click points.
+        used_ids = {pt[3] for pt in self.click_points}
+        phantom_ids = set(self.object_names.keys()) - used_ids
+        if phantom_ids:
+            print(f"Pruning {len(phantom_ids)} unused object entries from metadata "
+                  f"(old pre-populated Object_1..100 names).")
+            for pid in phantom_ids:
+                self.object_names.pop(pid, None)
+                self.object_colors.pop(pid, None)
+
         # Update max object ID
-        if self.object_names:
+        if used_ids:
+            self.max_object_id = max(used_ids)
+        elif self.object_names:
             self.max_object_id = max(self.object_names.keys())
         else:
             self.max_object_id = 1
@@ -2913,9 +2956,14 @@ class SAM2VideoUI:
             # remaining frames (at most one GOP, ~15-60 frames) corrects this.
             self.video_cap_lazy.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
             actual = int(self.video_cap_lazy.get(cv2.CAP_PROP_POS_FRAMES))
+            _seek_guard = 0
             while actual < frame_idx:
                 ret, _ = self.video_cap_lazy.read()
-                if not ret:
+                _seek_guard += 1
+                if not ret or _seek_guard > 500:
+                    # 500 frames is far beyond any realistic GOP; if we're still
+                    # short the codec is not reporting position reliably — bail
+                    # rather than spinning forever on the Tkinter main thread.
                     break
                 actual = int(self.video_cap_lazy.get(cv2.CAP_PROP_POS_FRAMES))
             ret, frame = self.video_cap_lazy.read()
@@ -7667,10 +7715,20 @@ class SAM2VideoUI:
             mask_dir, pattern = self.sam3_mask_dirs[obj_id]
             path = os.path.join(mask_dir, pattern.format(frame=frame_idx))
             if os.path.exists(path):
-                mask = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
-                if mask is not None:
-                    self._cache_mask(cache_key, mask)
-                return mask
+                if path.endswith('.npz'):
+                    try:
+                        data = np.load(path)
+                        mask = data["mask"]
+                        if mask is not None:
+                            self._cache_mask(cache_key, mask)
+                        return mask
+                    except Exception:
+                        return None
+                else:
+                    mask = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+                    if mask is not None:
+                        self._cache_mask(cache_key, mask)
+                    return mask
             return None
 
         if not hasattr(self, 'mask_export_dir') or self.mask_export_dir is None:
