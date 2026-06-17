@@ -528,7 +528,11 @@ class DynamicFrameCompositor:
 
         self.video_cap = cv2.VideoCapture(video_path)
         if not self.video_cap.isOpened():
-            raise ValueError(f"Failed to open video: {video_path}")
+            self.video_cap.release()
+            self.video_cap = None
+            if not self.frames_dir:
+                raise ValueError(f"Failed to open video: {video_path}")
+            print(f"Warning: cannot open video ({video_path}); using frame cache only.")
 
         # Per-frame mask cache: populated by get_composited_frame, read by callers
         # Maps (concept_name, obj_id) -> mask ndarray for the most-recently composited frame.
@@ -562,6 +566,8 @@ class DynamicFrameCompositor:
                 if frame is not None:
                     return frame
         # Priority 2/3: video file (MJPEG or original)
+        if self.video_cap is None:
+            raise ValueError(f"Failed to read frame {frame_idx} (no video source)")
         self.video_cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
         ret, frame = self.video_cap.read()
         if ret:

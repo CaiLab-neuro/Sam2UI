@@ -1280,6 +1280,47 @@ class SAM3VideoUI:
     # Video Loading
     # ============================================================
 
+    def _create_compositor(self):
+        """Create DynamicFrameCompositor for self.project.
+
+        If the stored video path is inaccessible, prompts the user to locate the
+        video file.  The chosen path is used only for this session — it is NOT
+        written back to project.json, so saving will never overwrite the original
+        stored path.
+
+        Returns the compositor, or None if the user cancelled.
+        """
+        try:
+            return DynamicFrameCompositor(self.project)
+        except ValueError as exc:
+            if "Failed to open video" not in str(exc):
+                raise
+        # Video unavailable — ask the user to locate it
+        stored = self.project.video_path or "(unknown)"
+        messagebox.showinfo(
+            "Video Not Found",
+            f"The video file could not be opened:\n\n{stored}\n\n"
+            "Please locate the video file to continue.",
+        )
+        chosen = filedialog.askopenfilename(
+            title="Locate source video",
+            filetypes=[
+                ("Video files", "*.mp4 *.avi *.mov *.mkv *.webm *.m4v"),
+                ("All files", "*.*"),
+            ],
+        )
+        if not chosen:
+            return None
+        # Temporarily patch project.video_path for compositor init so the
+        # constructor can open the file — restored immediately after so that
+        # save() never persists the local override path.
+        _orig = self.project.video_path
+        self.project.video_path = chosen
+        try:
+            return DynamicFrameCompositor(self.project)
+        finally:
+            self.project.video_path = _orig
+
     def load_video(self):
         """Load a video file and create new project"""
 
@@ -1374,8 +1415,11 @@ class SAM3VideoUI:
             self.fps = self.project.fps
             self.current_frame_idx = 0
 
-            # Initialize compositor
-            self.compositor = DynamicFrameCompositor(self.project)
+            # Initialize compositor (prompts for video if stored path is inaccessible)
+            self.compositor = self._create_compositor()
+            if self.compositor is None:
+                self.status_var.set("Load cancelled: video not found.")
+                return
             _tp2 = _time.perf_counter()
 
             # Presence cache must be cleared so it gets rebuilt from actual mask files
@@ -1484,7 +1528,10 @@ class SAM3VideoUI:
             self.frame_dimensions = self.project.frame_dimensions
             self.fps = self.project.fps
 
-            self.compositor = DynamicFrameCompositor(self.project)
+            self.compositor = self._create_compositor()
+            if self.compositor is None:
+                self.status_var.set("Reload cancelled: video not found.")
+                return
             self._invalidate_presence_cache()
             self._load_points_cache_from_project()
             self._load_quality_metrics(project_dir)
