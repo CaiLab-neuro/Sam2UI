@@ -96,16 +96,45 @@ def _check_sam3_available():
 SAM3_AVAILABLE = _check_sam3_available()
 
 
+def _read_mask(mask_path, cv2_mod):
+    """Read a binary mask from a PNG or NPZ file. Returns a uint8 numpy array or None."""
+    p = Path(mask_path)
+    if p.suffix == ".npz":
+        try:
+            import numpy as _np
+            return _np.load(str(p))["mask"]
+        except Exception:
+            return None
+    else:
+        return cv2_mod.imread(str(p), cv2_mod.IMREAD_GRAYSCALE)
+
+
+def _write_mask(dst_path, mask, cv2_mod):
+    """Write a uint8 mask array to dst_path (PNG or NPZ determined by suffix)."""
+    dst_path = Path(dst_path)
+    if dst_path.suffix == ".npz":
+        import numpy as _np
+        _np.savez_compressed(str(dst_path), mask=mask)
+    else:
+        cv2_mod.imwrite(str(dst_path), mask)
+
+
 def _link_sam3_masks_to_output(sam3_project, sam3_mask_dirs_rel, obj_ids,
                                 output_dir, num_frames, mask_format="png"):
     """
     Link (or copy) SAM3 native masks into output_dir/masks/ using SAM2 filename conventions.
 
-    Uses hard links for zero storage overhead on the same filesystem; falls back to
-    shutil.copy2 if hard-linking fails (cross-filesystem or Windows restriction).
+    Single-instance entries use hard links (zero storage overhead on the same filesystem;
+    falls back to shutil.copy2 on cross-filesystem or Windows).  The destination filename
+    extension matches the source file's actual format (PNG or NPZ).
+
+    Multi-instance entries (``mask_sub_instances`` key) compute a pixel-wise OR union of
+    their constituent masks and write the result in ``mask_format`` (png or npz).
 
     Returns masks_meta: {frame_idx: {obj_id: {"filename": str}}} for the linked objects.
     """
+    import cv2 as _cv2
+
     out_masks_dir = Path(output_dir) / "masks"
     out_masks_dir.mkdir(parents=True, exist_ok=True)
 
@@ -114,21 +143,57 @@ def _link_sam3_masks_to_output(sam3_project, sam3_mask_dirs_rel, obj_ids,
         obj_id = int(str_obj_id)
         if obj_id not in obj_ids:
             continue
-        mask_dir = sam3_project / entry["mask_dir_rel"]
-        pattern = entry["mask_filename_pattern"]
         name = entry.get("name", f"Object_{obj_id}")
-        for frame_idx in range(num_frames):
-            src = mask_dir / pattern.format(frame=frame_idx)
-            if not src.exists():
-                continue
-            dst_name = f"mask_f{frame_idx:06d}_{name}_id{obj_id}.png"
-            dst = out_masks_dir / dst_name
-            if not dst.exists():
-                try:
-                    os.link(str(src), str(dst))
-                except OSError:
-                    shutil.copy2(str(src), str(dst))
-            masks_meta.setdefault(frame_idx, {})[obj_id] = {"filename": dst_name}
+
+        sub_instances = entry.get("mask_sub_instances")
+        if sub_instances:
+            # Multi-instance union: pixel-wise OR across all sub-instance masks.
+            # Output format follows mask_format (png or npz).
+            ext = "npz" if mask_format == "npz" else "png"
+            frames_written = 0
+            for frame_idx in range(num_frames):
+                union_mask = None
+                for sub in sub_instances:
+                    mask_dir = sam3_project / sub["mask_dir_rel"]
+                    mask_path = mask_dir / sub["mask_filename_pattern"].format(frame=frame_idx)
+                    if not mask_path.exists():
+                        continue
+                    m = _read_mask(mask_path, _cv2)
+                    if m is None:
+                        continue
+                    union_mask = m if union_mask is None else (union_mask | m)
+                if union_mask is not None:
+                    dst_name = f"mask_f{frame_idx:06d}_{name}_id{obj_id}.{ext}"
+                    dst = out_masks_dir / dst_name
+                    _write_mask(dst, union_mask, _cv2)
+                    masks_meta.setdefault(frame_idx, {})[obj_id] = {
+                        "filename": dst_name, "name": name}
+                    frames_written += 1
+            n_subs = len(sub_instances)
+            sub_names = ", ".join(f"'{s['name']}'" for s in sub_instances)
+            if frames_written:
+                print(f"  Union mask for '{name}' (id {obj_id}) from {n_subs} sub-instances "
+                      f"[{sub_names}]: {frames_written} frames written.")
+            else:
+                print(f"  WARNING: No sub-instance masks found for '{name}' (id {obj_id}). "
+                      f"Sub-instances: [{sub_names}]")
+        else:
+            # Single instance — hard-link into output dir (zero storage overhead).
+            # Preserve the source file's extension (PNG or NPZ) in the destination name.
+            mask_dir = sam3_project / entry["mask_dir_rel"]
+            pattern = entry["mask_filename_pattern"]
+            for frame_idx in range(num_frames):
+                src = mask_dir / pattern.format(frame=frame_idx)
+                if not src.exists():
+                    continue
+                dst_name = f"mask_f{frame_idx:06d}_{name}_id{obj_id}{src.suffix}"
+                dst = out_masks_dir / dst_name
+                if not dst.exists():
+                    try:
+                        os.link(str(src), str(dst))
+                    except OSError:
+                        shutil.copy2(str(src), str(dst))
+                masks_meta.setdefault(frame_idx, {})[obj_id] = {"filename": dst_name}
 
     linked = sum(len(v) for v in masks_meta.values())
     print(f"SAM3 masks linked to output: {linked} files for objects {sorted(obj_ids)}")
@@ -1878,6 +1943,7 @@ Examples:
             import cv2 as _cv2
             out_masks_dir = output_dir / "masks"
             out_masks_dir.mkdir(exist_ok=True)
+            _ext = "npz" if args.mask_format == "npz" else "png"
             for covered_id, info in sam2_covered_ids.items():
                 sub_ids = [int(x) for x in info.get("sam3_sub_ids", [])]
                 if not sub_ids:
@@ -1896,21 +1962,14 @@ Examples:
                         mask_path = mask_dir / pattern.format(frame=frame_idx)
                         if not mask_path.exists():
                             continue
-                        if mask_path.suffix == ".npz":
-                            import numpy as _np
-                            try:
-                                m = _np.load(str(mask_path))["mask"]
-                            except Exception:
-                                continue
-                        else:
-                            m = _cv2.imread(str(mask_path), _cv2.IMREAD_GRAYSCALE)
+                        m = _read_mask(mask_path, _cv2)
                         if m is None:
                             continue
                         union_mask = m if union_mask is None else (union_mask | m)
                     if union_mask is not None:
                         out_path = out_masks_dir / (
-                            f"mask_f{frame_idx:06d}_{covered_name}_id{covered_id}.png")
-                        _cv2.imwrite(str(out_path), union_mask)
+                            f"mask_f{frame_idx:06d}_{covered_name}_id{covered_id}.{_ext}")
+                        _write_mask(out_path, union_mask, _cv2)
                         masks_by_frame.setdefault(frame_idx, {})[covered_id] = {
                             "filename": out_path.name, "name": covered_name}
                         frames_written += 1

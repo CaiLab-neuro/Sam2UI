@@ -487,10 +487,8 @@ class SAM3VideoUI:
         tk.Label(refine_frame, text="Left click: positive  |  Right click: negative",
                  font=("Arial", 8), fg="gray").pack(anchor=tk.W, pady=(2, 4))
 
-        tk.Button(refine_frame, text="Apply Changes & Propagate",
-                 command=self.apply_refinement).pack(fill=tk.X, pady=2)
-        tk.Button(refine_frame, text="Save Changes for Refinement",
-                 command=self.save_points_for_batch).pack(fill=tk.X, pady=2)
+        tk.Button(refine_frame, text="Clear Frame Annotations",
+                 command=self.clear_frame_annotations).pack(fill=tk.X, pady=2)
 
         self.remove_mode_button = tk.Button(
             refine_frame, text="Remove Point Mode",
@@ -499,8 +497,12 @@ class SAM3VideoUI:
         )
         self.remove_mode_button.pack(fill=tk.X, pady=2)
 
-        tk.Button(refine_frame, text="Clear Frame Annotations",
-                 command=self.clear_frame_annotations).pack(fill=tk.X, pady=2)
+        tk.Button(refine_frame, text="Clear ALL Points (all frames)",
+                 fg='darkred', command=self.clear_all_instance_annotations).pack(fill=tk.X, pady=2)
+        tk.Button(refine_frame, text="Save Changes for Refinement",
+                 command=self.save_points_for_batch).pack(fill=tk.X, pady=2)
+        tk.Button(refine_frame, text="Apply Changes & Propagate",
+                 command=self.apply_refinement).pack(fill=tk.X, pady=2)
 
         # Flash buttons (shortcut: f / o)
         flash_row = tk.Frame(refine_frame)
@@ -1242,8 +1244,11 @@ class SAM3VideoUI:
             # Playhead
             if f_start <= self.current_frame_idx <= f_end:
                 cx = (self.current_frame_idx - f_start) / visible * w
-                canvas.create_line(cx + 1, 0, cx + 1, h, fill='black', width=1)
-                canvas.create_line(cx, 0, cx, h, fill='white', width=1)
+                canvas.create_line(cx + 1, 0, cx + 1, h, fill='black', width=3)
+                canvas.create_line(cx, 0, cx, h, fill='#ffdd00', width=2)
+                ts = 4
+                canvas.create_polygon(cx - ts, 0, cx + ts, 0, cx, ts + 2,
+                                      fill='#ffdd00', outline='black', width=1)
 
         _draw_bar(self.quality_overlap_canvas,
                   self.quality_overlap,
@@ -2326,6 +2331,7 @@ class SAM3VideoUI:
         self._metadata_dirty = True
         self.update_concept_tree()
         self.status_var.set(f"Renamed instance to '{new_name}'. Ctrl+Z to undo.")
+        self.canvas.focus_set()
 
     def _compute_per_period_anchors(self, concept, instance, is_positive: bool,
                                     tag: Optional[str] = None,
@@ -2966,6 +2972,30 @@ class SAM3VideoUI:
             self.status_var.set(f"Restored {len(action['points'])} point(s) at frame "
                                 f"{action.get('frame_idx', '?')}.")
 
+        elif t == 'clear_all_instance':
+            key = action['key']
+            # Restore _points_cache to its pre-clear state.
+            cache_entry = self._points_cache.setdefault(key, {})
+            # Remove tombstones we added, then put back whatever was pending before.
+            for f in action['tombstoned_frames']:
+                cache_entry.pop(f, None)
+            cache_entry.update(action['pending_snap'])
+            # Restore all-annotations cache.
+            all_dict = self._all_annotations_cache.setdefault(key, {})
+            all_dict.clear()
+            all_dict.update(action['all_snap'])
+            self._dirty_keys.add(key)
+            # Restore current-frame live points if we're still on the same instance.
+            if (self.selected_concept and self.selected_instance
+                    and self.selected_concept.name == action['concept_name']
+                    and self.selected_instance.sam3_obj_id == action['obj_id']):
+                self.refinement_points.clear()
+                self.refinement_points.extend(action['current_pts_snap'])
+            self.points_label.config(text=f"Points: {len(self.refinement_points)}")
+            self.display_frame()
+            self.status_var.set(
+                f"Undid clear-all: restored annotations for instance (obj {action['obj_id']}).")
+
         elif t == 'delete_instance':
             action['instance'].deleted = False
             action['instance'].visible = True
@@ -3067,6 +3097,23 @@ class SAM3VideoUI:
             self.points_label.config(text="Points: 0")
             self.display_frame()
             self.status_var.set(f"Re-cleared frame {action.get('frame_idx', '?')}.")
+
+        elif t == 'clear_all_instance':
+            key = action['key']
+            cache_entry = self._points_cache.setdefault(key, {})
+            for f in action['tombstoned_frames']:
+                cache_entry[f] = []
+            all_dict = self._all_annotations_cache.setdefault(key, {})
+            all_dict.clear()
+            self._dirty_keys.add(key)
+            if (self.selected_concept and self.selected_instance
+                    and self.selected_concept.name == action['concept_name']
+                    and self.selected_instance.sam3_obj_id == action['obj_id']):
+                self.refinement_points.clear()
+            self.points_label.config(text="Points: 0")
+            self.display_frame()
+            self.status_var.set(
+                f"Re-cleared all annotations for instance (obj {action['obj_id']}).")
 
         elif t == 'delete_instance':
             action['instance'].deleted = True
@@ -3246,6 +3293,65 @@ class SAM3VideoUI:
         self.display_frame()
         self.status_var.set(f"Cleared all annotations at frame {self.current_frame_idx}. "
                             "Ctrl+Z to undo. Save Changes for Refinement or Apply to persist.")
+
+    def clear_all_instance_annotations(self):
+        """Clear ALL annotation points for the selected instance across every frame.
+        Tombstones every frame so --refine won't replay any of them.
+        Undoable within the session; deferred to disk until save."""
+        if not self.selected_instance or not self.selected_concept:
+            messagebox.showwarning("Warning", "Please select an instance first.")
+            return
+        inst = self.selected_instance
+        concept = self.selected_concept
+        key = self._instance_key()
+
+        # Gather what exists: pending cache + all-annotations cache (covers historical too)
+        pending_snap = dict(self._points_cache.get(key, {}))
+        all_snap = dict(self._all_annotations_cache.get(key, {}))
+        current_pts_snap = list(self.refinement_points)
+
+        all_frames = sorted(set(pending_snap) | set(all_snap))
+        total = len(all_frames)
+
+        if not messagebox.askyesno(
+            "Clear ALL Annotation Points",
+            f"This will delete all annotation points for '{inst.user_name}' "
+            f"across {total} frame(s).\n\n"
+            "The instance itself is kept; only the click-point annotations are removed. "
+            "You can Ctrl+Z to undo within this session.\n\n"
+            "Proceed?"
+        ):
+            return
+
+        # Tombstone every frame in _points_cache so _flush writes empty entries
+        # (which supersede historical propagated=True entries on --refine).
+        cache_entry = self._points_cache.setdefault(key, {})
+        for f in all_frames:
+            cache_entry[f] = []
+        # Also wipe the current-frame live list and its all-annotations entry.
+        self.refinement_points.clear()
+        all_dict = self._all_annotations_cache.setdefault(key, {})
+        all_dict.clear()
+        self._dirty_keys.add(key)
+
+        self.undo_stack.append({
+            'type': 'clear_all_instance',
+            'concept_name': concept.name,
+            'obj_id': inst.sam3_obj_id,
+            'key': key,
+            'pending_snap': pending_snap,
+            'all_snap': all_snap,
+            'current_pts_snap': current_pts_snap,
+            'tombstoned_frames': all_frames,
+        })
+        self.redo_stack.clear()
+
+        self.points_label.config(text="Points: 0")
+        self.display_frame()
+        self.status_var.set(
+            f"Cleared all annotations for '{inst.user_name}' ({total} frame(s)). "
+            "Ctrl+Z to undo. Save Changes for Refinement or Apply to persist."
+        )
 
     def _purge_deleted_instance_masks(self, concepts=None):
         """Remove mask dirs for all deleted instances.
@@ -4180,6 +4286,8 @@ class ExportSAM2Dialog:
         else:
             _H("SAM2 ID", 7)
             _H("Include", 6)
+            tk.Label(hdr, text="(same ID → union)",
+                     font=("Arial", 8), fg="gray").pack(side=tk.LEFT, padx=2)
 
         # --- Scrollable body ---
         body_frame = tk.Frame(self.table_lf)
@@ -4263,7 +4371,7 @@ class ExportSAM2Dialog:
                 rb_new.pack(side=tk.LEFT)
 
                 rb_merge = tk.Radiobutton(
-                    action_frame, text="Merge into ID:",
+                    action_frame, text="Union with ID:",
                     variable=act_var, value="merge")
                 rb_merge.pack(side=tk.LEFT, padx=(8, 0))
 
@@ -4375,7 +4483,13 @@ class ExportSAM2Dialog:
             reserved.update(e["id"] for e in self.csv_name_map.values())
         next_id = self._next_free_id(reserved)
 
-        # --- Process each instance row ---
+        # --- Collect all instance assignments into pending dict first ---
+        # pending: {sam2_id: {"name": str, "color": list, "subs": [sub_entry, ...]}}
+        # Collecting before writing prevents a later row from silently overwriting
+        # an earlier one that mapped to the same SAM2 ID.
+        pending: dict = {}
+        errors: list = []
+
         for state in self.row_states:
             concept = state["concept"]
             inst = state["inst"]
@@ -4390,41 +4504,85 @@ class ExportSAM2Dialog:
 
             if kind == "existing":
                 sam2_id = state["sam2_id"]
-                color = inst.get_effective_color(concept.color_rgb or (200, 200, 200))
+                color = list(inst.get_effective_color(concept.color_rgb or (200, 200, 200)))
             elif kind == "csv_match":
                 sam2_id = state["sam2_id"]
-                color = tuple(self.csv_name_map[inst.user_name]["color"])
+                color = list(self.csv_name_map[inst.user_name]["color"])
             elif kind == "unmatched":
                 action = state["action_var"].get()
                 if action == "discard":
                     continue
                 elif action == "merge":
                     sam2_id = state["merge_id_var"].get()
-                    if str(sam2_id) not in new_mapping:
-                        messagebox.showwarning(
-                            "Invalid merge",
-                            f"Instance '{inst.user_name}': merge target ID {sam2_id} "
-                            f"does not exist in the handoff. Choose an existing ID.")
-                        return
+                    # Target must be either already pending (assigned in this pass)
+                    # or present in the existing handoff.
+                    if sam2_id not in pending and str(sam2_id) not in new_mapping:
+                        errors.append(
+                            f"Instance '{inst.user_name}': union target ID {sam2_id} "
+                            f"does not exist in the current handoff or this export batch. "
+                            f"Choose an existing ID or assign this instance a new ID.")
+                        continue
                 else:  # new
                     sam2_id = state["auto_id"]
                     reserved.add(sam2_id)
                     next_id = self._next_free_id(reserved)
-                color = inst.get_effective_color(concept.color_rgb or (200, 200, 200))
+                color = list(inst.get_effective_color(concept.color_rgb or (200, 200, 200)))
             else:  # auto (no CSV)
                 if not state["inc_var"].get():
                     continue
                 sam2_id = state["id_var"].get()
-                color = inst.get_effective_color(concept.color_rgb or (200, 200, 200))
+                color = list(inst.get_effective_color(concept.color_rgb or (200, 200, 200)))
 
-            new_mapping[str(sam2_id)] = {
+            sub_entry = {
                 "concept": concept.name,
                 "instance_id": inst.sam3_obj_id,
                 "name": inst.user_name,
                 "mask_dir_rel": mask_dir_rel,
                 "mask_filename_pattern": "{frame:06d}." + mask_format,
             }
-            new_colors[str(sam2_id)] = list(color)
+            if sam2_id not in pending:
+                pending[sam2_id] = {"name": inst.user_name, "color": color, "subs": []}
+            pending[sam2_id]["subs"].append(sub_entry)
+
+        if errors:
+            messagebox.showwarning("Assignment Errors", "\n\n".join(errors))
+            return
+
+        # --- Confirm intentional multi-instance unions ---
+        unions = [(sid, info) for sid, info in pending.items() if len(info["subs"]) > 1]
+        if unions:
+            union_lines = "\n".join(
+                f"  SAM2 ID {sid}: "
+                + " + ".join(f"'{s['name']}' ({s['concept']})" for s in info["subs"])
+                for sid, info in unions
+            )
+            if not messagebox.askyesno(
+                "Confirm Multi-Instance Union",
+                f"The following SAM2 IDs will have their masks pixel-unioned "
+                f"from multiple SAM3 instances:\n\n{union_lines}\n\nContinue?"
+            ):
+                return
+
+        # --- Write pending assignments to new_mapping ---
+        for sam2_id, info in pending.items():
+            subs = info["subs"]
+            if len(subs) == 1:
+                # Single instance — flat format (backward compatible)
+                sub = subs[0]
+                new_mapping[str(sam2_id)] = {
+                    "concept": sub["concept"],
+                    "instance_id": sub["instance_id"],
+                    "name": info["name"],
+                    "mask_dir_rel": sub["mask_dir_rel"],
+                    "mask_filename_pattern": sub["mask_filename_pattern"],
+                }
+            else:
+                # Multiple instances → pixel-union at export time
+                new_mapping[str(sam2_id)] = {
+                    "name": info["name"],
+                    "mask_sub_instances": subs,
+                }
+            new_colors[str(sam2_id)] = info["color"]
 
         if not new_mapping:
             messagebox.showwarning("Warning", "No instances selected for export.")
@@ -4539,6 +4697,8 @@ class AbsorbInstanceDialog:
         btn_frame.pack(pady=12)
         tk.Button(btn_frame, text="Absorb", width=10, command=self.on_absorb).pack(side=tk.LEFT, padx=5)
         tk.Button(btn_frame, text="Cancel", width=10, command=self.top.destroy).pack(side=tk.LEFT, padx=5)
+
+        self.top.bind("<Return>", lambda e: self.on_absorb())
 
     def on_absorb(self):
         sel = self.listbox.curselection()

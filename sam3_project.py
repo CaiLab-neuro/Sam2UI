@@ -102,7 +102,9 @@ class SAM3Instance:
     # Maximal runs of consecutive frames that have a mask: [(start, end), ...] inclusive
     continuous_periods: List[Tuple[int, int]] = field(default_factory=list)
     # Best (peak-area) frame per period, computed during propagation while masks are in memory.
-    # Each entry: {"start": int, "end": int, "best_frame": int, "pixel_count": int}
+    # Each entry: {"start": int, "end": int, "best_frame": int, "pixel_count": int,
+    #              "avg_pixel_ratio": float, "min_pixel_ratio": float, "max_pixel_ratio": float}
+    # pixel_ratio fields absent on entries from older project.json files — use .get(..., 0.0).
     period_peaks: List[dict] = field(default_factory=list)
     # True when instance was created manually in the UI (not returned by text detection).
     # replay_concept_refinements initializes it via point prompts instead of text detection.

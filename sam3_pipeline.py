@@ -101,28 +101,47 @@ def _prune_non_cond_outputs(inner_state: dict, frame_idx: int, keep: int = 20,
 
 
 def compute_period_peaks(periods: List[Tuple[int, int]],
-                         frame_pixel_counts: "dict[int, int]") -> List[dict]:
-    """For each (start, end) period return the frame with the highest pixel count.
+                         frame_pixel_counts: "dict[int, int]",
+                         total_pixels: int = 0) -> List[dict]:
+    """For each (start, end) period return the peak frame and pixel-ratio stats.
 
     Returns a list of dicts:
-        {"start": int, "end": int, "best_frame": int, "pixel_count": int}
+        {"start": int, "end": int, "best_frame": int, "pixel_count": int,
+         "avg_pixel_ratio": float, "min_pixel_ratio": float, "max_pixel_ratio": float}
 
+    pixel_ratio fields are 0.0 when total_pixels is 0 or no counts are available.
     Intended to be computed once during propagation (while masks are in memory)
     and stored on SAM3Instance so later operations (delete/absorb anchor
     generation) can find the best frame per period without re-reading any PNGs.
     """
     peaks = []
+    inv = 1.0 / total_pixels if total_pixels > 0 else 0.0
     for start, end in periods:
         best_frame = None
         best_count = 0
+        total_count = 0
+        min_count = None
+        max_count = 0
+        n_present = 0
         for f in range(start, end + 1):
             c = frame_pixel_counts.get(f, 0)
             if c > best_count:
                 best_count = c
                 best_frame = f
+            if c > 0:
+                total_count += c
+                max_count = max(max_count, c)
+                min_count = c if min_count is None else min(min_count, c)
+                n_present += 1
         if best_frame is not None and best_count > 0:
-            peaks.append({"start": start, "end": end,
-                          "best_frame": best_frame, "pixel_count": best_count})
+            avg_ratio = (total_count * inv / n_present) if n_present > 0 else 0.0
+            peaks.append({
+                "start": start, "end": end,
+                "best_frame": best_frame, "pixel_count": best_count,
+                "avg_pixel_ratio": avg_ratio,
+                "min_pixel_ratio": (min_count or 0) * inv,
+                "max_pixel_ratio": max_count * inv,
+            })
     return peaks
 
 
@@ -475,6 +494,12 @@ def process_concept_detection(
         frame_count = 0
         mask_count = 0
 
+        # Hoist per-loop constants: concept dir and total frame size for pixel-ratio.
+        concept_dir = project.get_concept_dir(concept.name)
+        _frame_w, _frame_h = project.frame_dimensions
+        total_pixels = _frame_w * _frame_h
+        output_dirs: dict = {}  # obj_id_int -> output_dir (cached per unique object)
+
         # Inner inference_state for cache eviction.
         # SAM3 accumulates full-resolution bool masks in cached_frame_outputs for every
         # yielded frame — ~2MB/obj/frame at 1080p.  Once masks are saved to disk the
@@ -526,12 +551,13 @@ def process_concept_detection(
                 else:
                     mask_np = mask
 
-                # Queue mask for background write (don't accumulate in memory)
-                # Use simple frame-number filenames (hierarchy encoded in directory path)
-                output_dir = os.path.join(
-                    project.get_concept_dir(concept.name),
-                    "instances", str(obj_id_int), "masks"
-                )
+                # Cache output_dir per unique obj_id (os.path.join called once per object,
+                # not once per object per frame).
+                if obj_id_int not in output_dirs:
+                    output_dirs[obj_id_int] = os.path.join(
+                        concept_dir, "instances", str(obj_id_int), "masks"
+                    )
+                output_dir = output_dirs[obj_id_int]
 
                 mask_path = mask_writer.submit(mask_np, output_dir, frame_idx)
                 instance_masks[obj_id_int][frame_idx] = mask_path
@@ -606,7 +632,7 @@ def process_concept_detection(
                 num_frames_with_mask=len(instance_masks[obj_id]),
                 continuous_periods=periods,
                 period_peaks=compute_period_peaks(
-                    periods, pixel_counts_by_obj.get(obj_id_int, {})),
+                    periods, pixel_counts_by_obj.get(obj_id_int, {}), total_pixels),
             )
             instances.append(instance)
 
@@ -730,6 +756,11 @@ def add_refinement_points(
     print("Re-propagating with refinements...")
     from sam3_utils import AsyncMaskWriter
     mask_writer = AsyncMaskWriter(mask_format=mask_format)
+    # output_dir is constant for this single-instance path — hoist before loop.
+    output_dir = os.path.join(
+        project_dir, "concepts", concept.name,
+        "instances", str(instance.sam3_obj_id), "masks"
+    )
     try:
         for out in sam3_model.propagate_in_video(
             session_id=session_id,
@@ -752,12 +783,6 @@ def add_refinement_points(
                         mask_np = mask.cpu().numpy()
                     else:
                         mask_np = mask
-
-                    # Update mask on disk (simple frame-number filename)
-                    output_dir = os.path.join(
-                        project_dir, "concepts", concept.name,
-                        "instances", str(obj_id), "masks"
-                    )
 
                     mask_writer.submit(mask_np, output_dir, out_frame_idx)
 
@@ -1006,6 +1031,9 @@ def replay_concept_refinements(
         from sam3_utils import AsyncMaskWriter
         mask_writer = AsyncMaskWriter(mask_format=mask_format)
         pixel_counts_by_obj: dict = defaultdict(dict)
+        total_pixels = orig_width * orig_height
+        instances_root = os.path.join(project_dir, "concepts", concept.name, "instances")
+        output_dirs: dict = {}  # obj_id_int -> output_dir (cached per unique object)
         try:
             for out in sam3_model.propagate_in_video(
                 session_id=session_id,
@@ -1025,12 +1053,13 @@ def replay_concept_refinements(
                     mask_np = mask.cpu().numpy() if torch.is_tensor(mask) else np.asarray(mask)
                     if mask_np.ndim == 3 and mask_np.shape[0] == 1:
                         mask_np = mask_np[0]
-                    output_dir = os.path.join(
-                        project_dir, "concepts", concept.name,
-                        "instances", str(int(obj_id)), "masks"
-                    )
-                    mask_writer.submit(mask_np, output_dir, out_frame_idx)
-                    pixel_counts_by_obj[int(obj_id)][out_frame_idx] = int((mask_np > 0).sum())
+                    obj_id_int = int(obj_id)
+                    if obj_id_int not in output_dirs:
+                        output_dirs[obj_id_int] = os.path.join(
+                            instances_root, str(obj_id_int), "masks"
+                        )
+                    mask_writer.submit(mask_np, output_dirs[obj_id_int], out_frame_idx)
+                    pixel_counts_by_obj[obj_id_int][out_frame_idx] = int((mask_np > 0).sum())
 
                 # Evict after saving — forward propagation never revisits past frames
                 inner_state["cached_frame_outputs"].pop(out_frame_idx, None)
@@ -1098,13 +1127,12 @@ def replay_concept_refinements(
             if inst.deleted:
                 continue
             mask_dir = os.path.join(
-                project_dir, "concepts", concept.name,
-                "instances", str(inst.sam3_obj_id), "masks"
+                instances_root, str(inst.sam3_obj_id), "masks"
             )
             periods = compute_continuous_periods(mask_dir)
             inst.continuous_periods = periods
             inst.period_peaks = compute_period_peaks(
-                periods, pixel_counts_by_obj.get(inst.sam3_obj_id, {}))
+                periods, pixel_counts_by_obj.get(inst.sam3_obj_id, {}), total_pixels)
             inst.num_frames_with_mask = sum(e - s + 1 for s, e in periods)
             if periods:
                 inst.first_detection_frame = periods[0][0]
@@ -1340,6 +1368,9 @@ def online_replay_concept_refinements(
     from sam3_utils import AsyncMaskWriter
     mask_writer = AsyncMaskWriter(mask_format=mask_format)
     pixel_counts_by_obj: dict = defaultdict(dict)
+    total_pixels = orig_width * orig_height
+    instances_root = os.path.join(project_dir, "concepts", concept.name, "instances")
+    output_dirs: dict = {}  # obj_id_int -> output_dir (cached per unique object)
     try:
         for out in sam3_model.propagate_in_video(
             session_id=session_id,
@@ -1353,10 +1384,11 @@ def online_replay_concept_refinements(
             for obj_id, mask in zip(outputs.get("out_obj_ids", []), outputs.get("out_binary_masks", [])):
                 obj_id_int = int(obj_id)
                 mask_np = mask.cpu().numpy() if torch.is_tensor(mask) else np.asarray(mask)
-                output_dir = os.path.join(
-                    project_dir, "concepts", concept.name, "instances", str(obj_id_int), "masks"
-                )
-                mask_writer.submit(mask_np, output_dir, out_frame_idx)
+                if obj_id_int not in output_dirs:
+                    output_dirs[obj_id_int] = os.path.join(
+                        instances_root, str(obj_id_int), "masks"
+                    )
+                mask_writer.submit(mask_np, output_dirs[obj_id_int], out_frame_idx)
                 pixel_counts_by_obj[obj_id_int][out_frame_idx] = int((mask_np > 0).sum())
             _prune_non_cond_outputs(
                 sam3_model._all_inference_states[session_id]["state"], out_frame_idx,
@@ -1383,12 +1415,12 @@ def online_replay_concept_refinements(
         if inst.deleted:
             continue
         mask_dir = os.path.join(
-            project_dir, "concepts", concept.name, "instances", str(inst.sam3_obj_id), "masks"
+            instances_root, str(inst.sam3_obj_id), "masks"
         )
         periods = compute_continuous_periods(mask_dir)
         inst.continuous_periods = periods
         inst.period_peaks = compute_period_peaks(
-            periods, pixel_counts_by_obj.get(inst.sam3_obj_id, {}))
+            periods, pixel_counts_by_obj.get(inst.sam3_obj_id, {}), total_pixels)
         inst.num_frames_with_mask = sum(e - s + 1 for s, e in periods)
         if periods:
             inst.first_detection_frame = periods[0][0]

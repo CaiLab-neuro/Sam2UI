@@ -1266,7 +1266,9 @@ def _refine_project_impl(args, project):
             sentinel = os.path.join(project.project_dir, "concepts", cname, "redetect")
             if os.path.exists(sentinel):
                 os.remove(sentinel)
-        project.save()
+        # Workers own concept_metadata.json — use write_concept_metadata=False so the
+        # parent's stale in-memory concept copy doesn't clobber the fresh data workers wrote.
+        project.save(write_concept_metadata=False)
         cleanup_frames_dir(project)
         return rc
 
