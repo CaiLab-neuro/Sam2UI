@@ -152,9 +152,13 @@ class SAM3VideoUI:
         self._canvas_image_id = None   # persistent canvas item; avoids delete+create each frame
         self.show_labels_var = tk.BooleanVar(value=True)
         self.show_masks_var = tk.BooleanVar(value=True)
+        self.focus_mode_var = tk.BooleanVar(value=False)
         self.skip_delete_confirm_var = tk.BooleanVar(value=False)
         self.auto_jump_var = tk.BooleanVar(value=False)
         self.mask_alpha_var = tk.DoubleVar(value=0.5)
+
+        # Rate-limit perf diagnostics: print at most once every 2 seconds
+        self._last_perf_print: float = 0.0
 
         # Suppress redundant display_frame() calls triggered by selection_set() inside
         # update_concept_tree() — the caller always calls display_frame() explicitly after.
@@ -554,6 +558,9 @@ class SAM3VideoUI:
                        command=self.display_frame).pack(anchor=tk.W)
         tk.Checkbutton(display_frame, text="Show masks",
                        variable=self.show_masks_var,
+                       command=self.display_frame).pack(anchor=tk.W)
+        tk.Checkbutton(display_frame, text="Focus: selected concept only",
+                       variable=self.focus_mode_var,
                        command=self.display_frame).pack(anchor=tk.W)
         alpha_row = tk.Frame(display_frame)
         alpha_row.pack(fill=tk.X, pady=(2, 0))
@@ -1279,19 +1286,20 @@ class SAM3VideoUI:
             n = len(values)
             lr, lg, lb = low_color
             hr, hg, hb = high_color
-            prev_x1 = 0
-            for f in range(f_start, min(f_end + 1, n)):
-                x0 = (f - f_start) / visible * w
-                x1 = max(x0 + 1, (f - f_start + 1) / visible * w)
-                if x1 <= prev_x1:
-                    continue
+            # Iterate over pixel columns rather than frames — O(canvas_width) not
+            # O(num_frames).  Each pixel samples the frame at its left edge, which
+            # is visually identical to the original for any video longer than the
+            # canvas width, and correct for zoomed (short) windows too.
+            for px in range(w):
+                f = f_start + int(px * visible / w)
+                if f >= n:
+                    break
                 t = min(max(values[f], 0.0), 1.0)
                 r = int(lr + t * (hr - lr))
                 g = int(lg + t * (hg - lg))
                 b = int(lb + t * (hb - lb))
-                canvas.create_rectangle(x0, 0, x1, h,
+                canvas.create_rectangle(px, 0, px + 1, h,
                                         fill=f'#{r:02x}{g:02x}{b:02x}', outline='')
-                prev_x1 = x1
 
         def _draw_playhead(canvas):
             w = canvas.winfo_width()
@@ -1438,7 +1446,11 @@ class SAM3VideoUI:
 
             # Update UI
             self.frame_slider.configure(to=num_frames - 1)
+            self.selected_concept = None
+            self.selected_instance = None
+            self.selected_instances = []
             self.update_concept_tree()
+            self._auto_select_first_instance()
             self.display_frame()
 
             self.status_var.set(f"Loaded: {Path(video_path).name} ({num_frames} frames, {dims[0]}x{dims[1]}, {fps:.2f} fps)")
@@ -1497,7 +1509,11 @@ class SAM3VideoUI:
 
             # Update UI
             self.frame_slider.configure(to=self.num_frames - 1)
+            self.selected_concept = None
+            self.selected_instance = None
+            self.selected_instances = []
             self.update_concept_tree()
+            self._auto_select_first_instance()
             _tp4 = _time.perf_counter()
             self.display_frame()
             _tp5 = _time.perf_counter()
@@ -1665,7 +1681,9 @@ class SAM3VideoUI:
         if not self.project:
             return frame_rgb
 
-        frame = frame_rgb.copy()
+        # Defer the frame copy until the first label is actually drawn — skips
+        # the ~2 MB clone on frames where no instance mask is present.
+        frame = None
 
         for concept in self.project.concepts:
             if not concept.visible:
@@ -1707,12 +1725,14 @@ class SAM3VideoUI:
                 font_scale = 0.55
                 thickness = 1
 
+                if frame is None:
+                    frame = frame_rgb.copy()
                 cv2.putText(frame, label, (cx, cy), font, font_scale,
                             (0, 0, 0), thickness + 2, cv2.LINE_AA)
                 cv2.putText(frame, label, (cx, cy), font, font_scale,
                             text_color, thickness, cv2.LINE_AA)
 
-        return frame
+        return frame if frame is not None else frame_rgb
 
     def display_frame(self):
         """Display current frame with composited masks"""
@@ -1724,11 +1744,19 @@ class SAM3VideoUI:
             _perf_reset()
             _t_total = _time.perf_counter()
 
+            # Resolve focus concept: only composite the selected concept when focus mode is on.
+            _focus_concept = None
+            if self.focus_mode_var.get() and self.selected_concept:
+                _focus_concept = self.selected_concept.name
+
             # Get composited frame; masks loaded during compositing are cached for reuse
             _alpha = self.mask_alpha_var.get() if self.show_masks_var.get() else 0.0
             with _T("compositor"):
-                frame_rgb = self.compositor.get_composited_frame(self.current_frame_idx,
-                                                                  alpha_multiplier=_alpha)
+                frame_rgb = self.compositor.get_composited_frame(
+                    self.current_frame_idx,
+                    alpha_multiplier=_alpha,
+                    focus_concept_name=_focus_concept,
+                )
             masks_cache = self.compositor.get_last_masks()
 
             # White+black outline on the selected instance (uses cached mask, no extra disk read)
@@ -1797,11 +1825,11 @@ class SAM3VideoUI:
 
                     pil_image = pil_image.resize((new_width, new_height), Image.BILINEAR)
 
-            # Display
+            # Display — reuse the already-queried canvas dimensions for centering
             with _T("canvas"):
                 self.photo = ImageTk.PhotoImage(pil_image)
-                cx = self.canvas.winfo_width() // 2
-                cy = self.canvas.winfo_height() // 2
+                cx = canvas_width // 2
+                cy = canvas_height // 2
                 if self._canvas_image_id is None:
                     self._canvas_image_id = self.canvas.create_image(
                         cx, cy, image=self.photo, anchor=tk.CENTER)
@@ -1815,7 +1843,12 @@ class SAM3VideoUI:
             # Update presence bar cursor position
             with _T("presence_bar"):
                 self._update_presence_bar()
-            _perf_report(f"display_frame[{self.current_frame_idx}]", _time.perf_counter() - _t_total)
+
+            # Rate-limited perf report: print at most once every 2 seconds
+            _now = _time.perf_counter()
+            if _now - self._last_perf_print >= 2.0:
+                _perf_report(f"display_frame[{self.current_frame_idx}]", _now - _t_total)
+                self._last_perf_print = _now
 
         except Exception as e:
             print(f"Error displaying frame: {e}")
@@ -1940,6 +1973,70 @@ class SAM3VideoUI:
                     self.concept_tree.see(inst_item)
 
         self._updating_tree = False
+
+    def _auto_select_first_instance(self):
+        """Select the first concept+instance with detected masks after project load.
+
+        Walks concepts in order; skips concepts with no live instances and concepts
+        whose instances have no masks yet (status != completed).  Falls back to the
+        first live instance regardless of status if none are completed.  Does nothing
+        when no instances exist at all — safe to call on empty projects.
+        """
+        if not self.project:
+            return
+
+        # Two-pass: prefer a completed concept, fall back to any live instance.
+        target_concept = None
+        target_inst = None
+        fallback_concept = None
+        fallback_inst = None
+
+        for concept in self.project.concepts:
+            live = [i for i in concept.instances if not i.deleted]
+            if not live:
+                continue
+            if fallback_concept is None:
+                fallback_concept, fallback_inst = concept, live[0]
+            if concept.status.value == "completed" and target_concept is None:
+                target_concept, target_inst = concept, live[0]
+
+        if target_concept is None:
+            target_concept, target_inst = fallback_concept, fallback_inst
+
+        if target_concept is None:
+            # No instances at all — nothing to select.
+            return
+
+        self.selected_concept = target_concept
+        self.selected_instance = target_inst
+        self.selected_instances = [(target_concept, target_inst)]
+
+        # Sync the tree widget selection without triggering display_frame recursion.
+        self._updating_tree = True
+        try:
+            for concept_item in self.concept_tree.get_children():
+                tags = self.concept_tree.item(concept_item, 'tags')
+                if not (tags and tags[0] == 'concept' and tags[1] == target_concept.name):
+                    continue
+                self.concept_tree.item(concept_item, open=True)
+                for inst_item in self.concept_tree.get_children(concept_item):
+                    itags = self.concept_tree.item(inst_item, 'tags')
+                    if (len(itags) >= 3 and itags[0] == 'instance'
+                            and int(itags[2]) == target_inst.sam3_obj_id):
+                        self.concept_tree.selection_set(inst_item)
+                        self.concept_tree.see(inst_item)
+                        break
+                break
+        finally:
+            self._updating_tree = False
+
+        self.selected_label.config(
+            text=f"{target_inst.user_name} (ID: {target_inst.sam3_obj_id})")
+        self.name_entry.delete(0, tk.END)
+        self.name_entry.insert(0, target_inst.user_name)
+        self._update_name_combobox_values()
+        self._mark_presence_dirty()
+        self._load_annotations_for_current_frame()
 
     def on_tree_select(self, event):
         """Handle tree selection (single or multi via Shift/Ctrl)."""

@@ -540,6 +540,9 @@ class DynamicFrameCompositor:
         # Maps (concept_name, obj_id) -> mask ndarray for the most-recently composited frame.
         self._last_masks: Dict[tuple, np.ndarray] = {}
 
+        # Rate-limit [COMP] diagnostics: print at most once every 2 seconds.
+        self._last_comp_print: float = 0.0
+
         # Pre-allocate ALL per-frame working buffers at init time and force-touch them
         # so OS maps physical pages now.  This eliminates cold-page spikes on the first
         # few render calls (which otherwise took 50–160 seconds on NFS-backed storage).
@@ -588,7 +591,8 @@ class DynamicFrameCompositor:
         """
         return self._last_masks
 
-    def get_composited_frame(self, frame_idx: int, alpha_multiplier: float = 1.0) -> np.ndarray:
+    def get_composited_frame(self, frame_idx: int, alpha_multiplier: float = 1.0,
+                             focus_concept_name: Optional[str] = None) -> np.ndarray:
         """
         Composite a single frame with all visible concepts.
 
@@ -597,8 +601,11 @@ class DynamicFrameCompositor:
         Loaded masks are cached in self._last_masks for the caller.
 
         Args:
-            frame_idx: Frame index to composite
+            frame_idx: Frame index to composite.
             alpha_multiplier: Global scale for all mask opacities (0.0 = raw frame, no masks).
+            focus_concept_name: When set, only composite this concept's instances.
+                Used by the UI's "Focus: selected concept only" mode to reduce mask I/O
+                and blend work when the user is refining a single concept.
 
         Returns:
             Composited frame (RGB uint8)
@@ -642,8 +649,10 @@ class DynamicFrameCompositor:
         _t_blend = 0.0
         _n_masks = 0
 
-        # Composite all masks into overlay
+        # Composite all masks into overlay (or only the focused concept's masks)
         for concept_name in self.project.concept_order:
+            if focus_concept_name is not None and concept_name != focus_concept_name:
+                continue
             concept = self.project.get_concept_by_name(concept_name)
             if not concept or not concept.visible:
                 continue
@@ -698,22 +707,25 @@ class DynamicFrameCompositor:
         np.copyto(self._result_u8, frame_rgb, casting='unsafe')
         result = self._result_u8
         _t_clip = time.perf_counter()
-        _total = _t_clip - _t0
-        # untracked = time not covered by any named section (loop overhead, etc.)
-        _tracked = (_t_video-_t0) + (_t_cvtcolor-_t_video) + (_t_bufinit-_t_cvtcolor) + \
-                   (_t_fill-_t_bufinit) + _t_mask_io + _t_color + _t_blend + _t_final_blend + \
-                   (_t_clip - _tf - _t_final_blend)
-        print(f"[COMP] frame={frame_idx} total={_total*1000:.1f}ms | "
-              f"video={(_t_video-_t0)*1000:.1f}ms | "
-              f"cvtcolor={(_t_cvtcolor-_t_video)*1000:.1f}ms | "
-              f"bufinit={(_t_bufinit-_t_cvtcolor)*1000:.1f}ms | "
-              f"fill={(_t_fill-_t_bufinit)*1000:.1f}ms | "
-              f"mask_io({_n_masks})={_t_mask_io*1000:.1f}ms | "
-              f"color={_t_color*1000:.1f}ms | "
-              f"blend={_t_blend*1000:.1f}ms | "
-              f"final_blend={_t_final_blend*1000:.1f}ms | "
-              f"clip={(_t_clip-_tf-_t_final_blend)*1000:.1f}ms | "
-              f"untracked={(_total-_tracked)*1000:.1f}ms")
+
+        # Rate-limited diagnostics: print at most once every 2 seconds
+        if _t_clip - self._last_comp_print >= 2.0:
+            _total = _t_clip - _t0
+            _tracked = ((_t_video-_t0) + (_t_cvtcolor-_t_video) + (_t_bufinit-_t_cvtcolor) +
+                        (_t_fill-_t_bufinit) + _t_mask_io + _t_color + _t_blend +
+                        _t_final_blend + (_t_clip - _tf - _t_final_blend))
+            focus_tag = f" focus={focus_concept_name}" if focus_concept_name else ""
+            print(f"[COMP] frame={frame_idx}{focus_tag} total={_total*1000:.1f}ms | "
+                  f"video={(_t_video-_t0)*1000:.1f}ms | "
+                  f"cvtcolor={(_t_cvtcolor-_t_video)*1000:.1f}ms | "
+                  f"fill={(_t_fill-_t_bufinit)*1000:.1f}ms | "
+                  f"mask_io({_n_masks})={_t_mask_io*1000:.1f}ms | "
+                  f"blend={_t_blend*1000:.1f}ms | "
+                  f"final_blend={_t_final_blend*1000:.1f}ms | "
+                  f"clip={(_t_clip-_tf-_t_final_blend)*1000:.1f}ms | "
+                  f"untracked={(_total-_tracked)*1000:.1f}ms")
+            self._last_comp_print = _t_clip
+
         return result
 
     def export_video(self, output_path: str, progress_callback=None):
