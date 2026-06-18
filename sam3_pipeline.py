@@ -25,9 +25,8 @@ from sam3_project import (
 from sam3_utils import extract_frames_from_video
 
 
-def _prune_non_cond_outputs(inner_state: dict, frame_idx: int, keep: int = 20,
-                            max_cond_frames: int = 4) -> None:
-    """Prune stale non_cond_frame_outputs and old cond_frame_outputs from every tracker state.
+def _prune_non_cond_outputs(inner_state: dict, frame_idx: int, keep: int = 20) -> None:
+    """Prune stale non_cond_frame_outputs from every tracker state.
 
     SAM3's multi-GPU structure stores maskmem tensors at:
       inner_state["tracker_inference_states"][gpu]["output_dict"]["non_cond_frame_outputs"]
@@ -40,11 +39,11 @@ def _prune_non_cond_outputs(inner_state: dict, frame_idx: int, keep: int = 20,
     SAM3 attends to at most num_maskmem=7 previous frames, so keeping `keep` (default 20)
     frames of history is generous.  Call this once per yielded frame.
 
-    Cond frame pruning: select_closest_cond_frames picks the `max_cond_frames_in_attn`
-    temporally closest entries at attention time. In forward-only propagation this means
-    the most recent N cond frames are always selected; older ones are never attended to
-    and can be safely evicted. We keep max_cond_frames entries so the live attention
-    window is never starved.
+    Cond frames are intentionally NOT evicted here.  select_closest_cond_frames selects
+    attending frames by temporal proximity (closest before + closest after + nearest by
+    distance), so every user correction frame remains eligible as long as it stays in
+    cond_frame_outputs.  Evicting old cond entries by index (as was done previously)
+    would silently remove correction anchors that SAM3 would have attended to.
     """
     cutoff = frame_idx - keep
     tracker_states = (inner_state.get("tracker_inference_states", [])
@@ -56,48 +55,11 @@ def _prune_non_cond_outputs(inner_state: dict, frame_idx: int, keep: int = 20,
         for f in stale:
             del non_cond[f]
 
-        # Prune old cond frame outputs — keep only the most recent max_cond_frames entries.
-        # Older cond frames will never be selected by select_closest_cond_frames in a
-        # single-pass forward propagation (newer frames are always closer).
-        #
-        # `propagate_in_video_preflight` enforces two invariants that span several
-        # dicts beyond `output_dict["cond_frame_outputs"]` itself:
-        #   1. every frame in consolidated_frame_inds["cond_frame_outputs"] must still
-        #      be a key in output_dict["cond_frame_outputs"]
-        #   2. consolidated_frame_inds["cond_frame_outputs"] | [...]["non_cond_frame_outputs"]
-        #      must exactly equal the union of all objects' point/mask input frames
-        #      (point_inputs_per_obj / mask_inputs_per_obj)
-        # So evicting a cond frame here must remove it from ALL of: the combined
-        # output_dict, every object's output_dict_per_obj slice, consolidated_frame_inds,
-        # and every object's point/mask inputs on that frame — exactly what
-        # `clear_all_points_in_frame` does per-object, applied across the whole batch.
-        cond = ts.get("output_dict", {}).get("cond_frame_outputs", {})
-        evict = set()
-        if len(cond) > max_cond_frames:
-            keep_frames = sorted(cond)[-max_cond_frames:]
-            evict = {f for f in cond if f not in keep_frames}
-            for f in evict:
-                del cond[f]
-
-        consolidated_cond = ts.get("consolidated_frame_inds", {}).get("cond_frame_outputs")
-        if consolidated_cond is not None:
-            consolidated_cond -= evict
-
         for obj_dict in ts.get("output_dict_per_obj", {}).values():
             non_cond = obj_dict.get("non_cond_frame_outputs", {})
             stale = [f for f in non_cond if f < cutoff]
             for f in stale:
                 del non_cond[f]
-
-            obj_cond = obj_dict.get("cond_frame_outputs", {})
-            for f in evict:
-                obj_cond.pop(f, None)
-
-        for input_dict in (ts.get("point_inputs_per_obj", {}).values(),
-                           ts.get("mask_inputs_per_obj", {}).values()):
-            for per_frame in input_dict:
-                for f in evict:
-                    per_frame.pop(f, None)
 
 
 def compute_period_peaks(periods: List[Tuple[int, int]],
@@ -457,11 +419,6 @@ def process_concept_detection(
     if _cap > 0:
         print(f"Instance cap for '{concept.name}': {_cap}")
 
-    # Read the model's max_cond_frames_in_attn so the pruner knows how many cond
-    # frame entries to keep.  Works for both SAM3 (tracker attr) and SAM3.1 (same).
-    _tracker = getattr(_inner_model, "tracker", None) or _inner_model
-    _max_cond = getattr(_tracker, "max_cond_frames_in_attn", 4)
-
     # offload_state_to_cpu: moves maskmem_features to CPU after each frame so GPU doesn't
     # accumulate the full video's worth of 648 KB/frame/instance tensors.
     sam3_model.start_session(
@@ -569,7 +526,7 @@ def process_concept_detection(
 
             # Prune stale non_cond_frame_outputs inside each tracker state.
             # (SAM3 stores maskmem tensors per-GPU-rank, not at top-level inner_state.)
-            _prune_non_cond_outputs(inner_state, frame_idx, max_cond_frames=_max_cond)
+            _prune_non_cond_outputs(inner_state, frame_idx)
 
             # Clear GPU cache periodically
             if frame_idx % 100 == 0:
@@ -747,11 +704,6 @@ def add_refinement_points(
         if n > 0:
             print(f"Using {n} restored cond frames from prior round.")
 
-    # Read the model's cond-frame attention window for pruning below.
-    _refine_inner = getattr(sam3_model, "model", sam3_model)
-    _refine_tracker = getattr(_refine_inner, "tracker", None) or _refine_inner
-    _refine_max_cond = getattr(_refine_tracker, "max_cond_frames_in_attn", 4)
-
     # Re-propagate scanning entire video from frame 0
     print("Re-propagating with refinements...")
     from sam3_utils import AsyncMaskWriter
@@ -788,7 +740,6 @@ def add_refinement_points(
 
             _prune_non_cond_outputs(
                 sam3_model._all_inference_states[session_id]["state"], out_frame_idx,
-                max_cond_frames=_refine_max_cond,
             )
             # Progress callback
             if progress_callback:
@@ -937,13 +888,14 @@ def replay_concept_refinements(
     )
 
     try:
-        # Re-run text detection from frame 0 to get all instances in the session.
-        # This resets state and assigns obj_ids in the same deterministic order as
-        # the original detection — required for restore_cond_frame_states to match
-        # saved [B, ...] tensors by batch index.
+        # Re-run text detection anchored to the same frame used during initial detection.
+        # frame_idx only determines where initial results are displayed; the text prompt
+        # applies to all frames.  Using concept.detection_frame (not hard-coded 0) keeps
+        # the API call consistent with process_concept_detection, which matters if the
+        # user explicitly set a non-zero detection_frame in their concepts JSON.
         sam3_model.add_prompt(
             session_id=session_id,
-            frame_idx=0,
+            frame_idx=concept.detection_frame,
             text=concept.text_prompt,
         )
 
@@ -1025,9 +977,6 @@ def replay_concept_refinements(
         # Single propagation: all instances in one batched forward pass.
         # Non-overlapping constraints are enforced across all instances jointly.
         # Write masks for ALL detected instances (not just the ones with new annotations).
-        _replay_inner = getattr(sam3_model, "model", sam3_model)
-        _replay_tracker = getattr(_replay_inner, "tracker", None) or _replay_inner
-        _replay_max_cond = getattr(_replay_tracker, "max_cond_frames_in_attn", 4)
         from sam3_utils import AsyncMaskWriter
         mask_writer = AsyncMaskWriter(mask_format=mask_format)
         pixel_counts_by_obj: dict = defaultdict(dict)
@@ -1063,7 +1012,7 @@ def replay_concept_refinements(
 
                 # Evict after saving — forward propagation never revisits past frames
                 inner_state["cached_frame_outputs"].pop(out_frame_idx, None)
-                _prune_non_cond_outputs(inner_state, out_frame_idx, max_cond_frames=_replay_max_cond)
+                _prune_non_cond_outputs(inner_state, out_frame_idx)
 
                 if progress_callback:
                     progress_callback(out_frame_idx, num_frames)
@@ -1216,10 +1165,6 @@ def online_add_refinement_points(
         obj_id=instance.sam3_obj_id
     )
 
-    _online_add_inner = getattr(sam3_model, "model", sam3_model)
-    _online_add_tracker = getattr(_online_add_inner, "tracker", None) or _online_add_inner
-    _online_add_max_cond = getattr(_online_add_tracker, "max_cond_frames_in_attn", 4)
-
     # Re-propagate with the new cond anchor included
     print("Re-propagating with new anchor...")
     from sam3_utils import AsyncMaskWriter
@@ -1255,7 +1200,6 @@ def online_add_refinement_points(
 
             _prune_non_cond_outputs(
                 sam3_model._all_inference_states[session_id]["state"], out_frame_idx,
-                max_cond_frames=_online_add_max_cond,
             )
             if progress_callback:
                 progress_callback(out_frame_idx, num_frames)
@@ -1358,10 +1302,6 @@ def online_replay_concept_refinements(
                 obj_id=instance.sam3_obj_id,
             )
 
-    _online_replay_inner = getattr(sam3_model, "model", sam3_model)
-    _online_replay_tracker = getattr(_online_replay_inner, "tracker", None) or _online_replay_inner
-    _online_replay_max_cond = getattr(_online_replay_tracker, "max_cond_frames_in_attn", 4)
-
     # Single propagation pass — non-overlapping applied across ALL instances simultaneously
     inst_names = [inst.user_name for inst, _ in instances_with_pending]
     print(f"Re-propagating with corrections for {len(instances_with_pending)} instance(s): {inst_names}")
@@ -1392,7 +1332,6 @@ def online_replay_concept_refinements(
                 pixel_counts_by_obj[obj_id_int][out_frame_idx] = int((mask_np > 0).sum())
             _prune_non_cond_outputs(
                 sam3_model._all_inference_states[session_id]["state"], out_frame_idx,
-                max_cond_frames=_online_replay_max_cond,
             )
             if progress_callback:
                 progress_callback(out_frame_idx, num_frames)
@@ -1447,7 +1386,7 @@ def online_replay_concept_refinements(
 
 
 def load_sam3_model(model_name: str = "sam3", device: str = "cuda:0",
-                    use_fa3: bool = False, max_cond_frames_in_attn: int = 4):
+                    use_fa3: bool = False, max_cond_frames_in_attn: int = -1):
     """
     Load SAM3 model with proper configuration.
 
@@ -1459,10 +1398,10 @@ def load_sam3_model(model_name: str = "sam3", device: str = "cuda:0",
             Hopper GPU (H100/H200) and the flash_attn_interface package;
             crashes on Ampere/Ada (e.g. L40S). Ignored for SAM3.
         max_cond_frames_in_attn: How many conditioning frames the tracker attends
-            to per forward pass (default: 4, matching SAM3's built-in default).
-            Increase (e.g. 8) to improve tracking of objects with varied appearance
-            at the cost of slightly more attention compute per frame.
-            -1 means attend to all stored cond frames (no limit).
+            to per forward pass (default: -1 = no limit, matching SAM3's built-in
+            default).  All user correction anchors are always attended to.
+            Set to a small positive value (e.g. 4) only if attention compute is a
+            bottleneck with many correction frames.
 
     Returns:
         SAM3 model instance (session-based predictor; same API for both versions)

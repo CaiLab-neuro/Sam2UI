@@ -1630,14 +1630,14 @@ def main():
                              "(--sam-version 3.1 only). Requires a Hopper GPU "
                              "(H100/H200, compute capability 9.0+); fails on "
                              "Ampere/Ada GPUs such as the L40S.")
-    parser.add_argument("--max-cond-frames", type=int, default=4,
+    parser.add_argument("--max-cond-frames", type=int, default=-1,
                         dest="max_cond_frames_in_attn",
                         help="Number of conditioning frames the tracker attends to per "
-                             "forward pass (default: 4, matching SAM3's built-in default). "
-                             "Increase (e.g. 8) to improve tracking stability for objects "
-                             "with varied appearance across a long video, at the cost of "
-                             "slightly more attention compute per frame. "
-                             "-1 attends to all stored conditioning frames (no limit).")
+                             "forward pass (default: -1 = no limit, matching SAM3's "
+                             "built-in default).  All user correction anchors are always "
+                             "attended to.  Set to a small positive value (e.g. 4) only "
+                             "if attention compute is a bottleneck with many correction "
+                             "frames.")
     parser.add_argument("--device", default="cuda:0",
                         help="Device, comma-separated list, or 'all' to use every available GPU "
                              "(e.g. cuda:2, cuda:2,cuda:3, or all). Default: cuda:0")

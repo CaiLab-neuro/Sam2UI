@@ -11,6 +11,7 @@ Features:
 """
 
 import colorsys
+import copy
 import os
 import sys
 import json
@@ -121,6 +122,9 @@ class SAM3VideoUI:
         # Quality metrics (loaded from quality_metrics.npz when available)
         self.quality_bg: Optional[List[float]] = None      # background ratio per frame
         self.quality_overlap: Optional[List[float]] = None  # overlap ratio per frame
+        # When True, _draw_quality_colorbars() redraws bars from scratch; otherwise
+        # only the playhead is moved (same fast-path logic as _presence_bar_dirty).
+        self._quality_bars_dirty: bool = True
 
         # In-memory annotation cache: (concept_name, obj_id) -> {frame_idx -> [(x, y, is_positive)]}
         # Populated on project load (propagated=False entries only) and updated on every point
@@ -138,9 +142,14 @@ class SAM3VideoUI:
         # Disk cleanup + sentinel write is deferred to save_points_for_batch().
         self._concepts_pending_reset: set = set()
 
+        # Vocabulary: concept_name -> [instance name, ...]  (for rename dropdown)
+        self.vocabulary: Dict[str, List[str]] = {}
+        self.vocabulary_path: Optional[str] = None
+
         # Display
         self.display_image = None
         self.photo = None
+        self._canvas_image_id = None   # persistent canvas item; avoids delete+create each frame
         self.show_labels_var = tk.BooleanVar(value=True)
         self.show_masks_var = tk.BooleanVar(value=True)
         self.skip_delete_confirm_var = tk.BooleanVar(value=False)
@@ -216,6 +225,18 @@ class SAM3VideoUI:
                               command=self.save_project)
         file_menu.add_separator()
         file_menu.add_command(label="Exit", command=self.root.quit)
+
+        vocab_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="Vocabulary", menu=vocab_menu)
+        vocab_menu.add_command(label="Load Vocabulary File...",
+                               command=self.load_vocabulary)
+        vocab_menu.add_command(label="Save Vocabulary File",
+                               command=self.save_vocabulary)
+        vocab_menu.add_command(label="Save Vocabulary As...",
+                               command=self.save_vocabulary_as)
+        vocab_menu.add_separator()
+        vocab_menu.add_command(label="Edit Vocabulary...",
+                               command=self.edit_vocabulary_dialog)
 
         # Main container — three resizable panes
         main_paned = tk.PanedWindow(self.root, orient=tk.HORIZONTAL,
@@ -435,10 +456,11 @@ class SAM3VideoUI:
         rename_frame.pack(fill=tk.X, pady=5)
 
         tk.Label(rename_frame, text="Name:").pack(side=tk.LEFT)
-        self.name_entry = tk.Entry(rename_frame)
+        self.name_entry = ttk.Combobox(rename_frame, state='normal')
         self.name_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
         self.name_entry.bind('<Return>', lambda e: self.rename_instance())
         self.name_entry.bind('<FocusOut>', lambda e: self._on_name_entry_focus_out())
+        self.name_entry.bind('<<ComboboxSelected>>', lambda e: self.rename_instance())
         tk.Button(rename_frame, text="Rename",
                  command=self.rename_instance).pack(side=tk.LEFT)
 
@@ -975,8 +997,9 @@ class SAM3VideoUI:
         self._presence_bar_dirty = True
 
     def _mark_presence_dirty(self):
-        """Mark the presence bar for a full block redraw on next update."""
+        """Mark the presence bar and quality colorbars for a full redraw on next update."""
         self._presence_bar_dirty = True
+        self._quality_bars_dirty = True
 
     # ============================================================
     # In-memory annotation cache
@@ -1126,31 +1149,56 @@ class SAM3VideoUI:
             canvas.create_rectangle(0, 0, w, h, fill='#2a2a2a', outline='')
 
             if self.selected_instance and self.selected_concept:
-                presence = self._get_presence_frames()
-                if presence:
-                    inst = self.selected_instance
-                    concept = self.selected_concept
-                    base = inst.color_rgb or concept.color_rgb or (100, 180, 255)
-                    r, g, b = base
-                    hv, sv, vv = colorsys.rgb_to_hsv(r / 255, g / 255, b / 255)
-                    r2, g2, b2 = colorsys.hsv_to_rgb(hv, 1.0, 1.0)
-                    fill_color = f'#{int(r2*255):02x}{int(g2*255):02x}{int(b2*255):02x}'
+                inst = self.selected_instance
+                concept = self.selected_concept
+                base = inst.color_rgb or concept.color_rgb or (100, 180, 255)
+                r, g, b = base
+                hv, sv, vv = colorsys.rgb_to_hsv(r / 255, g / 255, b / 255)
+                r2, g2, b2 = colorsys.hsv_to_rgb(hv, 1.0, 1.0)
+                fill_color = f'#{int(r2*255):02x}{int(g2*255):02x}{int(b2*255):02x}'
 
-                    y0, y1 = 1, h - 1
-                    sorted_f = sorted(f for f in presence if f_start <= f <= f_end)
-                    if sorted_f:
-                        run_s = run_e = sorted_f[0]
-                        for fr in sorted_f[1:]:
-                            if fr == run_e + 1:
-                                run_e = fr
-                            else:
-                                x0 = (run_s - f_start) / visible * w
-                                x1 = max(x0 + 1, (run_e - f_start + 1) / visible * w)
-                                canvas.create_rectangle(x0, y0, x1, y1, fill=fill_color, outline='')
-                                run_s = run_e = fr
-                        x0 = (run_s - f_start) / visible * w
-                        x1 = max(x0 + 1, (run_e - f_start + 1) / visible * w)
+                period_peaks = inst.period_peaks if inst.period_peaks else []
+                if period_peaks:
+                    # Variable-height bars: height proportional to sqrt of normalized
+                    # avg_pixel_ratio so small objects remain visible.  Bar is bottom-anchored.
+                    max_ratio = max(p.get('avg_pixel_ratio', 0) for p in period_peaks)
+                    if max_ratio <= 0:
+                        max_ratio = 1.0
+                    inner_h = h - 2
+                    for period in period_peaks:
+                        p_start = period['start']
+                        p_end = period['end']
+                        draw_start = max(p_start, f_start)
+                        draw_end = min(p_end, f_end)
+                        if draw_start > draw_end:
+                            continue
+                        ratio = period.get('avg_pixel_ratio', 0)
+                        rel = (ratio / max_ratio) ** 0.5
+                        bar_h = max(2, int(rel * inner_h))
+                        y0 = h - 1 - bar_h
+                        y1 = h - 1
+                        x0 = (draw_start - f_start) / visible * w
+                        x1 = max(x0 + 1, (draw_end - f_start + 1) / visible * w)
                         canvas.create_rectangle(x0, y0, x1, y1, fill=fill_color, outline='')
+                else:
+                    # Fallback: binary presence from mask file scan (old projects / no peak data)
+                    presence = self._get_presence_frames()
+                    if presence:
+                        y0, y1 = 1, h - 1
+                        sorted_f = sorted(f for f in presence if f_start <= f <= f_end)
+                        if sorted_f:
+                            run_s = run_e = sorted_f[0]
+                            for fr in sorted_f[1:]:
+                                if fr == run_e + 1:
+                                    run_e = fr
+                                else:
+                                    x0 = (run_s - f_start) / visible * w
+                                    x1 = max(x0 + 1, (run_e - f_start + 1) / visible * w)
+                                    canvas.create_rectangle(x0, y0, x1, y1, fill=fill_color, outline='')
+                                    run_s = run_e = fr
+                            x0 = (run_s - f_start) / visible * w
+                            x1 = max(x0 + 1, (run_e - f_start + 1) / visible * w)
+                            canvas.create_rectangle(x0, y0, x1, y1, fill=fill_color, outline='')
 
             self._presence_bar_dirty = False
         else:
@@ -1202,29 +1250,33 @@ class SAM3VideoUI:
             print(f"[quality] Could not load metrics: {e}")
             self.quality_bg = None
             self.quality_overlap = None
+        self._quality_bars_dirty = True
         self._draw_quality_colorbars()
 
     def _draw_quality_colorbars(self):
-        """Render the overlap and background-ratio colorbars with a playhead."""
+        """Render the overlap and background-ratio colorbars with a playhead.
+
+        Full redraw only when _quality_bars_dirty is set; otherwise only the
+        playhead is moved — same fast-path pattern as _update_presence_bar().
+        """
         if not hasattr(self, 'quality_overlap_canvas'):
             return
 
-        def _draw_bar(canvas, values, low_color, high_color):
+        zoom = self.slider_zoom_level.get()
+        if zoom == 1:
+            f_start, f_end = 0, self.num_frames - 1
+        else:
+            f_start = int(self.frame_slider.cget('from'))
+            f_end = int(self.frame_slider.cget('to'))
+        visible = max(1, f_end - f_start + 1)
+
+        def _full_redraw(canvas, values, low_color, high_color):
             canvas.delete("all")
             w = canvas.winfo_width()
             h = canvas.winfo_height()
             if w <= 1 or h <= 1 or not values or not self.num_frames:
                 return
-
-            zoom = self.slider_zoom_level.get()
-            if zoom == 1:
-                f_start, f_end = 0, self.num_frames - 1
-            else:
-                f_start = int(self.frame_slider.cget('from'))
-                f_end = int(self.frame_slider.cget('to'))
-            visible = max(1, f_end - f_start + 1)
             n = len(values)
-
             lr, lg, lb = low_color
             hr, hg, hb = high_color
             prev_x1 = 0
@@ -1241,21 +1293,31 @@ class SAM3VideoUI:
                                         fill=f'#{r:02x}{g:02x}{b:02x}', outline='')
                 prev_x1 = x1
 
-            # Playhead
+        def _draw_playhead(canvas):
+            w = canvas.winfo_width()
+            h = canvas.winfo_height()
+            if w <= 1 or h <= 1 or not self.num_frames:
+                return
+            canvas.delete("qplayhead")
             if f_start <= self.current_frame_idx <= f_end:
                 cx = (self.current_frame_idx - f_start) / visible * w
-                canvas.create_line(cx + 1, 0, cx + 1, h, fill='black', width=3)
-                canvas.create_line(cx, 0, cx, h, fill='#ffdd00', width=2)
+                canvas.create_line(cx + 1, 0, cx + 1, h, fill='black', width=3, tags="qplayhead")
+                canvas.create_line(cx, 0, cx, h, fill='#ffdd00', width=2, tags="qplayhead")
                 ts = 4
                 canvas.create_polygon(cx - ts, 0, cx + ts, 0, cx, ts + 2,
-                                      fill='#ffdd00', outline='black', width=1)
+                                      fill='#ffdd00', outline='black', width=1, tags="qplayhead")
 
-        _draw_bar(self.quality_overlap_canvas,
-                  self.quality_overlap,
-                  (42, 42, 42), (220, 60, 30))   # dark → red-orange
-        _draw_bar(self.quality_bg_canvas,
-                  self.quality_bg,
-                  (42, 42, 42), (30, 120, 200))   # dark → blue
+        if self._quality_bars_dirty:
+            _full_redraw(self.quality_overlap_canvas,
+                         self.quality_overlap,
+                         (42, 42, 42), (220, 60, 30))
+            _full_redraw(self.quality_bg_canvas,
+                         self.quality_bg,
+                         (42, 42, 42), (30, 120, 200))
+            self._quality_bars_dirty = False
+
+        _draw_playhead(self.quality_overlap_canvas)
+        _draw_playhead(self.quality_bg_canvas)
 
     def _on_quality_bar_click(self, event):
         """Click on a quality colorbar to jump to that frame."""
@@ -1738,12 +1800,14 @@ class SAM3VideoUI:
             # Display
             with _T("canvas"):
                 self.photo = ImageTk.PhotoImage(pil_image)
-                self.canvas.delete("all")
-                self.canvas.create_image(
-                    self.canvas.winfo_width() // 2,
-                    self.canvas.winfo_height() // 2,
-                    image=self.photo, anchor=tk.CENTER
-                )
+                cx = self.canvas.winfo_width() // 2
+                cy = self.canvas.winfo_height() // 2
+                if self._canvas_image_id is None:
+                    self._canvas_image_id = self.canvas.create_image(
+                        cx, cy, image=self.photo, anchor=tk.CENTER)
+                else:
+                    self.canvas.itemconfig(self._canvas_image_id, image=self.photo)
+                    self.canvas.coords(self._canvas_image_id, cx, cy)
 
             # Update frame label
             self.frame_label.config(text=f"{self.current_frame_idx} / {self.num_frames - 1}")
@@ -1933,6 +1997,7 @@ class SAM3VideoUI:
                 self.selected_label.config(text=f"Concept: {last_concept.name}")
             self.name_entry.delete(0, tk.END)
 
+        self._update_name_combobox_values()
         self._update_session_status()
         self._mark_presence_dirty()
         self._load_annotations_for_current_frame()
@@ -2379,6 +2444,68 @@ class SAM3VideoUI:
         self.update_concept_tree()
         self.status_var.set(f"Renamed instance to '{new_name}'. Ctrl+Z to undo.")
         self.canvas.focus_set()
+
+    # ------------------------------------------------------------------
+    # Vocabulary
+    # ------------------------------------------------------------------
+
+    def _update_name_combobox_values(self):
+        """Refresh the rename combobox dropdown values for the currently selected concept."""
+        vocab = []
+        if self.selected_concept:
+            vocab = self.vocabulary.get(self.selected_concept.name, [])
+        self.name_entry['values'] = vocab
+
+    def load_vocabulary(self, path: Optional[str] = None):
+        """Load a vocabulary JSON file (concept_name -> [instance names])."""
+        if path is None:
+            path = filedialog.askopenfilename(
+                title="Load Vocabulary File",
+                filetypes=[("JSON files", "*.json"), ("All files", "*.*")]
+            )
+        if not path:
+            return
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                raise ValueError("Expected a JSON object at top level")
+            self.vocabulary = {str(k): list(v) for k, v in data.items()}
+            self.vocabulary_path = path
+            self._update_name_combobox_values()
+            self.status_var.set(f"Vocabulary loaded: {os.path.basename(path)}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to load vocabulary:\n{e}")
+
+    def save_vocabulary(self):
+        """Save vocabulary to the current path (prompts for path if none set)."""
+        if not self.vocabulary_path:
+            self.save_vocabulary_as()
+            return
+        try:
+            with open(self.vocabulary_path, 'w') as f:
+                json.dump(self.vocabulary, f, indent=2)
+            self.status_var.set(f"Vocabulary saved: {os.path.basename(self.vocabulary_path)}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to save vocabulary:\n{e}")
+
+    def save_vocabulary_as(self):
+        """Prompt for a path and save the vocabulary."""
+        path = filedialog.asksaveasfilename(
+            title="Save Vocabulary As",
+            defaultextension=".json",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")]
+        )
+        if not path:
+            return
+        self.vocabulary_path = path
+        self.save_vocabulary()
+
+    def edit_vocabulary_dialog(self):
+        """Open the vocabulary editor dialog."""
+        dialog = VocabularyEditorDialog(self.root, self)
+        self.root.wait_window(dialog.top)
+        self._update_name_combobox_values()
 
     def _compute_per_period_anchors(self, concept, instance, is_positive: bool,
                                     tag: Optional[str] = None,
@@ -3485,8 +3612,14 @@ class SAM3VideoUI:
             ):
                 return
 
-        # Commit pending instance deletions: remove mask dirs from disk now
+        # Commit pending instance deletions: remove mask dirs from disk now,
+        # then remove them from concept.instances so they don't re-trigger this
+        # dialog on the next save.
         self._purge_deleted_instance_masks()
+        for n in self.project.concept_order:
+            c = self.project.get_concept_by_name(n)
+            if c:
+                c.instances = [inst for inst in c.instances if not inst.deleted]
 
         # After purging, stale delete_instance undo entries would restore ghost instances
         # with no mask files — scrub them so Ctrl+Z can't create ghosts.
@@ -5024,6 +5157,296 @@ class EditPromptDialog:
             return
         self.top.destroy()
         self.ui._change_concept_prompt(self.concept, new_prompt)
+
+
+class VocabularyEditorDialog:
+    """Two-pane editor for the concept → instance-name vocabulary.
+
+    Left pane: list of concepts in the vocabulary.
+    Right pane: ordered list of instance names for the selected concept.
+    Changes are applied in-memory on Save & Close; the caller is responsible
+    for persisting to disk via ui.save_vocabulary() if desired.
+    """
+
+    def __init__(self, parent, ui: SAM3VideoUI):
+        self.ui = ui
+        # Deep-copy so Cancel can discard changes
+        self._vocab: Dict[str, List[str]] = copy.deepcopy(ui.vocabulary)
+
+        self.top = tk.Toplevel(parent)
+        self.top.title("Edit Vocabulary")
+        self.top.geometry("700x500")
+        self.top.transient(parent)
+        self.top.grab_set()
+
+        self._build_ui()
+        self._refresh_concept_list()
+
+        self.top.bind('<Escape>', lambda e: self.top.destroy())
+
+    # ------------------------------------------------------------------
+    # Layout
+    # ------------------------------------------------------------------
+
+    def _build_ui(self):
+        # Top instruction label
+        tk.Label(
+            self.top,
+            text="Map concept names to allowed instance names. "
+                 "Users can still type freely — the list is a suggestion menu.",
+            font=("Arial", 9), fg="gray", wraplength=680, justify=tk.LEFT
+        ).pack(fill=tk.X, padx=10, pady=(8, 4))
+
+        # Two-pane area
+        paned = tk.PanedWindow(self.top, orient=tk.HORIZONTAL,
+                               sashrelief=tk.RAISED, sashwidth=5)
+        paned.pack(fill=tk.BOTH, expand=True, padx=10, pady=4)
+
+        # --- Left: concept list ---
+        left = tk.Frame(paned)
+        paned.add(left, minsize=160, width=200)
+
+        tk.Label(left, text="Concepts", font=("Arial", 9, "bold")).pack(anchor=tk.W)
+
+        self.concept_lb = tk.Listbox(left, selectmode=tk.SINGLE, exportselection=False)
+        scrollL = tk.Scrollbar(left, orient=tk.VERTICAL, command=self.concept_lb.yview)
+        self.concept_lb.config(yscrollcommand=scrollL.set)
+        self.concept_lb.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollL.pack(side=tk.LEFT, fill=tk.Y)
+        self.concept_lb.bind('<<ListboxSelect>>', self._on_concept_select)
+
+        btn_left = tk.Frame(left)
+        btn_left.pack(fill=tk.X, pady=(4, 0))
+        tk.Button(btn_left, text="+ Add", command=self._add_concept).pack(side=tk.LEFT, expand=True, fill=tk.X)
+        tk.Button(btn_left, text="- Delete", command=self._delete_concept).pack(side=tk.LEFT, expand=True, fill=tk.X)
+
+        # --- Right: instance name list ---
+        right = tk.Frame(paned)
+        paned.add(right, minsize=200)
+
+        self.right_label = tk.Label(right, text="Names", font=("Arial", 9, "bold"))
+        self.right_label.pack(anchor=tk.W)
+
+        name_frame = tk.Frame(right)
+        name_frame.pack(fill=tk.BOTH, expand=True)
+
+        self.name_lb = tk.Listbox(name_frame, selectmode=tk.SINGLE, exportselection=False)
+        scrollR = tk.Scrollbar(name_frame, orient=tk.VERTICAL, command=self.name_lb.yview)
+        self.name_lb.config(yscrollcommand=scrollR.set)
+        self.name_lb.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollR.pack(side=tk.LEFT, fill=tk.Y)
+        self.name_lb.bind('<Double-Button-1>', self._edit_name)
+
+        btn_right = tk.Frame(right)
+        btn_right.pack(fill=tk.X, pady=(4, 0))
+        tk.Button(btn_right, text="+ Add", command=self._add_name).pack(side=tk.LEFT, expand=True, fill=tk.X)
+        tk.Button(btn_right, text="Edit", command=self._edit_name).pack(side=tk.LEFT, expand=True, fill=tk.X)
+        tk.Button(btn_right, text="- Delete", command=self._delete_name).pack(side=tk.LEFT, expand=True, fill=tk.X)
+        tk.Button(btn_right, text="^ Up", command=self._move_name_up).pack(side=tk.LEFT, expand=True, fill=tk.X)
+        tk.Button(btn_right, text="v Down", command=self._move_name_down).pack(side=tk.LEFT, expand=True, fill=tk.X)
+
+        # Bottom bar
+        bottom = tk.Frame(self.top)
+        bottom.pack(fill=tk.X, padx=10, pady=8)
+
+        tk.Button(bottom, text="Load File...", command=self._load_file).pack(side=tk.LEFT, padx=(0, 4))
+        tk.Button(bottom, text="Save File", command=self._save_file).pack(side=tk.LEFT, padx=(0, 4))
+
+        tk.Button(bottom, text="Save & Close", width=14,
+                  command=self._save_and_close).pack(side=tk.RIGHT, padx=(4, 0))
+        tk.Button(bottom, text="Cancel", width=10,
+                  command=self.top.destroy).pack(side=tk.RIGHT, padx=(4, 0))
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _selected_concept_name(self) -> Optional[str]:
+        sel = self.concept_lb.curselection()
+        if not sel:
+            return None
+        return self.concept_lb.get(sel[0])
+
+    def _refresh_concept_list(self, select_name: Optional[str] = None):
+        self.concept_lb.delete(0, tk.END)
+        for name in sorted(self._vocab.keys()):
+            self.concept_lb.insert(tk.END, name)
+        # Re-select
+        if select_name:
+            for i in range(self.concept_lb.size()):
+                if self.concept_lb.get(i) == select_name:
+                    self.concept_lb.selection_set(i)
+                    self.concept_lb.see(i)
+                    break
+        self._refresh_name_list()
+
+    def _refresh_name_list(self, select_idx: Optional[int] = None):
+        concept = self._selected_concept_name()
+        self.name_lb.delete(0, tk.END)
+        if concept is None:
+            self.right_label.config(text="Names")
+            return
+        self.right_label.config(text=f"Names for \"{concept}\"")
+        for name in self._vocab.get(concept, []):
+            self.name_lb.insert(tk.END, name)
+        if select_idx is not None:
+            idx = max(0, min(select_idx, self.name_lb.size() - 1))
+            if self.name_lb.size() > 0:
+                self.name_lb.selection_set(idx)
+                self.name_lb.see(idx)
+
+    # ------------------------------------------------------------------
+    # Concept actions
+    # ------------------------------------------------------------------
+
+    def _on_concept_select(self, _event=None):
+        self._refresh_name_list()
+
+    def _add_concept(self):
+        name = simpledialog.askstring("Add Concept", "Concept name:", parent=self.top)
+        if not name:
+            return
+        name = name.strip()
+        if not name:
+            return
+        if name in self._vocab:
+            messagebox.showwarning("Warning", f"Concept '{name}' already exists.", parent=self.top)
+            return
+        self._vocab[name] = []
+        self._refresh_concept_list(select_name=name)
+
+    def _delete_concept(self):
+        name = self._selected_concept_name()
+        if name is None:
+            return
+        if not messagebox.askyesno("Delete Concept",
+                                   f"Delete concept '{name}' and all its names?",
+                                   parent=self.top):
+            return
+        del self._vocab[name]
+        self._refresh_concept_list()
+
+    # ------------------------------------------------------------------
+    # Name actions
+    # ------------------------------------------------------------------
+
+    def _add_name(self):
+        concept = self._selected_concept_name()
+        if concept is None:
+            messagebox.showwarning("Warning", "Select a concept first.", parent=self.top)
+            return
+        name = simpledialog.askstring("Add Name", "Instance name:", parent=self.top)
+        if not name:
+            return
+        name = name.strip()
+        if not name:
+            return
+        names = self._vocab.setdefault(concept, [])
+        if name in names:
+            messagebox.showwarning("Warning", f"'{name}' already in list.", parent=self.top)
+            return
+        names.append(name)
+        self._refresh_name_list(select_idx=len(names) - 1)
+
+    def _edit_name(self, _event=None):
+        concept = self._selected_concept_name()
+        if concept is None:
+            return
+        sel = self.name_lb.curselection()
+        if not sel:
+            return
+        idx = sel[0]
+        old = self.name_lb.get(idx)
+        new = simpledialog.askstring("Edit Name", "Instance name:", initialvalue=old, parent=self.top)
+        if not new:
+            return
+        new = new.strip()
+        if not new or new == old:
+            return
+        names = self._vocab[concept]
+        names[idx] = new
+        self._refresh_name_list(select_idx=idx)
+
+    def _delete_name(self):
+        concept = self._selected_concept_name()
+        if concept is None:
+            return
+        sel = self.name_lb.curselection()
+        if not sel:
+            return
+        idx = sel[0]
+        del self._vocab[concept][idx]
+        self._refresh_name_list(select_idx=idx)
+
+    def _move_name_up(self):
+        concept = self._selected_concept_name()
+        if concept is None:
+            return
+        sel = self.name_lb.curselection()
+        if not sel or sel[0] == 0:
+            return
+        idx = sel[0]
+        names = self._vocab[concept]
+        names[idx - 1], names[idx] = names[idx], names[idx - 1]
+        self._refresh_name_list(select_idx=idx - 1)
+
+    def _move_name_down(self):
+        concept = self._selected_concept_name()
+        if concept is None:
+            return
+        sel = self.name_lb.curselection()
+        names = self._vocab.get(concept, [])
+        if not sel or sel[0] >= len(names) - 1:
+            return
+        idx = sel[0]
+        names[idx], names[idx + 1] = names[idx + 1], names[idx]
+        self._refresh_name_list(select_idx=idx + 1)
+
+    # ------------------------------------------------------------------
+    # File I/O
+    # ------------------------------------------------------------------
+
+    def _load_file(self):
+        path = filedialog.askopenfilename(
+            title="Load Vocabulary File",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+            parent=self.top
+        )
+        if not path:
+            return
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                raise ValueError("Expected a JSON object at top level")
+            self._vocab = {str(k): list(v) for k, v in data.items()}
+            self.ui.vocabulary_path = path
+            self._refresh_concept_list()
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to load:\n{e}", parent=self.top)
+
+    def _save_file(self):
+        path = self.ui.vocabulary_path
+        if not path:
+            path = filedialog.asksaveasfilename(
+                title="Save Vocabulary File",
+                defaultextension=".json",
+                filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+                parent=self.top
+            )
+        if not path:
+            return
+        try:
+            with open(path, 'w') as f:
+                json.dump(self._vocab, f, indent=2)
+            self.ui.vocabulary_path = path
+            messagebox.showinfo("Saved", f"Vocabulary saved to:\n{path}", parent=self.top)
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to save:\n{e}", parent=self.top)
+
+    def _save_and_close(self):
+        self.ui.vocabulary = self._vocab
+        self.top.destroy()
 
 
 def main():

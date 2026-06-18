@@ -533,6 +533,8 @@ class DynamicFrameCompositor:
             if not self.frames_dir:
                 raise ValueError(f"Failed to open video: {video_path}")
             print(f"Warning: cannot open video ({video_path}); using frame cache only.")
+        # Track the next expected frame so sequential reads skip the seek call.
+        self._video_cap_next_frame: int = -1
 
         # Per-frame mask cache: populated by get_composited_frame, read by callers
         # Maps (concept_name, obj_id) -> mask ndarray for the most-recently composited frame.
@@ -568,10 +570,14 @@ class DynamicFrameCompositor:
         # Priority 2/3: video file (MJPEG or original)
         if self.video_cap is None:
             raise ValueError(f"Failed to read frame {frame_idx} (no video source)")
-        self.video_cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+        # Skip the seek on sequential access — a bare read() is much faster.
+        if self._video_cap_next_frame != frame_idx:
+            self.video_cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
         ret, frame = self.video_cap.read()
         if ret:
+            self._video_cap_next_frame = frame_idx + 1
             return frame
+        self._video_cap_next_frame = -1
         raise ValueError(f"Failed to read frame {frame_idx}")
 
     def get_last_masks(self) -> Dict[tuple, np.ndarray]:
