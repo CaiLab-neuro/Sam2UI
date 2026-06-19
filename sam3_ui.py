@@ -107,6 +107,12 @@ class SAM3VideoUI:
         self.playback_speed = tk.DoubleVar(value=1.0)
         self.zoom_buttons: Dict[int, object] = {}
         self.speed_buttons: Dict[float, object] = {}
+        # Pending after-id for debounced canvas-resize redraws
+        self._canvas_resize_pending = None
+        # True while a _update_frame_from_play call is queued but not yet executed.
+        # Prevents the background thread from flooding the event queue when rendering
+        # (compositor + mask I/O) is slower than the target frame period.
+        self._render_pending: bool = False
 
         # Timeline zoom (slider window)
         self.slider_zoom_level = tk.IntVar(value=1)
@@ -115,9 +121,18 @@ class SAM3VideoUI:
 
         # Presence bar frame-cache: (concept_name, obj_id) -> set of frame indices
         self._presence_cache: Dict[tuple, set] = {}
-        # When True, next _update_presence_bar() redraws blocks+background (expensive).
-        # When False, only the playhead is updated (3 canvas ops, ~0ms).
+        # When True, next _update_presence_bar() regenerates the background image.
+        # When False, only the playhead canvas items are moved — O(1).
         self._presence_bar_dirty: bool = True
+        # Cached PhotoImage of the bar background (blocks only, no playhead).
+        # Stored here to prevent GC; updated only when dirty.
+        self._presence_bar_photo = None
+        self._presence_bar_img_id = None
+        # Same pattern for quality colorbars.
+        self._quality_overlap_photo = None
+        self._quality_overlap_img_id = None
+        self._quality_bg_photo = None
+        self._quality_bg_img_id = None
 
         # Quality metrics (loaded from quality_metrics.npz when available)
         self.quality_bg: Optional[List[float]] = None      # background ratio per frame
@@ -342,6 +357,15 @@ class SAM3VideoUI:
         # Bind click events for refinement (left=positive, right=negative)
         self.canvas.bind('<Button-1>', self.on_canvas_click)
         self.canvas.bind('<Button-3>', self.on_canvas_right_click)
+
+        # Redraw when canvas is resized so video fills the new size
+        self.canvas.bind('<Configure>', self._on_canvas_configure)
+
+        # Mouse-wheel scroll → frame navigation (Linux: Button-4/5; others: MouseWheel)
+        self.canvas.bind('<Button-4>',    lambda e: self.jump_frames(-1))
+        self.canvas.bind('<Button-5>',    lambda e: self.jump_frames(1))
+        self.canvas.bind('<MouseWheel>',
+                         lambda e: self.jump_frames(-1 if e.delta > 0 else 1))
 
         # ── Row 1: play/pause + frame nav + counter ───────────────────────────
         row1 = tk.Frame(parent)
@@ -888,7 +912,11 @@ class SAM3VideoUI:
             if self.current_frame_idx < self.num_frames - 1:
                 self.current_frame_idx = min(
                     self.current_frame_idx + frame_step, self.num_frames - 1)
-                self.root.after(0, self._update_frame_from_play)
+                # Only queue a render if the previous one has been consumed; otherwise
+                # the main thread would accumulate a backlog of stale frame renders.
+                if not self._render_pending:
+                    self._render_pending = True
+                    self.root.after(0, self._update_frame_from_play)
                 next_deadline += adjusted_delay
                 wait = next_deadline - time.perf_counter() - refresh_interval / 2.0
                 if wait > 0:
@@ -900,6 +928,7 @@ class SAM3VideoUI:
 
     def _update_frame_from_play(self):
         """Called on main thread to update slider + display during playback."""
+        self._render_pending = False  # allow background thread to queue the next render
         zoom = self.slider_zoom_level.get()
         if zoom > 1:
             slider_min = int(self.frame_slider.cget('from'))
@@ -1115,6 +1144,19 @@ class SAM3VideoUI:
                 if all_dict:
                     self._all_annotations_cache[key] = all_dict
 
+    def _on_canvas_configure(self, event):
+        """Redraw video when the canvas is resized (debounced 80 ms to avoid per-pixel floods)."""
+        if not self.compositor:
+            return
+        if self._canvas_resize_pending:
+            self.root.after_cancel(self._canvas_resize_pending)
+        self._canvas_resize_pending = self.root.after(80, self._canvas_resize_redraw)
+
+    def _canvas_resize_redraw(self):
+        self._canvas_resize_pending = None
+        if self.compositor:
+            self.display_frame()
+
     def _on_presence_canvas_configure(self, event):
         """Cache canvas size on resize and redraw."""
         self._presence_canvas_w = event.width
@@ -1125,10 +1167,10 @@ class SAM3VideoUI:
     def _update_presence_bar(self):
         """Update the instance presence bar.
 
-        Full redraw (background + blocks + playhead) only when dirty — i.e., when the
-        selected instance, zoom window, or mask data changed.  On plain frame navigation
-        (the common case) only the 3-item playhead is redrawn, avoiding the X11 flush
-        that a full canvas.delete("all") + many create_rectangle calls would trigger.
+        Background blocks are rendered to a numpy pixel array and cached as a
+        PhotoImage — no per-block canvas items.  On plain frame navigation only
+        the 3-item playhead is redrawn (O(1) Tk ops regardless of frame count).
+        Full background regeneration happens only when dirty (instance/zoom changed).
         """
         if not hasattr(self, 'presence_canvas'):
             return
@@ -1141,7 +1183,7 @@ class SAM3VideoUI:
         if not self.num_frames:
             return
 
-        # Compute visible frame range (needed for both block and playhead drawing)
+        # Compute visible frame range (needed for both background and playhead)
         zoom = self.slider_zoom_level.get()
         if zoom == 1:
             f_start, f_end = 0, self.num_frames - 1
@@ -1151,9 +1193,9 @@ class SAM3VideoUI:
         visible = max(1, f_end - f_start + 1)
 
         if self._presence_bar_dirty:
-            # Full redraw: background + presence blocks
-            canvas.delete("all")
-            canvas.create_rectangle(0, 0, w, h, fill='#2a2a2a', outline='')
+            # Render background into a numpy pixel array (no canvas items, no X11 per-rect flush)
+            import numpy as _np
+            bg_img = _np.full((h, w, 3), [42, 42, 42], dtype=_np.uint8)
 
             if self.selected_instance and self.selected_concept:
                 inst = self.selected_instance
@@ -1162,36 +1204,29 @@ class SAM3VideoUI:
                 r, g, b = base
                 hv, sv, vv = colorsys.rgb_to_hsv(r / 255, g / 255, b / 255)
                 r2, g2, b2 = colorsys.hsv_to_rgb(hv, 1.0, 1.0)
-                fill_color = f'#{int(r2*255):02x}{int(g2*255):02x}{int(b2*255):02x}'
+                fill_rgb = [int(r2 * 255), int(g2 * 255), int(b2 * 255)]
 
                 period_peaks = inst.period_peaks if inst.period_peaks else []
                 if period_peaks:
-                    # Variable-height bars: height proportional to sqrt of normalized
-                    # avg_pixel_ratio so small objects remain visible.  Bar is bottom-anchored.
                     max_ratio = max(p.get('avg_pixel_ratio', 0) for p in period_peaks)
                     if max_ratio <= 0:
                         max_ratio = 1.0
                     inner_h = h - 2
                     for period in period_peaks:
-                        p_start = period['start']
-                        p_end = period['end']
-                        draw_start = max(p_start, f_start)
-                        draw_end = min(p_end, f_end)
+                        draw_start = max(period['start'], f_start)
+                        draw_end = min(period['end'], f_end)
                         if draw_start > draw_end:
                             continue
-                        ratio = period.get('avg_pixel_ratio', 0)
-                        rel = (ratio / max_ratio) ** 0.5
+                        rel = (period.get('avg_pixel_ratio', 0) / max_ratio) ** 0.5
                         bar_h = max(2, int(rel * inner_h))
                         y0 = h - 1 - bar_h
-                        y1 = h - 1
-                        x0 = (draw_start - f_start) / visible * w
-                        x1 = max(x0 + 1, (draw_end - f_start + 1) / visible * w)
-                        canvas.create_rectangle(x0, y0, x1, y1, fill=fill_color, outline='')
+                        x0 = max(0, int((draw_start - f_start) / visible * w))
+                        x1 = min(w, max(x0 + 1, int((draw_end - f_start + 1) / visible * w)))
+                        bg_img[y0:h - 1, x0:x1] = fill_rgb
                 else:
                     # Fallback: binary presence from mask file scan (old projects / no peak data)
                     presence = self._get_presence_frames()
                     if presence:
-                        y0, y1 = 1, h - 1
                         sorted_f = sorted(f for f in presence if f_start <= f <= f_end)
                         if sorted_f:
                             run_s = run_e = sorted_f[0]
@@ -1199,17 +1234,26 @@ class SAM3VideoUI:
                                 if fr == run_e + 1:
                                     run_e = fr
                                 else:
-                                    x0 = (run_s - f_start) / visible * w
-                                    x1 = max(x0 + 1, (run_e - f_start + 1) / visible * w)
-                                    canvas.create_rectangle(x0, y0, x1, y1, fill=fill_color, outline='')
+                                    x0 = max(0, int((run_s - f_start) / visible * w))
+                                    x1 = min(w, max(x0 + 1, int((run_e - f_start + 1) / visible * w)))
+                                    bg_img[1:h - 1, x0:x1] = fill_rgb
                                     run_s = run_e = fr
-                            x0 = (run_s - f_start) / visible * w
-                            x1 = max(x0 + 1, (run_e - f_start + 1) / visible * w)
-                            canvas.create_rectangle(x0, y0, x1, y1, fill=fill_color, outline='')
+                            x0 = max(0, int((run_s - f_start) / visible * w))
+                            x1 = min(w, max(x0 + 1, int((run_e - f_start + 1) / visible * w)))
+                            bg_img[1:h - 1, x0:x1] = fill_rgb
 
+            self._presence_bar_photo = ImageTk.PhotoImage(
+                Image.fromarray(bg_img, mode='RGB'))
+            if self._presence_bar_img_id is None:
+                canvas.delete("all")
+                self._presence_bar_img_id = canvas.create_image(
+                    0, 0, image=self._presence_bar_photo, anchor=tk.NW)
+            else:
+                canvas.itemconfig(self._presence_bar_img_id,
+                                  image=self._presence_bar_photo)
             self._presence_bar_dirty = False
         else:
-            # Fast path: only remove the old playhead items
+            # Fast path: only remove the old playhead items (background image unchanged)
             canvas.delete("playhead")
 
         # Draw playhead (always): black shadow + white line + triangle, tagged "playhead"
@@ -1263,8 +1307,10 @@ class SAM3VideoUI:
     def _draw_quality_colorbars(self):
         """Render the overlap and background-ratio colorbars with a playhead.
 
-        Full redraw only when _quality_bars_dirty is set; otherwise only the
-        playhead is moved — same fast-path pattern as _update_presence_bar().
+        Background is rendered to a numpy pixel array and cached as a PhotoImage —
+        O(canvas_width) numpy ops, zero per-pixel canvas items.  On plain frame
+        navigation only the 3-item playhead is redrawn (O(1) Tk ops).
+        Full background regeneration only when _quality_bars_dirty is set.
         """
         if not hasattr(self, 'quality_overlap_canvas'):
             return
@@ -1277,29 +1323,39 @@ class SAM3VideoUI:
             f_end = int(self.frame_slider.cget('to'))
         visible = max(1, f_end - f_start + 1)
 
-        def _full_redraw(canvas, values, low_color, high_color):
-            canvas.delete("all")
+        def _make_bar_image(canvas, values, low_color, high_color):
+            import numpy as _np
             w = canvas.winfo_width()
             h = canvas.winfo_height()
-            if w <= 1 or h <= 1 or not values or not self.num_frames:
-                return
-            n = len(values)
+            if w <= 1 or h <= 1 or not self.num_frames:
+                return None
             lr, lg, lb = low_color
             hr, hg, hb = high_color
-            # Iterate over pixel columns rather than frames — O(canvas_width) not
-            # O(num_frames).  Each pixel samples the frame at its left edge, which
-            # is visually identical to the original for any video longer than the
-            # canvas width, and correct for zoomed (short) windows too.
-            for px in range(w):
-                f = f_start + int(px * visible / w)
-                if f >= n:
-                    break
-                t = min(max(values[f], 0.0), 1.0)
-                r = int(lr + t * (hr - lr))
-                g = int(lg + t * (hg - lg))
-                b = int(lb + t * (hb - lb))
-                canvas.create_rectangle(px, 0, px + 1, h,
-                                        fill=f'#{r:02x}{g:02x}{b:02x}', outline='')
+            img = _np.empty((h, w, 3), dtype=_np.uint8)
+            img[:, :] = low_color
+            if values:
+                n = len(values)
+                # Map pixel columns to frames — O(w) numpy, zero Tk calls
+                px_arr = _np.arange(w)
+                f_arr = (f_start + (px_arr * visible / w).astype(_np.int32))
+                valid = f_arr < n
+                t_arr = _np.clip(_np.array(values)[f_arr[valid]], 0.0, 1.0)
+                img[:, px_arr[valid], 0] = (lr + t_arr * (hr - lr)).astype(_np.uint8)
+                img[:, px_arr[valid], 1] = (lg + t_arr * (hg - lg)).astype(_np.uint8)
+                img[:, px_arr[valid], 2] = (lb + t_arr * (hb - lb)).astype(_np.uint8)
+            return ImageTk.PhotoImage(Image.fromarray(img, mode='RGB'))
+
+        def _put_image(canvas, photo, img_id_attr, photo_attr):
+            if photo is None:
+                return
+            setattr(self, photo_attr, photo)
+            img_id = getattr(self, img_id_attr)
+            if img_id is None:
+                canvas.delete("all")
+                setattr(self, img_id_attr,
+                        canvas.create_image(0, 0, image=photo, anchor=tk.NW))
+            else:
+                canvas.itemconfig(img_id, image=photo)
 
         def _draw_playhead(canvas):
             w = canvas.winfo_width()
@@ -1316,12 +1372,14 @@ class SAM3VideoUI:
                                       fill='#ffdd00', outline='black', width=1, tags="qplayhead")
 
         if self._quality_bars_dirty:
-            _full_redraw(self.quality_overlap_canvas,
-                         self.quality_overlap,
-                         (42, 42, 42), (220, 60, 30))
-            _full_redraw(self.quality_bg_canvas,
-                         self.quality_bg,
-                         (42, 42, 42), (30, 120, 200))
+            _put_image(self.quality_overlap_canvas,
+                       _make_bar_image(self.quality_overlap_canvas,
+                                       self.quality_overlap, (42, 42, 42), (220, 60, 30)),
+                       '_quality_overlap_img_id', '_quality_overlap_photo')
+            _put_image(self.quality_bg_canvas,
+                       _make_bar_image(self.quality_bg_canvas,
+                                       self.quality_bg, (42, 42, 42), (30, 120, 200)),
+                       '_quality_bg_img_id', '_quality_bg_photo')
             self._quality_bars_dirty = False
 
         _draw_playhead(self.quality_overlap_canvas)
@@ -1744,18 +1802,48 @@ class SAM3VideoUI:
             _perf_reset()
             _t_total = _time.perf_counter()
 
-            # Resolve focus concept: only composite the selected concept when focus mode is on.
-            _focus_concept = None
-            if self.focus_mode_var.get() and self.selected_concept:
+            # During playback: focus on the selected concept only (reduces mask I/O & blend
+            # work from all concepts down to one), and skip label drawing (expensive centroid
+            # computation not useful while video is moving).
+            _is_playing = self.playing
+            if _is_playing:
+                _focus_concept = self.selected_concept.name if self.selected_concept else None
+            elif self.focus_mode_var.get() and self.selected_concept:
                 _focus_concept = self.selected_concept.name
+            else:
+                _focus_concept = None
 
-            # Get composited frame; masks loaded during compositing are cached for reuse
+            # During playback only: downscale to canvas resolution before compositing so
+            # all numpy work (blend, cvtcolor, etc.) runs at ~6× fewer pixels.
+            # During annotation/scrubbing: always composite at native resolution so click
+            # coordinates and mask precision are unaffected.
+            canvas_width = self.canvas.winfo_width()
+            canvas_height = self.canvas.winfo_height()
+            target_hw = None
+            _scale_x = _scale_y = 1.0
+            if _is_playing and canvas_width > 1 and canvas_height > 1:
+                _nw = self.compositor.native_w
+                _nh = self.compositor.native_h
+                if _nw > 1 and _nh > 1:
+                    if _nw / _nh > canvas_width / canvas_height:
+                        _disp_w = canvas_width
+                        _disp_h = int(canvas_width * _nh / _nw)
+                    else:
+                        _disp_h = canvas_height
+                        _disp_w = int(canvas_height * _nw / _nh)
+                    if _disp_w > 1 and _disp_h > 1:
+                        target_hw = (_disp_h, _disp_w)
+                        _scale_x = _disp_w / _nw
+                        _scale_y = _disp_h / _nh
+
+            # Get composited frame; masks loaded during compositing are cached for reuse.
             _alpha = self.mask_alpha_var.get() if self.show_masks_var.get() else 0.0
             with _T("compositor"):
                 frame_rgb = self.compositor.get_composited_frame(
                     self.current_frame_idx,
                     alpha_multiplier=_alpha,
                     focus_concept_name=_focus_concept,
+                    target_hw=target_hw,
                 )
             masks_cache = self.compositor.get_last_masks()
 
@@ -1763,8 +1851,8 @@ class SAM3VideoUI:
             with _T("highlight"):
                 frame_rgb = self._highlight_selected_instance(frame_rgb, masks_cache)
 
-            # Text labels at mask centroids (uses cached masks, no extra disk reads)
-            if self.show_labels_var.get():
+            # Text labels at mask centroids — skipped during playback (expensive, not useful)
+            if self.show_labels_var.get() and not _is_playing:
                 with _T("labels"):
                     frame_rgb = self._draw_instance_labels(frame_rgb, masks_cache)
 
@@ -1776,56 +1864,54 @@ class SAM3VideoUI:
                 )
                 m = load_sam3_mask(_fmask_dir, self.current_frame_idx)
                 if m is not None:
-                        white = np.zeros_like(frame_rgb)
-                        white[m > 127] = [255, 255, 255]
-                        frame_rgb = cv2.addWeighted(frame_rgb, 0.3, white, 0.7, 0)
+                    fh, fw = frame_rgb.shape[:2]
+                    if m.shape[0] != fh or m.shape[1] != fw:
+                        m = cv2.resize(m, (fw, fh), interpolation=cv2.INTER_NEAREST)
+                    white = np.zeros_like(frame_rgb)
+                    white[m > 127] = [255, 255, 255]
+                    frame_rgb = cv2.addWeighted(frame_rgb, 0.3, white, 0.7, 0)
 
             # Flash overlap: orange-red overlay on pixels claimed by 2+ instances
             if self.flash_overlap_in_progress and self.flash_overlap_on and self.flash_overlap_computed is not None:
                 overlap_mask = self.flash_overlap_computed
                 fh, fw = frame_rgb.shape[:2]
                 if overlap_mask.shape != (fh, fw):
-                    m_pil = Image.fromarray(overlap_mask.astype(np.uint8) * 255)
-                    m_pil = m_pil.resize((fw, fh), Image.NEAREST)
-                    overlap_mask = np.array(m_pil) > 0
+                    overlap_mask = cv2.resize(
+                        overlap_mask.astype(np.uint8), (fw, fh),
+                        interpolation=cv2.INTER_NEAREST).astype(bool)
                 red_overlay = np.zeros_like(frame_rgb)
                 red_overlay[overlap_mask] = [255, 60, 0]
                 frame_rgb = cv2.addWeighted(frame_rgb, 0.4, red_overlay, 0.6, 0)
 
-            # Draw saved/pending refinement points whenever present
+            # Draw saved/pending refinement points — scale from native video coords to frame size
             if self.refinement_points:
                 frame_rgb = frame_rgb.copy()
                 flash_pts = self.flash_points_in_progress and self.flash_points_on
                 radius = 10 if flash_pts else 5
                 halo = radius + 2
                 for x, y, is_pos in self.refinement_points:
+                    px, py = int(x * _scale_x), int(y * _scale_y)
                     color = (0, 255, 0) if is_pos else (255, 0, 0)
                     if flash_pts:
-                        cv2.circle(frame_rgb, (int(x), int(y)), halo + 3, (255, 255, 255), 3)
-                    cv2.circle(frame_rgb, (int(x), int(y)), radius, color, -1)
-                    cv2.circle(frame_rgb, (int(x), int(y)), halo, (255, 255, 255), 2)
+                        cv2.circle(frame_rgb, (px, py), halo + 3, (255, 255, 255), 3)
+                    cv2.circle(frame_rgb, (px, py), radius, color, -1)
+                    cv2.circle(frame_rgb, (px, py), halo, (255, 255, 255), 2)
 
-            # Convert to PIL and resize to canvas
+            # Wrap in PIL — compositor already returned at canvas size, no resize needed.
+            # Fallback PIL resize only when canvas wasn't ready (target_hw is None).
             with _T("pil_resize"):
                 pil_image = Image.fromarray(frame_rgb)
-                canvas_width = self.canvas.winfo_width()
-                canvas_height = self.canvas.winfo_height()
-
-                if canvas_width > 1 and canvas_height > 1:
-                    # Maintain aspect ratio
+                if target_hw is None and canvas_width > 1 and canvas_height > 1:
                     img_aspect = pil_image.width / pil_image.height
-                    canvas_aspect = canvas_width / canvas_height
-
-                    if img_aspect > canvas_aspect:
+                    if img_aspect > canvas_width / canvas_height:
                         new_width = canvas_width
                         new_height = int(canvas_width / img_aspect)
                     else:
                         new_height = canvas_height
                         new_width = int(canvas_height * img_aspect)
-
                     pil_image = pil_image.resize((new_width, new_height), Image.BILINEAR)
 
-            # Display — reuse the already-queried canvas dimensions for centering
+            # Display
             with _T("canvas"):
                 self.photo = ImageTk.PhotoImage(pil_image)
                 cx = canvas_width // 2
@@ -1857,6 +1943,11 @@ class SAM3VideoUI:
 
     def on_slider_change(self, value):
         """Handle frame slider change; re-center zoom window when near edge."""
+        # During playback the background thread updates current_frame_idx directly and
+        # calls display_frame() via _update_frame_from_play; the slider.set() there
+        # would fire this callback a second time, doubling all rendering work.
+        if self.playing:
+            return
         new_idx = int(float(value))
         zoom = self.slider_zoom_level.get()
         if zoom > 1:

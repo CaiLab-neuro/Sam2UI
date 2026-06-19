@@ -1512,6 +1512,15 @@ def load_sam3_model(model_name: str = "sam3", device: str = "cuda:0",
         if tracker is not None and hasattr(tracker, "offload_output_to_cpu_for_eval"):
             tracker.offload_output_to_cpu_for_eval = True
             print("SAM3: offload_output_to_cpu_for_eval=True on tracker")
+        # Disable prev-mask-logit bias so user correction points segment from scratch
+        # rather than refining the (possibly wrong) VG detector prediction at that frame.
+        # With iter_use_prev_mask_pred=True (the SAM3 default), a correction at frame F
+        # receives the VG mask as prev_sam_mask_logits, biasing the decoder toward the
+        # wrong region even when the correction point is on a different object.
+        # SAM3.1 multiplex already defaults to False, so this only affects SAM3.
+        if tracker is not None and hasattr(tracker, "iter_use_prev_mask_pred"):
+            tracker.iter_use_prev_mask_pred = False
+            print("SAM3: iter_use_prev_mask_pred=False on tracker (correction points start fresh)")
 
     # Patch max_cond_frames_in_attn on the tracker (lives on SAM2Base which
     # Sam3TrackerPredictor inherits from). Works for both SAM3 and SAM3.1.

@@ -548,6 +548,7 @@ class DynamicFrameCompositor:
         # few render calls (which otherwise took 50–160 seconds on NFS-backed storage).
         probe = self._load_video_frame(0)
         ph, pw = probe.shape[:2]
+        self.native_h, self.native_w = ph, pw  # original video resolution
         self._alloc_buffers(ph, pw)
 
     def _alloc_buffers(self, h: int, w: int):
@@ -592,7 +593,8 @@ class DynamicFrameCompositor:
         return self._last_masks
 
     def get_composited_frame(self, frame_idx: int, alpha_multiplier: float = 1.0,
-                             focus_concept_name: Optional[str] = None) -> np.ndarray:
+                             focus_concept_name: Optional[str] = None,
+                             target_hw: Optional[tuple] = None) -> np.ndarray:
         """
         Composite a single frame with all visible concepts.
 
@@ -604,11 +606,14 @@ class DynamicFrameCompositor:
             frame_idx: Frame index to composite.
             alpha_multiplier: Global scale for all mask opacities (0.0 = raw frame, no masks).
             focus_concept_name: When set, only composite this concept's instances.
-                Used by the UI's "Focus: selected concept only" mode to reduce mask I/O
-                and blend work when the user is refining a single concept.
+            target_hw: (height, width) to downscale to before compositing.  All numpy
+                work (cvtcolor, blend, final_blend) runs at this smaller resolution,
+                giving a ~6× speedup for 1600×1200 → 640×480.  Masks are also resized
+                (NEAREST) before blending.  The returned frame is at target_hw size so
+                the caller can skip a second PIL resize step.
 
         Returns:
-            Composited frame (RGB uint8)
+            Composited frame (RGB uint8) at target_hw size if given, else native size.
         """
         _t0 = time.perf_counter()
 
@@ -616,8 +621,15 @@ class DynamicFrameCompositor:
         frame = self._load_video_frame(frame_idx)
         _t_video = time.perf_counter()
 
+        # Downscale to target resolution before any numpy work — reduces all subsequent
+        # ops (cvtcolor, fill, per-mask blend, final_blend) proportionally.
+        if target_hw is not None:
+            th, tw = target_hw
+            if frame.shape[0] != th or frame.shape[1] != tw:
+                frame = cv2.resize(frame, (tw, th), interpolation=cv2.INTER_LINEAR)
+
         h, w = frame.shape[:2]
-        # Resize all buffers if video resolution changed (rare, but safe)
+        # Reallocate buffers if size changed (target_hw change or rare native resolution change)
         if self._overlay_rgb.shape[0] != h or self._overlay_rgb.shape[1] != w:
             self._alloc_buffers(h, w)
 
@@ -667,6 +679,9 @@ class DynamicFrameCompositor:
                 _t_mask_io += time.perf_counter() - _tm
                 if mask is None:
                     continue
+                # Downscale mask to match the (already-resized) frame dimensions
+                if mask.shape[0] != h or mask.shape[1] != w:
+                    mask = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
                 _n_masks += 1
                 self._last_masks[(concept.name, instance.sam3_obj_id)] = mask
 
