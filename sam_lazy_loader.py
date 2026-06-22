@@ -204,6 +204,140 @@ class LazyVideoFrameLoader:
         return self.compute_device if not self.offload_video_to_cpu else torch.device('cpu')
 
 
+def _apply_sam3_bugfixes():
+    """
+    Monkey-patch SAM3 classes to fix device-mismatch bugs that arise when
+    offload_state_to_cpu=True (required for long-video processing).
+
+    Returns a list of patch names that were successfully applied.
+    All patches are idempotent — safe to call more than once.
+    """
+    import functools
+    import torch
+    applied = []
+
+    # ── Patch 1: Sam3TrackerBase.cal_mem_score ────────────────────────────
+    # iou_score may be on CPU (offloaded) while object_score_logits is on GPU.
+    # Inserting .to() before the arithmetic prevents a device-mismatch crash.
+    try:
+        from sam3.model.sam3_tracker_base import Sam3TrackerBase
+        if not getattr(Sam3TrackerBase.cal_mem_score, "_sam3_patched", False):
+            def _cal_mem_score(self, object_score_logits, iou_score):
+                iou_score = iou_score.to(object_score_logits.device)
+                object_score_norm = torch.where(
+                    object_score_logits > 0,
+                    object_score_logits.sigmoid() * 2 - 1,
+                    torch.zeros_like(object_score_logits),
+                )
+                return (object_score_norm * iou_score).mean()
+            _cal_mem_score._sam3_patched = True
+            Sam3TrackerBase.cal_mem_score = _cal_mem_score
+            applied.append("SAM3 cal_mem_score device fix")
+    except (ImportError, AttributeError):
+        pass
+
+    # ── Patch 2: Sam3TrackerBase.track_step ──────────────────────────────
+    # When offload_output_to_cpu_for_eval=True and run_mem_encoder=False,
+    # trimmed_out omits maskmem_features / maskmem_pos_enc entirely.
+    # Downstream dict lookups then raise KeyError.  Wrap to ensure the keys
+    # are always present (None when there is no memory to encode).
+    try:
+        from sam3.model.sam3_tracker_base import Sam3TrackerBase
+        if not getattr(Sam3TrackerBase.track_step, "_sam3_patched", False):
+            _orig_track_step = Sam3TrackerBase.track_step
+
+            @functools.wraps(_orig_track_step)
+            def _track_step(self, *args, **kwargs):
+                current_out = _orig_track_step(self, *args, **kwargs)
+                if "maskmem_features" not in current_out:
+                    current_out["maskmem_features"] = None
+                if "maskmem_pos_enc" not in current_out:
+                    current_out["maskmem_pos_enc"] = None
+                return current_out
+            _track_step._sam3_patched = True
+            Sam3TrackerBase.track_step = _track_step
+            applied.append("SAM3 track_step maskmem key fix")
+    except (ImportError, AttributeError):
+        pass
+
+    # ── Patch 3: Sam3TrackingPredictor.init_state default ────────────────
+    # _tracker_add_new_objects (Sam3VideoBase) calls self.tracker.init_state()
+    # without offload_state_to_cpu, so newly created tracker states (for objects
+    # detected mid-video) don't inherit CPU offloading.  Changing the default
+    # to True means all dynamically created states offload without explicit kwarg.
+    try:
+        from sam3.model.sam3_tracking_predictor import Sam3TrackerPredictor
+        if not getattr(Sam3TrackerPredictor.init_state, "_sam3_patched", False):
+            _orig_init_state = Sam3TrackerPredictor.init_state
+
+            @functools.wraps(_orig_init_state)
+            def _init_state(self, *args, offload_state_to_cpu=True, **kwargs):
+                return _orig_init_state(
+                    self, *args, offload_state_to_cpu=offload_state_to_cpu, **kwargs
+                )
+            _init_state._sam3_patched = True
+            Sam3TrackerPredictor.init_state = _init_state
+            applied.append("SAM3 init_state offload default=True")
+    except (ImportError, AttributeError):
+        pass
+
+    # ── Patch 4: Sam3VideoInference._cache_frame_outputs ─────────────────
+    # Per-frame output masks were left on GPU, accumulating 30K+ tensors.
+    # Wrap to move each newly cached mask to CPU immediately after storage.
+    try:
+        from sam3.model.sam3_video_inference import Sam3VideoInference
+        if not getattr(Sam3VideoInference._cache_frame_outputs, "_sam3_patched", False):
+            _orig_cache = Sam3VideoInference._cache_frame_outputs
+
+            @functools.wraps(_orig_cache)
+            def _cache_frame_outputs(self, inference_state, frame_idx, obj_id_to_mask,
+                                     suppressed_obj_ids=None, removed_obj_ids=None,
+                                     unconfirmed_obj_ids=None):
+                _orig_cache(self, inference_state, frame_idx, obj_id_to_mask,
+                            suppressed_obj_ids, removed_obj_ids, unconfirmed_obj_ids)
+                cached = inference_state["cached_frame_outputs"].get(frame_idx)
+                if cached:
+                    for obj_id, mask in cached.items():
+                        if torch.is_tensor(mask) and mask.is_cuda:
+                            cached[obj_id] = mask.cpu()
+            _cache_frame_outputs._sam3_patched = True
+            Sam3VideoInference._cache_frame_outputs = _cache_frame_outputs
+            applied.append("SAM3 _cache_frame_outputs GPU→CPU offload")
+    except (ImportError, AttributeError):
+        pass
+
+    # ── Patch 5: Sam3VideoInference._build_tracker_output ────────────────
+    # Patch 4 offloads cached masks to CPU; if refined_obj_id_to_mask is on GPU
+    # the subsequent torch.cat in the caller hits a device mismatch.
+    # Wrap to realign all masks to the refined masks' device before returning.
+    try:
+        from sam3.model.sam3_video_inference import Sam3VideoInference
+        if not getattr(Sam3VideoInference._build_tracker_output, "_sam3_patched", False):
+            _orig_build = Sam3VideoInference._build_tracker_output
+
+            @functools.wraps(_orig_build)
+            def _build_tracker_output(self, inference_state, frame_idx,
+                                      refined_obj_id_to_mask=None):
+                obj_id_to_mask = _orig_build(
+                    self, inference_state, frame_idx, refined_obj_id_to_mask
+                )
+                if refined_obj_id_to_mask:
+                    target_device = next(iter(refined_obj_id_to_mask.values())).device
+                    for obj_id in obj_id_to_mask:
+                        if torch.is_tensor(obj_id_to_mask[obj_id]):
+                            obj_id_to_mask[obj_id] = (
+                                obj_id_to_mask[obj_id].to(target_device)
+                            )
+                return obj_id_to_mask
+            _build_tracker_output._sam3_patched = True
+            Sam3VideoInference._build_tracker_output = _build_tracker_output
+            applied.append("SAM3 _build_tracker_output device alignment")
+    except (ImportError, AttributeError):
+        pass
+
+    return applied
+
+
 def enable_lazy_loading(cache_size=20, enable_sam3=True,
                         prefetch_ahead=8, prefetch_workers=2):
     """
@@ -369,6 +503,11 @@ def enable_lazy_loading(cache_size=20, enable_sam3=True,
 
         except (ImportError, AttributeError):
             pass
+
+    if enable_sam3:
+        bugfix_patched = _apply_sam3_bugfixes()
+        if bugfix_patched:
+            patched.extend(bugfix_patched)
 
     print("=" * 60)
     print("LAZY LOADING ENABLED")

@@ -25,31 +25,55 @@ from sam3_project import (
 from sam3_utils import extract_frames_from_video
 
 
-def _prune_non_cond_outputs(inner_state: dict, frame_idx: int, keep: int = 20) -> None:
-    """Prune stale non_cond_frame_outputs from every tracker state.
+def _prune_non_cond_outputs(
+    inner_state: dict,
+    frame_idx: int,
+    keep: int = 20,
+    auto_cond_window: int = 48,
+) -> None:
+    """Prune stale frame outputs from every tracker state.
 
     SAM3's multi-GPU structure stores maskmem tensors at:
       inner_state["tracker_inference_states"][gpu]["output_dict"]["non_cond_frame_outputs"]
-    and per-object at:
-      inner_state["tracker_inference_states"][gpu]["output_dict_per_obj"][obj]["non_cond_frame_outputs"]
+    SAM3.1 multiplex uses inner_state["sam2_inference_states"] with the same keys.
 
-    SAM3.1 multiplex stores the equivalent bucketized tracker states under
-    inner_state["sam2_inference_states"] with the same output_dict key names.
+    Non-cond pruning
+    ----------------
+    Evict non_cond_frame_outputs entries older than `keep` frames.  SAM3 attends to at
+    most num_maskmem=7 previous non-cond frames, so 20 is already generous.
 
-    SAM3 attends to at most num_maskmem=7 previous frames, so keeping `keep` (default 20)
-    frames of history is generous.  Call this once per yielded frame.
+    Cond frame pruning — two categories
+    ------------------------------------
+    Cond frames come from two sources:
 
-    Cond frames are intentionally NOT evicted here.  select_closest_cond_frames selects
-    attending frames by temporal proximity (closest before + closest after + nearest by
-    distance), so every user correction frame remains eligible as long as it stays in
-    cond_frame_outputs.  Evicting old cond entries by index (as was done previously)
-    would silently remove correction anchors that SAM3 would have attended to.
+    1. User-correction clicks: stored in point_inputs_per_obj.  NEVER evict.
+       select_closest_cond_frames picks the temporally nearest cond frames, so a
+       correction at frame 500 is still selected when processing frame 38000 — it is
+       the most informative anchor for that instance.
+
+    2. Auto-reconditioning: every recondition_every_nth_frame=16 frames,
+       _recondition_masklets feeds the VG detector mask back via add_new_mask(),
+       which stores a mask-only entry in mask_inputs_per_obj and promotes the frame
+       to cond_frame_outputs (because add_all_frames_to_correct_as_cond=True on the
+       tracker).  These are NOT user corrections.  For a 38 K-frame video that is
+       ~2,400 auto-recondition cond frames that accumulate without bound.
+       Safe to evict: select_closest_cond_frames always picks the NEAREST cond frame
+       before the current position, so a recondition entry at F-32 is fully superseded
+       by the closer entry at F-16.  We keep the most recent `auto_cond_window` frames
+       worth (default 48 = 3 × 16-frame intervals), which is always more than enough.
+
+    When evicting an auto-recondition cond frame we must maintain the invariant that
+    all four of {output_dict["cond_frame_outputs"], consolidated_frame_inds["cond_frame_outputs"],
+    output_dict_per_obj[*]["cond_frame_outputs"], mask_inputs_per_obj[*][frame]} are
+    consistent — removal from one must propagate to all.
     """
     cutoff = frame_idx - keep
+    auto_cond_cutoff = frame_idx - auto_cond_window
+
     tracker_states = (inner_state.get("tracker_inference_states", [])
                       + inner_state.get("sam2_inference_states", []))
     for ts in tracker_states:
-        # Prune non-cond outputs (maskmem for non-conditioning frames)
+        # --- Non-cond pruning (unchanged) ---
         non_cond = ts.get("output_dict", {}).get("non_cond_frame_outputs", {})
         stale = [f for f in non_cond if f < cutoff]
         for f in stale:
@@ -60,6 +84,50 @@ def _prune_non_cond_outputs(inner_state: dict, frame_idx: int, keep: int = 20) -
             stale = [f for f in non_cond if f < cutoff]
             for f in stale:
                 del non_cond[f]
+
+        # --- Cond frame pruning: auto-recondition entries only ---
+        # Collect frames that have user-supplied point inputs — never evict these.
+        user_point_frames: set = set()
+        for per_frame in ts.get("point_inputs_per_obj", {}).values():
+            user_point_frames.update(per_frame.keys())
+
+        cond = ts.get("output_dict", {}).get("cond_frame_outputs", {})
+        # Never evict the earliest cond frame — it is the initial detection anchor
+        # (added by _tracker_add_new_objects → add_new_mask → propagate_in_video_preflight).
+        # Evicting it would empty cond_frame_outputs and trigger "No points" on the
+        # next tracker propagation call.  All later frames are auto-recondition entries
+        # that are safe to evict once they fall outside the auto_cond_window.
+        initial_frame = min(cond) if cond else None
+        evict = {
+            f for f in cond
+            if f < auto_cond_cutoff and f not in user_point_frames
+            and f != initial_frame
+        }
+        if not evict:
+            continue
+
+        for f in evict:
+            del cond[f]
+
+        # Keep consolidated_frame_inds in sync.
+        consolidated_cond = ts.get("consolidated_frame_inds", {}).get("cond_frame_outputs")
+        if consolidated_cond is not None:
+            consolidated_cond -= evict
+
+        # Per-object slices of cond_frame_outputs.
+        for obj_dict in ts.get("output_dict_per_obj", {}).values():
+            obj_cond = obj_dict.get("cond_frame_outputs", {})
+            for f in evict:
+                obj_cond.pop(f, None)
+
+        # Remove mask_inputs_per_obj entries for evicted frames so the
+        # point_inputs ∪ mask_inputs == cond_frame_inds invariant holds if
+        # propagate_in_video_preflight is ever called again (e.g. refinement restart).
+        # point_inputs_per_obj is intentionally left untouched (we only evict
+        # frames that had no point inputs to begin with).
+        for per_frame in ts.get("mask_inputs_per_obj", {}).values():
+            for f in evict:
+                per_frame.pop(f, None)
 
 
 def compute_period_peaks(periods: List[Tuple[int, int]],
@@ -105,6 +173,87 @@ def compute_period_peaks(periods: List[Tuple[int, int]],
                 "max_pixel_ratio": max_count * inv,
             })
     return peaks
+
+
+def compute_presence_norm(frame_pixel_counts: "dict[int, int]", total_pixels: int) -> float:
+    """99th-percentile pixel ratio across all detected frames (for presence bar normalization).
+
+    Returns 0.0 when total_pixels is 0 or no non-zero frame counts are available.
+    The UI uses this as the bar-height denominator so typical frames map near 100% height
+    while only the top 1% of frames (outlier peaks) clip at the ceiling.
+    """
+    if total_pixels <= 0 or not frame_pixel_counts:
+        return 0.0
+    ratios = sorted(c / total_pixels for c in frame_pixel_counts.values() if c > 0)
+    if not ratios:
+        return 0.0
+    n = len(ratios)
+    p = 0.99 * (n - 1)
+    lo = int(p)
+    hi = min(lo + 1, n - 1)
+    return ratios[lo] + (p - lo) * (ratios[hi] - ratios[lo])
+
+
+def _inject_mask_anchors(
+    sam3_model,
+    session_id: str,
+    concept: "SAM3Concept",
+    project_dir: str,
+) -> None:
+    """Load on-disk mask_anchors/ frames for every non-deleted instance and feed
+    them to the SAM3 tracker via add_new_mask().
+
+    Must be called AFTER text detection (which initialises tracker states and
+    assigns obj_ids) but BEFORE propagation.
+
+    SAM3 stores the mask in mask_inputs_per_obj and promotes the frame to
+    cond_frame_outputs, so it is selected by select_closest_cond_frames during
+    propagation — exactly like a user-provided mask prompt.
+    """
+    import cv2
+    inner_state = sam3_model._all_inference_states[session_id]["state"]
+    tracker_states = (inner_state.get("tracker_inference_states", [])
+                      + inner_state.get("sam2_inference_states", []))
+    if not tracker_states:
+        return
+
+    for inst in concept.instances:
+        if inst.deleted or not inst.mask_anchor_frames:
+            continue
+        anchors_dir = os.path.join(
+            project_dir, "concepts", concept.name,
+            "instances", str(inst.sam3_obj_id), "mask_anchors",
+        )
+        for frame_idx in inst.mask_anchor_frames:
+            # Prefer PNG; fall back to NPZ via cv2 (single channel)
+            candidate = None
+            for ext in (".png", ".npz"):
+                p = os.path.join(anchors_dir, f"{frame_idx:06d}{ext}")
+                if os.path.exists(p):
+                    candidate = p
+                    break
+            if candidate is None:
+                continue
+            if candidate.endswith(".npz"):
+                import numpy as np
+                data = np.load(candidate)
+                key = list(data.keys())[0]
+                mask_np = data[key]
+            else:
+                mask_np = cv2.imread(candidate, cv2.IMREAD_GRAYSCALE)
+            if mask_np is None:
+                continue
+            mask_tensor = torch.from_numpy((mask_np > 127).astype("float32"))
+            for ts in tracker_states:
+                try:
+                    sam3_model.model.tracker.add_new_mask(
+                        ts, frame_idx, inst.sam3_obj_id, mask_tensor
+                    )
+                except Exception as e:
+                    print(f"[warn] mask anchor injection failed "
+                          f"inst={inst.sam3_obj_id} frame={frame_idx}: {e}")
+            print(f"  Injected mask anchor: inst obj_id={inst.sam3_obj_id} "
+                  f"frame={frame_idx}")
 
 
 def compute_continuous_periods(mask_dir: str) -> List[Tuple[int, int]]:
@@ -357,6 +506,7 @@ def process_concept_detection(
     progress_callback: Optional[Callable[[int, int], None]] = None,
     keep_session_alive: bool = False,
     save_cond_states: bool = False,
+    cache_size: int = 50,
 ) -> SAM3Concept:
     """
     Run initial detection for a concept.
@@ -391,7 +541,7 @@ def process_concept_detection(
 
     # 1. Enable lazy loading
     print("Enabling lazy loading for SAM3...")
-    enable_lazy_loading(cache_size=20, enable_sam3=True)
+    enable_lazy_loading(cache_size=cache_size, enable_sam3=True)
 
     # 2. Extract frames (reuse if already present)
     frames_dir = project.get_frames_dir()
@@ -578,6 +728,7 @@ def process_concept_detection(
                 "instances", str(obj_id_int), "masks"
             )
             periods = compute_continuous_periods(mask_dir)
+            _pcounts = pixel_counts_by_obj.get(obj_id_int, {})
             instance = SAM3Instance(
                 sam3_obj_id=obj_id_int,
                 user_name=f"{concept.name}_{obj_id_int}",  # Default name
@@ -588,8 +739,8 @@ def process_concept_detection(
                 last_detection_frame=max(instance_masks[obj_id].keys()),
                 num_frames_with_mask=len(instance_masks[obj_id]),
                 continuous_periods=periods,
-                period_peaks=compute_period_peaks(
-                    periods, pixel_counts_by_obj.get(obj_id_int, {}), total_pixels),
+                period_peaks=compute_period_peaks(periods, _pcounts, total_pixels),
+                presence_norm=compute_presence_norm(_pcounts, total_pixels),
             )
             instances.append(instance)
 
@@ -798,6 +949,7 @@ def replay_concept_refinements(
     restore_cond_states: bool = False,
     save_cond_states: bool = False,
     mask_format: str = "png",
+    cache_size: int = 50,
 ) -> bool:
     """
     Replay saved refinements for ALL instances of a concept in ONE session.
@@ -833,7 +985,7 @@ def replay_concept_refinements(
         return False
 
     from sam_lazy_loader import enable_lazy_loading
-    enable_lazy_loading(cache_size=20, enable_sam3=True)
+    enable_lazy_loading(cache_size=cache_size, enable_sam3=True)
 
     # Load refinements.json for EVERY non-deleted instance of the concept — not just
     # the ones with pending entries.  All historical clicks are replayed each round so
@@ -860,9 +1012,14 @@ def replay_concept_refinements(
     # one entry, so the newest entry supersedes older ones for that frame (and an
     # entry with no points clears the frame).  Merging entries instead would
     # resurrect points the user deleted in the UI.
+    # "mask_anchor" entries are skipped here — they carry no point prompts and
+    # must not clear other annotations at the same frame.  Their effect is applied
+    # via _inject_mask_anchors() which reads directly from mask_anchor_frames.
     obj_frame_points: dict = defaultdict(dict)
     for obj_id, (rpath, all_entries, inst) in refinements_by_instance.items():
         for r in all_entries:
+            if r.get("type") == "mask_anchor":
+                continue
             frame_idx = r.get("frame_idx")
             if frame_idx is None:
                 continue
@@ -974,6 +1131,9 @@ def replay_concept_refinements(
                 )
                 inner_state["feature_cache"].pop(frame_idx, None)
 
+        # Inject mask-conditioning anchors (from absorb wizard) before propagation.
+        _inject_mask_anchors(sam3_model, session_id, concept, project_dir)
+
         # Single propagation: all instances in one batched forward pass.
         # Non-overlapping constraints are enforced across all instances jointly.
         # Write masks for ALL detected instances (not just the ones with new annotations).
@@ -1079,9 +1239,10 @@ def replay_concept_refinements(
                 instances_root, str(inst.sam3_obj_id), "masks"
             )
             periods = compute_continuous_periods(mask_dir)
+            _pcounts = pixel_counts_by_obj.get(inst.sam3_obj_id, {})
             inst.continuous_periods = periods
-            inst.period_peaks = compute_period_peaks(
-                periods, pixel_counts_by_obj.get(inst.sam3_obj_id, {}), total_pixels)
+            inst.period_peaks = compute_period_peaks(periods, _pcounts, total_pixels)
+            inst.presence_norm = compute_presence_norm(_pcounts, total_pixels)
             inst.num_frames_with_mask = sum(e - s + 1 for s, e in periods)
             if periods:
                 inst.first_detection_frame = periods[0][0]
@@ -1280,6 +1441,8 @@ def online_replay_concept_refinements(
     # Each add_prompt(obj_id=X) call routes to add_tracker_new_points — no reset_state.
     for instance, pending_entries in instances_with_pending:
         for entry in pending_entries:
+            if entry.get("type") == "mask_anchor":
+                continue  # no point prompts; mask is injected via _inject_mask_anchors
             frame_idx = entry["frame_idx"]
             raw_pts = entry.get("points", [])
             if not raw_pts:
@@ -1301,6 +1464,9 @@ def online_replay_concept_refinements(
                 point_labels=pt_labels,
                 obj_id=instance.sam3_obj_id,
             )
+
+    # Inject mask-conditioning anchors (from absorb wizard) before propagation.
+    _inject_mask_anchors(sam3_model, session_id, concept, project_dir)
 
     # Single propagation pass — non-overlapping applied across ALL instances simultaneously
     inst_names = [inst.user_name for inst, _ in instances_with_pending]
@@ -1357,9 +1523,10 @@ def online_replay_concept_refinements(
             instances_root, str(inst.sam3_obj_id), "masks"
         )
         periods = compute_continuous_periods(mask_dir)
+        _pcounts = pixel_counts_by_obj.get(inst.sam3_obj_id, {})
         inst.continuous_periods = periods
-        inst.period_peaks = compute_period_peaks(
-            periods, pixel_counts_by_obj.get(inst.sam3_obj_id, {}), total_pixels)
+        inst.period_peaks = compute_period_peaks(periods, _pcounts, total_pixels)
+        inst.presence_norm = compute_presence_norm(_pcounts, total_pixels)
         inst.num_frames_with_mask = sum(e - s + 1 for s, e in periods)
         if periods:
             inst.first_detection_frame = periods[0][0]

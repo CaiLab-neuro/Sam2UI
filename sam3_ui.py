@@ -98,6 +98,9 @@ class SAM3VideoUI:
         self.refinement_points: List[tuple] = []  # [(x, y, is_positive), ...]
         self.undo_stack: List[dict] = []  # {'type': 'point'|'remove_point'|'delete_instance', ...}
         self.redo_stack: List[dict] = []
+        # Absorb wizard state (None when no wizard is active)
+        self._absorb_wizard: Optional[dict] = None
+        self._wizard_pending_points: List[tuple] = []  # points placed in wizard point mode
         # True when instance renames/deletes/adds are in memory but not yet written to JSON.
         # Flushed by save_points_for_batch, apply_refinement, and the explicit Save Project.
         self._metadata_dirty: bool = False
@@ -366,6 +369,49 @@ class SAM3VideoUI:
         self.canvas.bind('<Button-5>',    lambda e: self.jump_frames(1))
         self.canvas.bind('<MouseWheel>',
                          lambda e: self.jump_frames(-1 if e.delta > 0 else 1))
+
+        # ── Absorb wizard banner (hidden until wizard is active) ──────────────
+        self._wizard_banner = tk.Frame(parent, bg='#1a3a1a', relief=tk.RIDGE, bd=1)
+        # (not packed here — shown only during absorb wizard via _wizard_enter_phase)
+
+        wiz_left = tk.Frame(self._wizard_banner, bg='#1a3a1a')
+        wiz_left.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8, pady=3)
+        self._wizard_title_lbl = tk.Label(wiz_left, text="", bg='#1a3a1a', fg='white',
+                                          font=("Arial", 9, "bold"), anchor=tk.W)
+        self._wizard_title_lbl.pack(fill=tk.X)
+        self._wizard_instr_lbl = tk.Label(wiz_left, text="", bg='#1a3a1a', fg='#aaffaa',
+                                          font=("Arial", 8), anchor=tk.W)
+        self._wizard_instr_lbl.pack(fill=tk.X)
+
+        wiz_right = tk.Frame(self._wizard_banner, bg='#1a3a1a')
+        wiz_right.pack(side=tk.RIGHT, padx=4, pady=3)
+
+        self._wiz_confirm_btn = tk.Button(wiz_right, text="Use this mask",
+                                          bg='#2a5a2a', fg='white', font=("Arial", 8),
+                                          command=self._wizard_confirm_mask)
+        self._wiz_confirm_btn.pack(side=tk.LEFT, padx=2)
+
+        self._wiz_point_btn = tk.Button(wiz_right, text="Add point instead",
+                                        bg='#2a2a5a', fg='white', font=("Arial", 8),
+                                        command=self._wizard_switch_to_point_mode)
+        self._wiz_point_btn.pack(side=tk.LEFT, padx=2)
+
+        self._wiz_confirm_pts_btn = tk.Button(wiz_right, text="Confirm points",
+                                              bg='#2a5a2a', fg='white', font=("Arial", 8),
+                                              state=tk.DISABLED,
+                                              command=self._wizard_confirm_points)
+        self._wiz_confirm_pts_btn.pack(side=tk.LEFT, padx=2)
+
+        self._wiz_back_btn = tk.Button(wiz_right, text="Back to mask",
+                                       bg='#404040', fg='white', font=("Arial", 8),
+                                       state=tk.DISABLED,
+                                       command=self._wizard_back_to_mask_mode)
+        self._wiz_back_btn.pack(side=tk.LEFT, padx=2)
+
+        self._wiz_cancel_btn = tk.Button(wiz_right, text="Cancel",
+                                         bg='#5a1a1a', fg='white', font=("Arial", 8),
+                                         command=self._wizard_cancel)
+        self._wiz_cancel_btn.pack(side=tk.LEFT, padx=2)
 
         # ── Row 1: play/pause + frame nav + counter ───────────────────────────
         row1 = tk.Frame(parent)
@@ -770,11 +816,13 @@ class SAM3VideoUI:
         self._go_to_frame(nxt)
 
     def _get_annotation_frames(self) -> List[int]:
-        """Return sorted list of frame indices that have annotation points (all, including already-propagated)."""
+        """Return sorted list of frame indices that have annotation points or mask anchors."""
         if not self.selected_instance or not self.selected_concept:
             return []
         key = (self.selected_concept.name, self.selected_instance.sam3_obj_id)
-        return sorted(self._all_annotations_cache.get(key, {}).keys())
+        point_frames = set(self._all_annotations_cache.get(key, {}).keys())
+        anchor_frames = set(self.selected_instance.mask_anchor_frames)
+        return sorted(point_frames | anchor_frames)
 
     def jump_to_prev_annotation(self):
         """Jump to the previous frame with saved annotations (wraps around)."""
@@ -971,6 +1019,8 @@ class SAM3VideoUI:
 
     def _execute_zoom_jump(self, frame_idx: int, window_size: int, total_frames: int):
         """Re-center the zoom window around frame_idx (called after edge approach)."""
+        if self._absorb_wizard:
+            return  # wizard controls the slider range; don't auto-recenter
         half = window_size // 2
         ws = max(0, frame_idx - half)
         we = min(total_frames - 1, ws + window_size)
@@ -1207,8 +1257,20 @@ class SAM3VideoUI:
                 fill_rgb = [int(r2 * 255), int(g2 * 255), int(b2 * 255)]
 
                 period_peaks = inst.period_peaks if inst.period_peaks else []
-                if period_peaks:
-                    max_ratio = max(p.get('avg_pixel_ratio', 0) for p in period_peaks)
+                # Build a list of valid (numeric) avg_pixel_ratio values — older
+                # projects stored None when pixel counts weren't tracked yet.
+                valid_ratios = [
+                    p.get('avg_pixel_ratio') for p in period_peaks
+                    if p.get('avg_pixel_ratio') is not None
+                ]
+                if period_peaks and valid_ratios:
+                    # Use saved 99th-percentile norm so typical frames read near full
+                    # height; fall back to max avg_pixel_ratio for old projects.
+                    saved_norm = getattr(inst, 'presence_norm', 0.0)
+                    if saved_norm > 0:
+                        max_ratio = saved_norm
+                    else:
+                        max_ratio = max(valid_ratios)
                     if max_ratio <= 0:
                         max_ratio = 1.0
                     inner_h = h - 2
@@ -1217,7 +1279,10 @@ class SAM3VideoUI:
                         draw_end = min(period['end'], f_end)
                         if draw_start > draw_end:
                             continue
-                        rel = (period.get('avg_pixel_ratio', 0) / max_ratio) ** 0.5
+                        avg = period.get('avg_pixel_ratio')
+                        if avg is None:
+                            avg = 0.0
+                        rel = min(1.0, (avg / max_ratio) ** 0.5)
                         bar_h = max(2, int(rel * inner_h))
                         y0 = h - 1 - bar_h
                         x0 = max(0, int((draw_start - f_start) / visible * w))
@@ -1850,6 +1915,55 @@ class SAM3VideoUI:
             # White+black outline on the selected instance (uses cached mask, no extra disk read)
             with _T("highlight"):
                 frame_rgb = self._highlight_selected_instance(frame_rgb, masks_cache)
+
+            # Wizard mode: draw cyan contour of current wizard instance's mask so the
+            # user can judge quality before confirming.  Also draw pending wizard points.
+            if self._absorb_wizard and not _is_playing:
+                wiz = self._absorb_wizard
+                wiz_inst = wiz['source'] if wiz['phase'] == 'source' else wiz['target']
+                wiz_mask_dir = os.path.join(
+                    self.project.project_dir, "concepts", wiz['concept'].name,
+                    "instances", str(wiz_inst.sam3_obj_id), "masks",
+                )
+                wiz_mask = load_sam3_mask(wiz_mask_dir, self.current_frame_idx)
+                if wiz_mask is not None:
+                    fh, fw = frame_rgb.shape[:2]
+                    if wiz_mask.shape[0] != fh or wiz_mask.shape[1] != fw:
+                        wiz_mask = cv2.resize(wiz_mask, (fw, fh),
+                                              interpolation=cv2.INTER_NEAREST)
+                    binary = (wiz_mask > 127).astype(np.uint8)
+                    contours, _ = cv2.findContours(
+                        binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                    cv2.drawContours(frame_rgb, contours, -1, (0, 220, 220), 2)
+
+                if wiz['mode'] == 'point' and self._wizard_pending_points:
+                    for wx, wy, wpos in self._wizard_pending_points:
+                        wpx, wpy = int(wx * _scale_x), int(wy * _scale_y)
+                        wcol = (0, 255, 0) if wpos else (255, 0, 0)
+                        cv2.circle(frame_rgb, (wpx, wpy), 5, wcol, -1)
+                        cv2.circle(frame_rgb, (wpx, wpy), 7, (255, 255, 255), 2)
+
+            # Normal mode: draw orange anchor boundary if current frame is a mask anchor.
+            elif (not _is_playing and self.selected_instance and self.selected_concept
+                  and self.current_frame_idx in self.selected_instance.mask_anchor_frames):
+                anc_dir = os.path.join(
+                    self.project.project_dir, "concepts", self.selected_concept.name,
+                    "instances", str(self.selected_instance.sam3_obj_id), "mask_anchors",
+                )
+                anc_mask = load_sam3_mask(anc_dir, self.current_frame_idx)
+                if anc_mask is not None:
+                    fh, fw = frame_rgb.shape[:2]
+                    if anc_mask.shape[0] != fh or anc_mask.shape[1] != fw:
+                        anc_mask = cv2.resize(anc_mask, (fw, fh),
+                                              interpolation=cv2.INTER_NEAREST)
+                    binary = (anc_mask > 127).astype(np.uint8)
+                    contours, _ = cv2.findContours(
+                        binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                    cv2.drawContours(frame_rgb, contours, -1, (255, 140, 0), 3)
+                    cv2.drawContours(frame_rgb, contours, -1, (180, 80, 0), 1)
+                    cv2.putText(frame_rgb, "ANCHOR", (5, frame_rgb.shape[0] - 8),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 140, 0), 1,
+                                cv2.LINE_AA)
 
             # Text labels at mask centroids — skipped during playback (expensive, not useful)
             if self.show_labels_var.get() and not _is_playing:
@@ -2794,26 +2908,90 @@ class SAM3VideoUI:
         return entries
 
     def _stage_anchors_to_cache(self, concept, instance, entries: List[dict]):
-        """Merge anchor entries into both annotation caches (in-memory only) and mark dirty."""
+        """Merge anchor entries into both annotation caches (in-memory only) and mark dirty.
+
+        mask_anchor type entries have no points and cannot go through _points_cache (which
+        only stores point coordinates).  They are written directly to refinements.json via
+        _write_mask_anchor_triggers so that _collect_pending_refinements can find them.
+        """
         if not entries:
             return
         key = (concept.name, instance.sam3_obj_id)
-        for cache in (self._points_cache, self._all_annotations_cache):
-            frame_dict = cache.setdefault(key, {})
-            for entry in entries:
-                frame_idx = entry["frame_idx"]
-                if frame_idx not in frame_dict and cache is self._points_cache:
-                    # Seed with the frame's full existing point set: the flush treats
-                    # _points_cache as the frame's canonical set and supersedes the
-                    # historical entry, so starting empty would drop the instance's
-                    # prior clicks on this frame.  (Reads _all_annotations_cache
-                    # before anchors are appended to it in the next loop pass.)
-                    frame_dict[frame_idx] = list(
-                        self._all_annotations_cache.get(key, {}).get(frame_idx, []))
-                pts = frame_dict.setdefault(frame_idx, [])
-                for p in entry["points"]:
-                    pts.append((p["x"], p["y"], p["is_positive"]))
+
+        # mask_anchor entries carry no points — write them directly to disk.
+        mask_anchor_entries = [e for e in entries if e.get("type") == "mask_anchor"]
+        point_entries = [e for e in entries if e.get("type") != "mask_anchor"]
+
+        if mask_anchor_entries and self.project:
+            self._write_mask_anchor_triggers(concept.name, instance.sam3_obj_id, mask_anchor_entries)
+
+        if point_entries:
+            for cache in (self._points_cache, self._all_annotations_cache):
+                frame_dict = cache.setdefault(key, {})
+                for entry in point_entries:
+                    frame_idx = entry["frame_idx"]
+                    if frame_idx not in frame_dict and cache is self._points_cache:
+                        # Seed with the frame's full existing point set: the flush treats
+                        # _points_cache as the frame's canonical set and supersedes the
+                        # historical entry, so starting empty would drop the instance's
+                        # prior clicks on this frame.  (Reads _all_annotations_cache
+                        # before anchors are appended to it in the next loop pass.)
+                        frame_dict[frame_idx] = list(
+                            self._all_annotations_cache.get(key, {}).get(frame_idx, []))
+                    pts = frame_dict.setdefault(frame_idx, [])
+                    for p in entry.get("points", []):
+                        pts.append((p["x"], p["y"], p["is_positive"]))
         self._dirty_keys.add(key)
+
+    def _write_mask_anchor_triggers(self, concept_name: str, obj_id: int,
+                                    entries: List[dict]):
+        """Append mask_anchor trigger entries directly to refinements.json.
+
+        mask_anchor entries have no point prompts; they only signal that
+        _inject_mask_anchors should run for this instance during propagation.
+        Skips duplicates (same frame_idx already pending on disk).
+        """
+        if not self.project:
+            return
+        rpath = os.path.join(
+            self.project.project_dir, "concepts", concept_name,
+            "instances", str(obj_id), "refinements.json"
+        )
+        os.makedirs(os.path.dirname(rpath), exist_ok=True)
+        existing: List[dict] = []
+        if os.path.exists(rpath):
+            with open(rpath) as f:
+                existing = json.load(f).get("refinements", [])
+        # Avoid duplicate pending triggers for the same frame
+        pending_frames = {r.get("frame_idx") for r in existing
+                         if not r.get("propagated", False) and r.get("type") == "mask_anchor"}
+        new_entries = [e for e in entries if e.get("frame_idx") not in pending_frames]
+        if new_entries:
+            with open(rpath, "w") as f:
+                json.dump({"refinements": existing + new_entries}, f, indent=2)
+
+    def _remove_mask_anchor_triggers(self, concept_name: str, obj_id: int,
+                                     frame_indices: List[int]):
+        """Remove pending (propagated=False) mask_anchor entries for given frames.
+        Called on undo of absorb_wizard so the trigger no longer appears pending."""
+        if not self.project or not frame_indices:
+            return
+        rpath = os.path.join(
+            self.project.project_dir, "concepts", concept_name,
+            "instances", str(obj_id), "refinements.json"
+        )
+        if not os.path.exists(rpath):
+            return
+        with open(rpath) as f:
+            existing = json.load(f).get("refinements", [])
+        frame_set = set(frame_indices)
+        updated = [r for r in existing
+                   if not (r.get("type") == "mask_anchor"
+                           and not r.get("propagated", False)
+                           and r.get("frame_idx") in frame_set)]
+        if len(updated) != len(existing):
+            with open(rpath, "w") as f:
+                json.dump({"refinements": updated}, f, indent=2)
 
     def _unstage_anchors_from_cache(self, concept, instance, entries: List[dict]):
         """Remove previously staged anchor entries from both annotation caches."""
@@ -2969,84 +3147,398 @@ class SAM3VideoUI:
                                       self.selected_instance, targets)
         self.root.wait_window(dialog.top)
 
+    # ============================================================
+    # Absorb Wizard — mask-based conditioning anchor selection
+    # ============================================================
+
+    def _get_first_period_info(self, concept, instance):
+        """Return (best_frame, period_start, period_end) for first detected period or None."""
+        if instance.period_peaks:
+            p = instance.period_peaks[0]
+            return p["best_frame"], p["start"], p["end"]
+        mask_dir = os.path.join(
+            self.project.project_dir, "concepts", concept.name,
+            "instances", str(instance.sam3_obj_id), "masks"
+        )
+        if not os.path.exists(mask_dir):
+            return None
+        periods = instance.continuous_periods or compute_continuous_periods(mask_dir)
+        if not periods:
+            return None
+        start, end = periods[0]
+        sample = list(range(start, end + 1))
+        if len(sample) > 20:
+            step = len(sample) / 20
+            sample = [sample[int(i * step)] for i in range(20)]
+        best_frame, best_area = None, 0
+        for f in sample:
+            m = load_sam3_mask(mask_dir, f)
+            if m is not None:
+                area = int((m > 127).sum())
+                if area > best_area:
+                    best_area = area
+                    best_frame = f
+        if best_frame is None:
+            return None
+        return best_frame, start, end
+
     def absorb_instance(self, target: 'SAM3Instance', source: 'SAM3Instance'):
-        """Absorb source instance into target.
+        """Launch the guided mask-confirmation wizard for an absorb.
 
-        Adds a positive anchor at the source's first-period peak-area centroid to guide
-        target to claim those pixels, then marks source as deleted so
-        replay_concept_refinements calls remove_object for it — no negative points
-        needed since deletion fully evicts the object from the SAM3 tracker before
-        propagation.
+        The wizard lets the user confirm (or navigate to) the best conditioning frame
+        for the source instance, then optionally for the target (if first absorb into
+        it).  The confirmed frame's mask is copied to the target's mask_anchors/ folder
+        and registered in target.mask_anchor_frames; the pipeline injects it via
+        Sam3TrackerPredictor.add_new_mask() during replay.
 
-        Only the source's FIRST detected period is used (not all periods): later
-        periods may have drifted segmentation (tracking error accumulating over time),
-        so the absorb is anchored to the instance's first appearance, which the user
-        can visually judge to actually be the same object before absorbing.
-
-        The first time ANY instance is absorbed into a given target, we also add a
-        self anchor for the target itself (same recipe, from the target's own first
-        period). Full re-propagation after --refine re-derives the whole timeline from
-        scratch, and without an explicit point pinning the target's own original
-        identity, the newly-added source anchor is the only point near the target —
-        which can pull the target's early frames toward the source's appearance instead
-        of just adding the source's pixels on top. One self anchor is enough to keep the
-        target pinned to what it originally was; later absorbs into the same target
-        don't need it again (it's already there).
+        If the user cannot find a clean mask, they can fall back to placing a point
+        (same path as the old centroid-based absorb).
         """
         concept = self.selected_concept
+        self._start_absorb_wizard(concept, target, source)
 
-        # Positive anchor for target, taken only from source's first period (see above).
-        pos_entries = self._compute_per_period_anchors(concept, source, is_positive=True,
-                                                       tag="auto_absorb_positive",
-                                                       first_period_only=True)
-        if not pos_entries:
-            messagebox.showerror("Error", f"No masks found for source instance '{source.user_name}'.")
+    def _start_absorb_wizard(self, concept, target, source):
+        """Initialise and enter the absorb wizard (source confirmation phase)."""
+        src_info = self._get_first_period_info(concept, source)
+        if src_info is None:
+            messagebox.showerror(
+                "Error",
+                f"No masks found for source instance '{source.user_name}'.\n"
+                "Cannot start absorb wizard."
+            )
+            return
+        src_best, src_start, src_end = src_info
+
+        tgt_info = None
+        if not target.received_absorb_anchor:
+            tgt_info = self._get_first_period_info(concept, target)
+
+        self._absorb_wizard = {
+            'concept': concept,
+            'target': target,
+            'source': source,
+            'phase': 'source',
+            'source_period': (src_start, src_end),
+            'target_period': (tgt_info[1], tgt_info[2]) if tgt_info else None,
+            'target_peak_frame': tgt_info[0] if tgt_info else None,
+            'source_result': None,
+            'target_result': None,
+            'mode': 'confirm',
+            'saved_slider_from': int(self.frame_slider.cget('from')),
+            'saved_slider_to': int(self.frame_slider.cget('to')),
+            'saved_zoom': self.slider_zoom_level.get(),
+            'original_concept': self.selected_concept,
+            'original_instance': self.selected_instance,
+        }
+        self._wizard_pending_points = []
+        self._wizard_enter_phase('source', src_best)
+
+    def _wizard_enter_phase(self, phase: str, jump_to: int):
+        """Set up slider zoom, select wizard instance, and update the banner."""
+        wiz = self._absorb_wizard
+        wiz['phase'] = phase
+        wiz['mode'] = 'confirm'
+        self._wizard_pending_points = []
+
+        if phase == 'source':
+            inst = wiz['source']
+            period_start, period_end = wiz['source_period']
+            n_steps = 1 if wiz['target_period'] is None else 2
+            title = f"Wizard (1/{n_steps}): confirm mask for SOURCE '{inst.user_name}'"
+        else:
+            inst = wiz['target']
+            period_start, period_end = wiz['target_period']
+            title = f"Wizard (2/2): confirm mask for TARGET '{inst.user_name}'"
+
+        instr = (f"Frames {period_start}–{period_end}. Confirm the frame "
+                 "where the mask cleanly covers the object (no bleed, not blurry). "
+                 "Or 'Add point instead' to place a point manually.")
+
+        # Zoom presence bar to this period
+        self.frame_slider.config(from_=period_start, to=period_end)
+        self._mark_presence_dirty()
+        self._update_presence_bar()
+
+        # Select wizard instance so highlight + mask loading are consistent
+        self.selected_concept = wiz['concept']
+        self.selected_instance = inst
+        self._load_annotations_for_current_frame()
+        self._go_to_frame(max(period_start, min(period_end, jump_to)))
+
+        # Show / update wizard banner
+        self._wizard_title_lbl.config(text=title)
+        self._wizard_instr_lbl.config(text=instr)
+        self._wizard_update_action_buttons()
+        if not self._wizard_banner.winfo_ismapped():
+            self._wizard_banner.pack(fill=tk.X, padx=5, pady=2, after=self.canvas)
+
+        self.status_var.set(
+            f"Wizard: navigate within {period_start}–{period_end}, "
+            f"then 'Use this mask' or 'Add point instead'."
+        )
+
+    def _wizard_update_action_buttons(self):
+        """Enable/disable wizard buttons for the current interaction mode."""
+        if not self._absorb_wizard:
+            return
+        mode = self._absorb_wizard['mode']
+        if mode == 'confirm':
+            self._wiz_confirm_btn.config(state=tk.NORMAL)
+            self._wiz_point_btn.config(state=tk.NORMAL)
+            self._wiz_confirm_pts_btn.config(state=tk.DISABLED)
+            self._wiz_back_btn.config(state=tk.DISABLED)
+        else:
+            self._wiz_confirm_btn.config(state=tk.DISABLED)
+            self._wiz_point_btn.config(state=tk.DISABLED)
+            has_pts = bool(self._wizard_pending_points)
+            self._wiz_confirm_pts_btn.config(state=tk.NORMAL if has_pts else tk.DISABLED)
+            self._wiz_back_btn.config(state=tk.NORMAL)
+
+    def _wizard_confirm_mask(self):
+        """User accepted the current frame's mask as conditioning anchor."""
+        wiz = self._absorb_wizard
+        if wiz is None:
+            return
+        wiz[f"{wiz['phase']}_result"] = {
+            'type': 'mask',
+            'frame_idx': self.current_frame_idx,
+        }
+        self._wizard_advance()
+
+    def _wizard_switch_to_point_mode(self):
+        """Switch to manual point-placement fallback mode."""
+        wiz = self._absorb_wizard
+        if wiz is None:
+            return
+        wiz['mode'] = 'point'
+        self._wizard_pending_points = []
+        self._wizard_update_action_buttons()
+        self.status_var.set(
+            "Point mode: left-click positive, right-click negative. "
+            "Click 'Confirm points' when done."
+        )
+        self.display_frame()
+
+    def _wizard_back_to_mask_mode(self):
+        """Return from point mode back to mask-confirm mode."""
+        wiz = self._absorb_wizard
+        if wiz is None:
+            return
+        wiz['mode'] = 'confirm'
+        self._wizard_pending_points = []
+        self._wizard_update_action_buttons()
+        self.display_frame()
+
+    def _wizard_confirm_points(self):
+        """User confirmed their manually-placed points for this phase."""
+        wiz = self._absorb_wizard
+        if wiz is None:
+            return
+        if not self._wizard_pending_points:
+            messagebox.showwarning("No points", "Place at least one point first.")
+            return
+        wiz[f"{wiz['phase']}_result"] = {
+            'type': 'points',
+            'frame_idx': self.current_frame_idx,
+            'points': list(self._wizard_pending_points),
+        }
+        self._wizard_advance()
+
+    def _wizard_advance(self):
+        """Advance to target phase if needed, otherwise complete the wizard."""
+        wiz = self._absorb_wizard
+        if wiz is None:
+            return
+        if wiz['phase'] == 'source' and wiz['target_period'] is not None:
+            # Restore slider before entering target phase (so save/restore round-trips cleanly)
+            self._wizard_exit_zoom()
+            self._wizard_enter_phase('target', wiz['target_peak_frame'])
+        else:
+            self._complete_absorb_wizard()
+
+    def _wizard_exit_zoom(self):
+        """Restore slider zoom to the pre-wizard state."""
+        wiz = self._absorb_wizard
+        if wiz is None:
+            return
+        self.frame_slider.config(from_=wiz['saved_slider_from'], to=wiz['saved_slider_to'])
+        self.slider_zoom_level.set(wiz['saved_zoom'])
+        self._mark_presence_dirty()
+        self._update_presence_bar()
+
+    def _complete_absorb_wizard(self):
+        """Stage all confirmed anchors, mark source deleted, push undo entry."""
+        import shutil as _shutil
+        wiz = self._absorb_wizard
+        if wiz is None:
             return
 
-        # Stage positive anchors for target (in-memory only; write via Save Changes for Refinement)
-        self._stage_anchors_to_cache(concept, target, pos_entries)
+        concept = wiz['concept']
+        target = wiz['target']
+        source = wiz['source']
+        copied_paths: List[str] = []
+        staged_point_entries: List[dict] = []
+        target_anchor_was_new = wiz['target_period'] is not None
 
-        # One-time self anchor for target, only the first time something is absorbed into it.
-        target_self_entries: List[dict] = []
-        target_anchor_was_new = not target.received_absorb_anchor
-        if target_anchor_was_new:
-            target_self_entries = self._compute_per_period_anchors(
-                concept, target, is_positive=True,
-                tag="auto_absorb_self_anchor", first_period_only=True)
-            if target_self_entries:
-                self._stage_anchors_to_cache(concept, target, target_self_entries)
-                target.received_absorb_anchor = True
-            else:
-                target_anchor_was_new = False  # nothing was actually staged/flagged
+        def _apply_result(result, src_inst, label_tag: str):
+            """Copy mask or stage points for the TARGET instance."""
+            if result['type'] == 'mask':
+                from datetime import datetime as _dt
+                frame_idx = result['frame_idx']
+                src_mask_dir = os.path.join(
+                    self.project.project_dir, "concepts", concept.name,
+                    "instances", str(src_inst.sam3_obj_id), "masks"
+                )
+                mask_np = load_sam3_mask(src_mask_dir, frame_idx)
+                if mask_np is None:
+                    messagebox.showwarning(
+                        "Warning",
+                        f"Mask not found at frame {frame_idx} for "
+                        f"'{src_inst.user_name}'. Skipping mask anchor."
+                    )
+                    return
+                dst_dir = Path(self.project.project_dir) / "concepts" / concept.name / \
+                          "instances" / str(target.sam3_obj_id) / "mask_anchors"
+                dst_dir.mkdir(parents=True, exist_ok=True)
+                dst_path = dst_dir / f"{frame_idx:06d}.png"
+                cv2.imwrite(str(dst_path), mask_np)
+                if frame_idx not in target.mask_anchor_frames:
+                    target.mask_anchor_frames.append(frame_idx)
+                copied_paths.append(str(dst_path))
+                # Stage a mask-anchor entry so _collect_pending_refinements sees
+                # this instance as pending and "Apply Changes & Propagate" proceeds
+                # to call _inject_mask_anchors.  "type": "mask_anchor" identifies
+                # this entry explicitly; the pipeline skips it during point-prompt
+                # construction (no SAM3 point prompts added) but still runs
+                # propagation and injects the mask via _inject_mask_anchors.
+                rel_path = os.path.join(
+                    "concepts", concept.name,
+                    "instances", str(target.sam3_obj_id),
+                    "mask_anchors", f"{frame_idx:06d}.png"
+                )
+                trigger_entry = {
+                    "timestamp": _dt.now().isoformat(),
+                    "type": "mask_anchor",
+                    "frame_idx": frame_idx,
+                    "mask_path": rel_path,
+                    "propagated": False,
+                    label_tag: True,
+                }
+                self._stage_anchors_to_cache(concept, target, [trigger_entry])
+                staged_point_entries.append(trigger_entry)
+            elif result['type'] == 'points':
+                from datetime import datetime as _dt
+                frame_idx = result['frame_idx']
+                pts = result['points']
+                entry = {
+                    "timestamp": _dt.now().isoformat(),
+                    "frame_idx": frame_idx,
+                    "points": [{"x": x, "y": y, "is_positive": p} for x, y, p in pts],
+                    "propagated": False,
+                    label_tag: True,
+                }
+                self._stage_anchors_to_cache(concept, target, [entry])
+                staged_point_entries.append(entry)
 
-        # Mark source as deleted — replay_concept_refinements will call remove_object,
-        # which evicts it from tracking more reliably than negative points.
+        _apply_result(wiz['source_result'], source, "auto_absorb_positive")
+        if wiz['target_result'] is not None:
+            _apply_result(wiz['target_result'], target, "auto_absorb_self_anchor")
+
         source.deleted = True
         source.visible = False
+        target.received_absorb_anchor = True
 
         self.undo_stack.append({
-            'type': 'absorb_instance',
+            'type': 'absorb_wizard',
             'source': source,
             'target': target,
             'concept': concept,
-            'pos_entries': pos_entries,
-            'target_self_entries': target_self_entries,
+            'source_result': wiz['source_result'],
+            'target_result': wiz['target_result'],
             'target_anchor_was_new': target_anchor_was_new,
+            'copied_mask_paths': copied_paths,
+            'staged_point_entries': staged_point_entries,
         })
         self.redo_stack.clear()
+
+        self._wizard_finish()
 
         self._metadata_dirty = True
         self.update_concept_tree()
         self.compositor = DynamicFrameCompositor(self.project)
         self.display_frame()
 
-        anchor_note = (" + 1 self anchor at target's own first period (first absorb into this target)"
-                       if target_anchor_was_new else "")
+        sr = wiz['source_result']
+        desc = (f"mask at frame {sr['frame_idx']}" if sr['type'] == 'mask'
+                else f"point(s) at frame {sr['frame_idx']}")
         self.status_var.set(
-            f"Absorb: '{source.user_name}' -> '{target.user_name}' "
-            f"(1 positive anchor at source's first period{anchor_note}, source marked deleted). "
-            f"Save Changes for Refinement then run --refine to apply. Ctrl+Z to undo."
+            f"Absorb: '{source.user_name}' → '{target.user_name}' "
+            f"(source anchor: {desc}). "
+            "Save Changes for Refinement then --refine to apply. Ctrl+Z to undo."
         )
+
+    def _wizard_cancel(self):
+        """Cancel wizard with no changes."""
+        self._wizard_finish()
+        self.status_var.set("Absorb wizard cancelled.")
+
+    def _wizard_finish(self):
+        """Common teardown: hide banner, restore slider zoom, restore selection."""
+        if self._absorb_wizard:
+            self._wizard_exit_zoom()
+            orig_c = self._absorb_wizard.get('original_concept')
+            orig_i = self._absorb_wizard.get('original_instance')
+            if orig_c is not None:
+                self.selected_concept = orig_c
+            if orig_i is not None:
+                self.selected_instance = orig_i
+            self._absorb_wizard = None
+        self._wizard_pending_points = []
+        if self._wizard_banner.winfo_ismapped():
+            self._wizard_banner.pack_forget()
+        self._load_annotations_for_current_frame()
+        self.display_frame()
+
+    def remove_mask_anchor_at_location(self, x: float, y: float) -> bool:
+        """In removal mode: if (x, y) is inside the current frame's mask anchor, remove it."""
+        if not self.selected_instance or not self.selected_concept:
+            return False
+        inst = self.selected_instance
+        frame_idx = self.current_frame_idx
+        if frame_idx not in inst.mask_anchor_frames:
+            return False
+        anchor_dir = os.path.join(
+            self.project.project_dir, "concepts", self.selected_concept.name,
+            "instances", str(inst.sam3_obj_id), "mask_anchors"
+        )
+        mask_np = load_sam3_mask(anchor_dir, frame_idx)
+        if mask_np is None:
+            return False
+        ix, iy = int(round(x)), int(round(y))
+        if not (0 <= iy < mask_np.shape[0] and 0 <= ix < mask_np.shape[1]):
+            return False
+        if mask_np[iy, ix] < 128:
+            return False
+        mask_data = mask_np.copy()
+        inst.mask_anchor_frames.remove(frame_idx)
+        # Delete the file (PNG or NPZ)
+        for ext in ('.png', '.npz'):
+            p = Path(anchor_dir) / f"{frame_idx:06d}{ext}"
+            if p.exists():
+                p.unlink()
+        self.undo_stack.append({
+            'type': 'remove_mask_anchor',
+            'instance': inst,
+            'concept': self.selected_concept,
+            'frame_idx': frame_idx,
+            'mask_data': mask_data,
+            'anchor_dir': anchor_dir,
+        })
+        self.redo_stack.clear()
+        self._metadata_dirty = True
+        self.display_frame()
+        self.status_var.set(f"Removed mask anchor at frame {frame_idx}. Ctrl+Z to undo.")
+        return True
 
     def merge_instances_dialog(self):
         """Show dialog to merge multiple instances by pixel-union of their masks.
@@ -3222,8 +3714,15 @@ class SAM3VideoUI:
             return
         x, y = coords
 
+        if self._absorb_wizard and self._absorb_wizard['mode'] == 'point':
+            self._wizard_pending_points.append((x, y, True))
+            self._wizard_update_action_buttons()
+            self.display_frame()
+            return
+
         if self.point_removal_mode:
-            self.remove_point_at_location(x, y)
+            if not self.remove_point_at_location(x, y):
+                self.remove_mask_anchor_at_location(x, y)
             return
 
         # Add positive point (left click)
@@ -3250,8 +3749,15 @@ class SAM3VideoUI:
             return
         x, y = coords
 
+        if self._absorb_wizard and self._absorb_wizard['mode'] == 'point':
+            self._wizard_pending_points.append((x, y, False))
+            self._wizard_update_action_buttons()
+            self.display_frame()
+            return
+
         if self.point_removal_mode:
-            self.remove_point_at_location(x, y)
+            if not self.remove_point_at_location(x, y):
+                self.remove_mask_anchor_at_location(x, y)
             return
 
         pt = (x, y, False)
@@ -3383,6 +3889,44 @@ class SAM3VideoUI:
             self.display_frame()
             self.status_var.set(f"Absorb undone: '{action['source'].user_name}' restored.")
 
+        elif t == 'absorb_wizard':
+            action['source'].deleted = False
+            action['source'].visible = True
+            # Remove copied mask files from target's mask_anchors/
+            for p in action.get('copied_mask_paths', []):
+                try:
+                    Path(p).unlink(missing_ok=True)
+                    frame_idx = int(Path(p).stem)
+                    if frame_idx in action['target'].mask_anchor_frames:
+                        action['target'].mask_anchor_frames.remove(frame_idx)
+                except Exception:
+                    pass
+            # Unstage any point anchors
+            if action.get('staged_point_entries'):
+                self._unstage_anchors_from_cache(
+                    action['concept'], action['target'], action['staged_point_entries'])
+            if action.get('target_anchor_was_new'):
+                action['target'].received_absorb_anchor = False
+            self._metadata_dirty = True
+            self.update_concept_tree()
+            self.compositor = DynamicFrameCompositor(self.project)
+            self.display_frame()
+            self.status_var.set(f"Absorb undone: '{action['source'].user_name}' restored.")
+
+        elif t == 'remove_mask_anchor':
+            inst = action['instance']
+            frame_idx = action['frame_idx']
+            anchor_dir = action['anchor_dir']
+            dst = Path(anchor_dir) / f"{frame_idx:06d}.png"
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            cv2.imwrite(str(dst), action['mask_data'])
+            if frame_idx not in inst.mask_anchor_frames:
+                inst.mask_anchor_frames.append(frame_idx)
+                inst.mask_anchor_frames.sort()
+            self._metadata_dirty = True
+            self.display_frame()
+            self.status_var.set(f"Restored mask anchor at frame {frame_idx}.")
+
         elif t == 'rename_instance':
             action['instance'].user_name = action['old_name']
             self._metadata_dirty = True
@@ -3500,6 +4044,45 @@ class SAM3VideoUI:
             self.compositor = DynamicFrameCompositor(self.project)
             self.display_frame()
             self.status_var.set(f"Re-absorbed '{action['source'].user_name}'.")
+
+        elif t == 'absorb_wizard':
+            # Re-copy masks + re-stage points + re-delete source
+            import shutil as _shutil
+            action['source'].deleted = True
+            action['source'].visible = False
+            action['target'].received_absorb_anchor = True
+            for p in action.get('copied_mask_paths', []):
+                try:
+                    frame_idx = int(Path(p).stem)
+                    # The source mask might still exist; copy it back
+                    # (we stored the path; if missing, skip — impact is just a missing anchor)
+                    if not Path(p).exists():
+                        pass  # can't redo mask copy without source
+                    if frame_idx not in action['target'].mask_anchor_frames:
+                        action['target'].mask_anchor_frames.append(frame_idx)
+                except Exception:
+                    pass
+            if action.get('staged_point_entries'):
+                self._stage_anchors_to_cache(
+                    action['concept'], action['target'], action['staged_point_entries'])
+            self._metadata_dirty = True
+            self.update_concept_tree()
+            self.compositor = DynamicFrameCompositor(self.project)
+            self.display_frame()
+            self.status_var.set(f"Re-absorbed '{action['source'].user_name}'.")
+
+        elif t == 'remove_mask_anchor':
+            inst = action['instance']
+            frame_idx = action['frame_idx']
+            anchor_dir = action['anchor_dir']
+            dst = Path(anchor_dir) / f"{frame_idx:06d}.png"
+            if dst.exists():
+                dst.unlink()
+            if frame_idx in inst.mask_anchor_frames:
+                inst.mask_anchor_frames.remove(frame_idx)
+            self._metadata_dirty = True
+            self.display_frame()
+            self.status_var.set(f"Re-removed mask anchor at frame {frame_idx}.")
 
         elif t == 'rename_instance':
             action['instance'].user_name = action['new_name']
@@ -3737,6 +4320,12 @@ class SAM3VideoUI:
                 )
                 if os.path.isdir(masks_dir):
                     shutil.rmtree(masks_dir)
+                mask_anchors_dir = os.path.join(
+                    self.project.project_dir, "concepts", concept.name,
+                    "instances", str(inst.sam3_obj_id), "mask_anchors"
+                )
+                if os.path.isdir(mask_anchors_dir):
+                    shutil.rmtree(mask_anchors_dir)
                 cache_key = (concept.name, inst.sam3_obj_id)
                 self._presence_cache.pop(cache_key, None)
 
@@ -5217,7 +5806,8 @@ class AddConceptDialog:
         self.ui = ui
         self.top = tk.Toplevel(parent)
         self.top.title("Add Concept")
-        self.top.geometry("400x250")
+        self.top.geometry("420x380")
+        self.top.minsize(400, 380)
         self.top.transient(parent)
         self.top.grab_set()
 

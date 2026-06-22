@@ -106,6 +106,10 @@ class SAM3Instance:
     #              "avg_pixel_ratio": float, "min_pixel_ratio": float, "max_pixel_ratio": float}
     # pixel_ratio fields absent on entries from older project.json files — use .get(..., 0.0).
     period_peaks: List[dict] = field(default_factory=list)
+    # 99th-percentile pixel ratio across all detected frames; used to normalize presence bar
+    # height so typical frames read near full height rather than relative to the single maximum.
+    # 0.0 means not yet computed (old projects); UI falls back to max avg_pixel_ratio.
+    presence_norm: float = 0.0
     # True when instance was created manually in the UI (not returned by text detection).
     # replay_concept_refinements initializes it via point prompts instead of text detection.
     manually_added: bool = False
@@ -114,6 +118,9 @@ class SAM3Instance:
     # target's own first-period identity is pinned only the first time it gains an
     # absorbed instance — later absorbs into the same target don't repeat it.
     received_absorb_anchor: bool = False
+    # Frame indices in concepts/<name>/instances/<id>/mask_anchors/ that are used as
+    # SAM3 mask-conditioning anchors (set via the absorb wizard or mask-removal undo).
+    mask_anchor_frames: List[int] = field(default_factory=list)
 
     def get_effective_color(self, concept_color: Tuple[int, int, int]) -> Tuple[int, int, int]:
         """Get instance color (override if set, otherwise use concept color)"""
@@ -135,8 +142,10 @@ class SAM3Instance:
             "sam2_object_id": self.sam2_object_id,
             "continuous_periods": [list(p) for p in self.continuous_periods],
             "period_peaks": self.period_peaks,
+            "presence_norm": self.presence_norm,
             "manually_added": self.manually_added,
             "received_absorb_anchor": self.received_absorb_anchor,
+            "mask_anchor_frames": self.mask_anchor_frames,
         }
 
     @classmethod
@@ -157,8 +166,10 @@ class SAM3Instance:
             sam2_object_id=data.get("sam2_object_id", None),
             continuous_periods=[tuple(p) for p in data.get("continuous_periods", [])],
             period_peaks=data.get("period_peaks", []),
+            presence_norm=data.get("presence_norm", 0.0),
             manually_added=data.get("manually_added", False),
             received_absorb_anchor=data.get("received_absorb_anchor", False),
+            mask_anchor_frames=data.get("mask_anchor_frames", []),
         )
 
 

@@ -194,7 +194,8 @@ def _model_name_for(args) -> str:
 
 
 def _parallel_worker_main(worker_id, device, project_dir, model_name, use_fa3,
-                          max_cond_frames_in_attn, save_cond_states, task_queue, result_queue):
+                          max_cond_frames_in_attn, save_cond_states, cache_size,
+                          task_queue, result_queue):
     """
     Worker process for parallel concept processing.
 
@@ -241,6 +242,7 @@ def _parallel_worker_main(worker_id, device, project_dir, model_name, use_fa3,
                 device=device,
                 progress_callback=progress_callback,
                 save_cond_states=save_cond_states,
+                cache_size=cache_size,
             )
             # Persist this concept's metadata (disjoint per-concept file).
             project._save_concept_metadata(concept)
@@ -297,7 +299,7 @@ def process_project_parallel(args, project, concepts_to_process, devices):
             target=_parallel_worker_main,
             args=(i, device, project.project_dir, _model_name_for(args),
                   args.use_fa3, args.max_cond_frames_in_attn, args.save_cond_states,
-                  task_queue, result_queue),
+                  args.cache_size, task_queue, result_queue),
             daemon=True,
         )
         p.start()
@@ -363,7 +365,7 @@ def process_project_parallel(args, project, concepts_to_process, devices):
 
 def _parallel_refine_worker_main(
     worker_id, device, project_dir, model_name, use_fa3, max_cond_frames_in_attn,
-    restore_cond_states, save_cond_states, task_queue, result_queue
+    restore_cond_states, save_cond_states, cache_size, task_queue, result_queue
 ):
     """
     Worker process for parallel refinement.
@@ -420,6 +422,7 @@ def _parallel_refine_worker_main(
                     device=device,
                     progress_callback=progress_callback,
                     save_cond_states=save_cond_states,
+                    cache_size=cache_size,
                 )
                 project._save_concept_metadata(concept)
             else:
@@ -454,6 +457,7 @@ def _parallel_refine_worker_main(
                     restore_cond_states=restore_cond_states,
                     save_cond_states=save_cond_states,
                     mask_format=project.mask_format,
+                    cache_size=cache_size,
                 )
             result_queue.put(("done", worker_id, cname))
         except Exception as e:
@@ -503,7 +507,8 @@ def refine_project_parallel(args, project, redetect_concepts, refine_concepts, d
             target=_parallel_refine_worker_main,
             args=(i, device, project.project_dir, _model_name_for(args),
                   args.use_fa3, args.max_cond_frames_in_attn,
-                  args.restore_cond, args.save_cond_states, task_queue, result_queue),
+                  args.restore_cond, args.save_cond_states, args.cache_size,
+                  task_queue, result_queue),
             daemon=True,
         )
         p.start()
@@ -699,6 +704,7 @@ def _process_project_impl(args, project, devices):
                 device=devices[0],
                 progress_callback=progress_callback,
                 save_cond_states=args.save_cond_states,
+                cache_size=args.cache_size,
             )
             project.save()
             print(f"\nConcept '{concept.name}' complete!")
@@ -1298,6 +1304,7 @@ def _refine_project_impl(args, project):
                 device=devices[0],
                 progress_callback=redetect_progress,
                 save_cond_states=args.save_cond_states,
+                cache_size=args.cache_size,
             )
             os.remove(sentinel)
             project.save()
@@ -1333,6 +1340,7 @@ def _refine_project_impl(args, project):
                 restore_cond_states=args.restore_cond,
                 save_cond_states=args.save_cond_states,
                 mask_format=project.mask_format,
+                cache_size=args.cache_size,
             )
         except Exception as e:
             errors.append((cname, str(e)))
@@ -1630,6 +1638,12 @@ def main():
                              "(--sam-version 3.1 only). Requires a Hopper GPU "
                              "(H100/H200, compute capability 9.0+); fails on "
                              "Ampere/Ada GPUs such as the L40S.")
+    parser.add_argument("--cache-size", type=int, default=50,
+                        dest="cache_size",
+                        help="Number of decoded video frames held in the LRU cache during "
+                             "propagation (default: 50). Higher values reduce re-decoding "
+                             "on fast disks at the cost of more RAM (~100 MB per 10 frames "
+                             "for 1600x1200 video). Lower values save RAM on slow machines.")
     parser.add_argument("--max-cond-frames", type=int, default=-1,
                         dest="max_cond_frames_in_attn",
                         help="Number of conditioning frames the tracker attends to per "
