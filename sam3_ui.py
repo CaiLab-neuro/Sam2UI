@@ -172,7 +172,7 @@ class SAM3VideoUI:
         self.show_masks_var = tk.BooleanVar(value=True)
         self.focus_mode_var = tk.BooleanVar(value=False)
         self.skip_delete_confirm_var = tk.BooleanVar(value=False)
-        self.auto_jump_var = tk.BooleanVar(value=False)
+        self.auto_jump_var = tk.BooleanVar(value=True)
         self.mask_alpha_var = tk.DoubleVar(value=0.5)
 
         # Rate-limit perf diagnostics: print at most once every 2 seconds
@@ -895,6 +895,8 @@ class SAM3VideoUI:
         if not all_items:
             return
         current_idx = None
+        prev_key = ((self.selected_concept.name, self.selected_instance.sam3_obj_id)
+                    if self.selected_concept and self.selected_instance else None)
         if self.selected_instance and self.selected_concept:
             for i, (c, inst) in enumerate(all_items):
                 if (c.name == self.selected_concept.name and
@@ -905,22 +907,35 @@ class SAM3VideoUI:
         new_concept, new_inst = all_items[new_idx]
         self.selected_concept = new_concept
         self.selected_instance = new_inst
+        self.selected_instances = [(new_concept, new_inst)]
         self.selected_label.config(text=f"{new_inst.user_name} (ID: {new_inst.sam3_obj_id})")
         self.name_entry.delete(0, tk.END)
         self.name_entry.insert(0, new_inst.user_name)
-        # Highlight in tree
-        for concept_item in self.concept_tree.get_children():
-            for inst_item in self.concept_tree.get_children(concept_item):
-                tags = self.concept_tree.item(inst_item, 'tags')
-                if (tags and len(tags) >= 3 and tags[0] == 'instance' and
-                        tags[1] == new_concept.name and int(tags[2]) == new_inst.sam3_obj_id):
-                    self.concept_tree.selection_set(inst_item)
-                    self.concept_tree.see(inst_item)
-                    break
+        # Highlight in tree (suppress on_tree_select so it doesn't double-fire)
+        self._updating_tree = True
+        try:
+            for concept_item in self.concept_tree.get_children():
+                for inst_item in self.concept_tree.get_children(concept_item):
+                    tags = self.concept_tree.item(inst_item, 'tags')
+                    if (tags and len(tags) >= 3 and tags[0] == 'instance' and
+                            tags[1] == new_concept.name and int(tags[2]) == new_inst.sam3_obj_id):
+                        self.concept_tree.selection_set(inst_item)
+                        self.concept_tree.see(inst_item)
+                        break
+        finally:
+            self._updating_tree = False
         self._update_session_status()
         self._mark_presence_dirty()
         self._load_annotations_for_current_frame()
-        self.display_frame()
+        new_key = (new_concept.name, new_inst.sam3_obj_id)
+        jumped = False
+        if new_key != prev_key and self.auto_jump_var.get():
+            periods = self._get_instance_periods()
+            if periods:
+                self._go_to_frame(periods[0][0])
+                jumped = True
+        if not jumped:
+            self.display_frame()
         self.status_var.set(f"Instance: {new_inst.user_name}")
 
     # ============================================================
@@ -2449,11 +2464,7 @@ class SAM3VideoUI:
                         self.project.concepts[i] = updated_concept
                         break
 
-                # Save project
-                self.root.after(0, progress_dialog.update_progress, 0, 1, "Saving project...")
-                self._safe_project_save()
-
-                # Update UI (must be on main thread)
+                # Update UI (must be on main thread); save happens there too
                 self.root.after(0, progress_dialog.close)
                 self.root.after(0, self._concept_processing_complete, updated_concept)
 
@@ -2469,6 +2480,7 @@ class SAM3VideoUI:
     def _concept_processing_complete(self, concept: SAM3Concept):
         """Called when concept processing completes"""
 
+        self._safe_project_save()
         self._invalidate_presence_cache()
         self.update_concept_tree()
         self.compositor = DynamicFrameCompositor(self.project)  # Refresh compositor
@@ -3905,6 +3917,13 @@ class SAM3VideoUI:
             if action.get('staged_point_entries'):
                 self._unstage_anchors_from_cache(
                     action['concept'], action['target'], action['staged_point_entries'])
+                # Remove any pending mask_anchor trigger entries from disk
+                mask_anchor_entries = [e for e in action['staged_point_entries']
+                                       if e.get('type') == 'mask_anchor']
+                if mask_anchor_entries:
+                    self._remove_mask_anchor_triggers(
+                        action['concept'].name, action['target'].sam3_obj_id,
+                        [e['frame_idx'] for e in mask_anchor_entries])
             if action.get('target_anchor_was_new'):
                 action['target'].received_absorb_anchor = False
             self._metadata_dirty = True
@@ -4065,6 +4084,13 @@ class SAM3VideoUI:
             if action.get('staged_point_entries'):
                 self._stage_anchors_to_cache(
                     action['concept'], action['target'], action['staged_point_entries'])
+                # Re-write any mask_anchor trigger entries to disk
+                mask_anchor_entries = [e for e in action['staged_point_entries']
+                                       if e.get('type') == 'mask_anchor']
+                if mask_anchor_entries:
+                    self._write_mask_anchor_triggers(
+                        action['concept'].name, action['target'].sam3_obj_id,
+                        mask_anchor_entries)
             self._metadata_dirty = True
             self.update_concept_tree()
             self.compositor = DynamicFrameCompositor(self.project)
@@ -4198,8 +4224,8 @@ class SAM3VideoUI:
         if os.path.exists(rpath):
             with open(rpath) as f:
                 applied = [r for r in json.load(f).get("refinements", [])
-                           if r.get("propagated", False)
-                           and r.get("frame_idx") not in cached]
+                           if (r.get("propagated", False) and r.get("frame_idx") not in cached)
+                           or (not r.get("propagated", False) and r.get("type") == "mask_anchor")]
         from datetime import datetime
         pending = []
         for frame_idx, pts in sorted(cached.items()):
@@ -4587,14 +4613,7 @@ class SAM3VideoUI:
                         mask_format=self.project.mask_format,
                     )
 
-                # Save project (also flushes deferred metadata changes)
-                self._safe_project_save()
-                self._metadata_dirty = False
-
-                # Clear refinement points
-                self.refinement_points.clear()
-
-                # Close dialog and refresh display
+                # Close dialog and refresh display; save + metadata reset happen there
                 self.root.after(0, progress_dialog.close)
                 self.root.after(0, self._refinement_complete)
 
@@ -4614,6 +4633,10 @@ class SAM3VideoUI:
 
     def _refinement_complete(self):
         """Called when refinement completes"""
+        self._safe_project_save()
+        self._metadata_dirty = False
+        self.refinement_points.clear()
+
         # All pending points have been applied — clear them from the in-memory cache
         # so the concept starts fresh.  File entries are already marked propagated=True.
         if self.selected_concept:

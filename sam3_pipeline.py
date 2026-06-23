@@ -40,7 +40,8 @@ def _prune_non_cond_outputs(
     Non-cond pruning
     ----------------
     Evict non_cond_frame_outputs entries older than `keep` frames.  SAM3 attends to at
-    most num_maskmem=7 previous non-cond frames, so 20 is already generous.
+    most num_maskmem=7 previous non-cond frames; keep is set to num_maskmem + 2 at each
+    call site via _non_cond_keep_window(), so entries beyond that are never read.
 
     Cond frame pruning — two categories
     ------------------------------------
@@ -128,6 +129,20 @@ def _prune_non_cond_outputs(
         for per_frame in ts.get("mask_inputs_per_obj", {}).values():
             for f in evict:
                 per_frame.pop(f, None)
+
+
+def _non_cond_keep_window(sam3_model, extra: int = 1) -> int:
+    """Frames to retain in non_cond_frame_outputs: tracker's num_maskmem + a small buffer.
+
+    SAM3's tracker attends to at most num_maskmem (default 7) non-cond frames per forward
+    pass, so entries older than that are never read.  We keep num_maskmem + extra (=8) as
+    a buffer in case the model variant differs.  num_maskmem is an architectural constant
+    trained into the checkpoint, not a user-tunable knob.
+    """
+    try:
+        return sam3_model.model.tracker.num_maskmem + extra
+    except AttributeError:
+        return 7 + extra  # SAM3 default num_maskmem=7
 
 
 def compute_period_peaks(periods: List[Tuple[int, int]],
@@ -612,6 +627,7 @@ def process_concept_detection(
         # yielded frame — ~2MB/obj/frame at 1080p.  Once masks are saved to disk the
         # entry is no longer needed (forward-only propagation never looks backwards).
         inner_state = sam3_model._all_inference_states[session_id]["state"]
+        _keep = _non_cond_keep_window(sam3_model)
 
         # Scan entire video forward from frame 0.
         # "both" with start_frame_idx=0 was a no-op for backward (range(0,-1,-1)=[0]),
@@ -676,7 +692,7 @@ def process_concept_detection(
 
             # Prune stale non_cond_frame_outputs inside each tracker state.
             # (SAM3 stores maskmem tensors per-GPU-rank, not at top-level inner_state.)
-            _prune_non_cond_outputs(inner_state, frame_idx)
+            _prune_non_cond_outputs(inner_state, frame_idx, keep=_keep)
 
             # Clear GPU cache periodically
             if frame_idx % 100 == 0:
@@ -856,6 +872,7 @@ def add_refinement_points(
             print(f"Using {n} restored cond frames from prior round.")
 
     # Re-propagate scanning entire video from frame 0
+    _keep = _non_cond_keep_window(sam3_model)
     print("Re-propagating with refinements...")
     from sam3_utils import AsyncMaskWriter
     mask_writer = AsyncMaskWriter(mask_format=mask_format)
@@ -891,6 +908,7 @@ def add_refinement_points(
 
             _prune_non_cond_outputs(
                 sam3_model._all_inference_states[session_id]["state"], out_frame_idx,
+                keep=_keep,
             )
             # Progress callback
             if progress_callback:
@@ -1086,6 +1104,7 @@ def replay_concept_refinements(
         # _prepare_backbone_feats), so nothing here is reused once propagation starts —
         # evicting immediately after use is free and avoids the pileup.
         inner_state = sam3_model._all_inference_states[session_id]["state"]
+        _keep = _non_cond_keep_window(sam3_model)
 
         # Initialize manually-added instances (never text-detected) via ALL their pending
         # point sets in frame order.  The first add_prompt(obj_id=X, points=...) call
@@ -1172,7 +1191,7 @@ def replay_concept_refinements(
 
                 # Evict after saving — forward propagation never revisits past frames
                 inner_state["cached_frame_outputs"].pop(out_frame_idx, None)
-                _prune_non_cond_outputs(inner_state, out_frame_idx)
+                _prune_non_cond_outputs(inner_state, out_frame_idx, keep=_keep)
 
                 if progress_callback:
                     progress_callback(out_frame_idx, num_frames)
@@ -1328,6 +1347,7 @@ def online_add_refinement_points(
 
     # Re-propagate with the new cond anchor included
     print("Re-propagating with new anchor...")
+    _keep = _non_cond_keep_window(sam3_model)
     from sam3_utils import AsyncMaskWriter
     mask_writer = AsyncMaskWriter(mask_format=mask_format)
     try:
@@ -1361,6 +1381,7 @@ def online_add_refinement_points(
 
             _prune_non_cond_outputs(
                 sam3_model._all_inference_states[session_id]["state"], out_frame_idx,
+                keep=_keep,
             )
             if progress_callback:
                 progress_callback(out_frame_idx, num_frames)
@@ -1471,6 +1492,7 @@ def online_replay_concept_refinements(
     # Single propagation pass — non-overlapping applied across ALL instances simultaneously
     inst_names = [inst.user_name for inst, _ in instances_with_pending]
     print(f"Re-propagating with corrections for {len(instances_with_pending)} instance(s): {inst_names}")
+    _keep = _non_cond_keep_window(sam3_model)
     from sam3_utils import AsyncMaskWriter
     mask_writer = AsyncMaskWriter(mask_format=mask_format)
     pixel_counts_by_obj: dict = defaultdict(dict)
@@ -1498,6 +1520,7 @@ def online_replay_concept_refinements(
                 pixel_counts_by_obj[obj_id_int][out_frame_idx] = int((mask_np > 0).sum())
             _prune_non_cond_outputs(
                 sam3_model._all_inference_states[session_id]["state"], out_frame_idx,
+                keep=_keep,
             )
             if progress_callback:
                 progress_callback(out_frame_idx, num_frames)

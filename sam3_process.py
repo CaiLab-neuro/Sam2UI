@@ -1738,16 +1738,16 @@ def main():
             return handle_quality_metrics(args)
         return rc
 
-    if args.quality_metrics:
-        return handle_quality_metrics(args)
-
     if args.refine is not None:
         rc = refine_project(args)
-        if rc == 0 and getattr(args, "quality_metrics", False):
+        if rc == 0 and args.quality_metrics:
             return handle_quality_metrics(args)
         return rc
 
-    return process_project(args)
+    rc = process_project(args)
+    if rc == 0 and args.quality_metrics:
+        return handle_quality_metrics(args)
+    return rc
 
 
 if __name__ == "__main__":
