@@ -643,7 +643,7 @@ def _process_project_impl(args, project, devices):
             concepts_to_process = []
             for i, name in enumerate(names):
                 existing = next((c for c in project.concepts if c.name == name), None)
-                if existing and (existing.status.value == "pending" or args.force):
+                if existing and (existing.status.value in ("pending", "error") or args.force):
                     concepts_to_process.append(existing)
                 elif not existing:
                     color = generate_concept_color(len(project.concepts) + i)
@@ -655,7 +655,7 @@ def _process_project_impl(args, project, devices):
     else:
         concepts_to_process = [
             c for c in project.concepts
-            if (c.status.value == "pending" or args.force)
+            if (c.status.value in ("pending", "error") or args.force)
         ]
         print(f"Found {len(concepts_to_process)} concept(s) to process in project")
 

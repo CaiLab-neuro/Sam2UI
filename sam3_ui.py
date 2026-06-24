@@ -2494,6 +2494,40 @@ class SAM3VideoUI:
                            f"Concept '{concept.name}' processed successfully.\n"
                            f"Detected {num_instances} instances.")
 
+    def add_concept_pending(self, concept_name: str, text_prompt: str,
+                            detection_frame: int, max_instances: int = -1):
+        """Register a new concept as pending without running detection.
+
+        The concept is saved to project.json with status=PENDING so it can be
+        processed later by:  python sam3_process.py --project <dir> --device cuda:0
+        """
+        if not validate_text_prompt(text_prompt):
+            messagebox.showerror("Error", "Invalid text prompt. Must be 1-200 characters.")
+            return
+
+        if self.project.get_concept_by_name(concept_name):
+            messagebox.showerror("Error", f"Concept '{concept_name}' already exists.")
+            return
+
+        concept = SAM3Concept(
+            name=concept_name,
+            text_prompt=text_prompt,
+            color_rgb=generate_concept_color(len(self.project.concepts)),
+            detection_frame=detection_frame,
+            max_instances=max_instances,
+        )
+
+        self.project.add_concept(concept)
+        self.project.save()
+        self.update_concept_tree()
+        self.status_var.set(f"Concept '{concept_name}' saved (pending — run sam3_process.py to detect).")
+        messagebox.showinfo(
+            "Saved",
+            f"Concept '{concept_name}' saved as pending.\n\n"
+            f"Run detection later with:\n"
+            f"  python sam3_process.py --project <project_dir> --device {self.device}"
+        )
+
     def _concept_processing_error(self, concept_name: str, error: str):
         """Called when concept processing fails"""
 
@@ -5869,24 +5903,25 @@ class AddConceptDialog:
         btn_frame = tk.Frame(self.top)
         btn_frame.pack(pady=20)
 
-        tk.Button(btn_frame, text="Process", width=10,
+        tk.Button(btn_frame, text="Process Now", width=12,
                  command=self.on_process).pack(side=tk.LEFT, padx=5)
+        tk.Button(btn_frame, text="Save for Later", width=12,
+                 command=self.on_save_pending).pack(side=tk.LEFT, padx=5)
         tk.Button(btn_frame, text="Cancel", width=10,
                  command=self.top.destroy).pack(side=tk.LEFT, padx=5)
 
-    def on_process(self):
-        """Process the new concept"""
-
+    def _validate_inputs(self):
+        """Validate and return (name, prompt, frame_idx, max_instances) or None on error."""
         name = self.name_entry.get().strip()
         prompt = self.prompt_entry.get().strip()
 
         if not name:
             messagebox.showwarning("Warning", "Concept name is required.")
-            return
+            return None
 
         if not prompt:
             messagebox.showwarning("Warning", "Text prompt is required.")
-            return
+            return None
 
         try:
             frame_idx = int(self.frame_entry.get())
@@ -5894,16 +5929,33 @@ class AddConceptDialog:
                 raise ValueError()
         except ValueError:
             messagebox.showwarning("Warning", "Invalid frame index.")
-            return
+            return None
 
         try:
             max_instances = int(self.max_instances_entry.get())
         except ValueError:
             messagebox.showwarning("Warning", "Max Instances must be an integer (-1 for no limit).")
-            return
+            return None
 
+        return name, prompt, frame_idx, max_instances
+
+    def on_process(self):
+        """Process the new concept immediately."""
+        inputs = self._validate_inputs()
+        if inputs is None:
+            return
+        name, prompt, frame_idx, max_instances = inputs
         self.top.destroy()
         self.ui.add_concept(name, prompt, frame_idx, max_instances)
+
+    def on_save_pending(self):
+        """Save concept as pending (to be processed later via sam3_process.py)."""
+        inputs = self._validate_inputs()
+        if inputs is None:
+            return
+        name, prompt, frame_idx, max_instances = inputs
+        self.top.destroy()
+        self.ui.add_concept_pending(name, prompt, frame_idx, max_instances)
 
 
 class EditPromptDialog:
