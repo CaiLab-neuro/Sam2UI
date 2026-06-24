@@ -3881,6 +3881,17 @@ class SAM3VideoUI:
                 return
             self.refinement_points.extend(action['points'])
             self._update_points_cache()
+            # Restore mask anchor if one was removed.
+            if action.get('anchor_data') is not None:
+                inst = self.selected_instance
+                frame_idx = action['frame_idx']
+                anchor_dir = action['anchor_dir']
+                Path(anchor_dir).mkdir(parents=True, exist_ok=True)
+                cv2.imwrite(str(Path(anchor_dir) / f"{frame_idx:06d}.png"), action['anchor_data'])
+                if frame_idx not in inst.mask_anchor_frames:
+                    inst.mask_anchor_frames.append(frame_idx)
+                    inst.mask_anchor_frames.sort()
+                self._metadata_dirty = True
             self.points_label.config(text=f"Points: {len(self.refinement_points)}")
             self.display_frame()
             self.status_var.set(f"Restored {len(action['points'])} point(s) at frame "
@@ -4053,6 +4064,19 @@ class SAM3VideoUI:
                 return
             self.refinement_points.clear()
             self._update_points_cache()
+            if action.get('anchor_data') is not None:
+                inst = self.selected_instance
+                frame_idx = action['frame_idx']
+                anchor_dir = action['anchor_dir']
+                if frame_idx in inst.mask_anchor_frames:
+                    inst.mask_anchor_frames.remove(frame_idx)
+                self._remove_mask_anchor_triggers(
+                    action['concept_name'], inst.sam3_obj_id, [frame_idx])
+                for ext in ('.png', '.npz'):
+                    p = Path(anchor_dir) / f"{frame_idx:06d}{ext}"
+                    if p.exists():
+                        p.unlink()
+                self._metadata_dirty = True
             self.points_label.config(text="Points: 0")
             self.display_frame()
             self.status_var.set(f"Re-cleared frame {action.get('frame_idx', '?')}.")
@@ -4277,26 +4301,52 @@ class SAM3VideoUI:
 
     def clear_frame_annotations(self):
         """Clear ALL annotation points (historical + pending) for the selected instance
-        at the current frame. Undoable within the session; deferred to disk until save."""
+        at the current frame. Also removes any mask anchor at this frame.
+        Undoable within the session; deferred to disk until save."""
         if not self.selected_instance or not self.selected_concept:
             messagebox.showwarning("Warning", "Please select an instance first.")
             return
+        inst = self.selected_instance
+        frame_idx = self.current_frame_idx
+
         snapshot = list(self.refinement_points)
         self.refinement_points.clear()
         # Tombstone in cache — disk write deferred to explicit save.
         self._update_points_cache()
-        if snapshot:
+
+        # Also remove any mask anchor at this frame.
+        anchor_data = None
+        if frame_idx in inst.mask_anchor_frames:
+            anchor_dir = os.path.join(
+                self.project.project_dir, "concepts", self.selected_concept.name,
+                "instances", str(inst.sam3_obj_id), "mask_anchors"
+            )
+            mask_np = load_sam3_mask(anchor_dir, frame_idx)
+            if mask_np is not None:
+                anchor_data = mask_np.copy()
+            inst.mask_anchor_frames.remove(frame_idx)
+            self._remove_mask_anchor_triggers(
+                self.selected_concept.name, inst.sam3_obj_id, [frame_idx])
+            for ext in ('.png', '.npz'):
+                p = Path(anchor_dir) / f"{frame_idx:06d}{ext}"
+                if p.exists():
+                    p.unlink()
+            self._metadata_dirty = True
+
+        if snapshot or anchor_data is not None:
             self.undo_stack.append({
                 'type': 'clear_frame',
                 'concept_name': self.selected_concept.name,
-                'obj_id': self.selected_instance.sam3_obj_id,
-                'frame_idx': self.current_frame_idx,
+                'obj_id': inst.sam3_obj_id,
+                'frame_idx': frame_idx,
                 'points': snapshot,
+                'anchor_data': anchor_data,
+                'anchor_dir': anchor_dir if anchor_data is not None else None,
             })
             self.redo_stack.clear()
         self.points_label.config(text="Points: 0")
         self.display_frame()
-        self.status_var.set(f"Cleared all annotations at frame {self.current_frame_idx}. "
+        self.status_var.set(f"Cleared all annotations at frame {frame_idx}. "
                             "Ctrl+Z to undo. Save Changes for Refinement or Apply to persist.")
 
     def clear_all_instance_annotations(self):
