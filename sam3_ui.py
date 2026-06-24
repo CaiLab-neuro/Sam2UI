@@ -386,29 +386,34 @@ class SAM3VideoUI:
         wiz_right = tk.Frame(self._wizard_banner, bg='#1a3a1a')
         wiz_right.pack(side=tk.RIGHT, padx=4, pady=3)
 
-        self._wiz_confirm_btn = tk.Button(wiz_right, text="Use this mask",
+        wiz_row1 = tk.Frame(wiz_right, bg='#1a3a1a')
+        wiz_row1.pack(fill=tk.X, pady=(0, 2))
+        wiz_row2 = tk.Frame(wiz_right, bg='#1a3a1a')
+        wiz_row2.pack(fill=tk.X)
+
+        self._wiz_confirm_btn = tk.Button(wiz_row1, text="Use this mask",
                                           bg='#2a5a2a', fg='white', font=("Arial", 8),
                                           command=self._wizard_confirm_mask)
         self._wiz_confirm_btn.pack(side=tk.LEFT, padx=2)
 
-        self._wiz_point_btn = tk.Button(wiz_right, text="Add point instead",
+        self._wiz_point_btn = tk.Button(wiz_row1, text="Add point instead",
                                         bg='#2a2a5a', fg='white', font=("Arial", 8),
                                         command=self._wizard_switch_to_point_mode)
         self._wiz_point_btn.pack(side=tk.LEFT, padx=2)
 
-        self._wiz_confirm_pts_btn = tk.Button(wiz_right, text="Confirm points",
+        self._wiz_confirm_pts_btn = tk.Button(wiz_row2, text="Confirm points",
                                               bg='#2a5a2a', fg='white', font=("Arial", 8),
                                               state=tk.DISABLED,
                                               command=self._wizard_confirm_points)
         self._wiz_confirm_pts_btn.pack(side=tk.LEFT, padx=2)
 
-        self._wiz_back_btn = tk.Button(wiz_right, text="Back to mask",
+        self._wiz_back_btn = tk.Button(wiz_row2, text="Back to mask",
                                        bg='#404040', fg='white', font=("Arial", 8),
                                        state=tk.DISABLED,
                                        command=self._wizard_back_to_mask_mode)
         self._wiz_back_btn.pack(side=tk.LEFT, padx=2)
 
-        self._wiz_cancel_btn = tk.Button(wiz_right, text="Cancel",
+        self._wiz_cancel_btn = tk.Button(wiz_row2, text="Cancel",
                                          bg='#5a1a1a', fg='white', font=("Arial", 8),
                                          command=self._wizard_cancel)
         self._wiz_cancel_btn.pack(side=tk.LEFT, padx=2)
@@ -3198,10 +3203,7 @@ class SAM3VideoUI:
     # ============================================================
 
     def _get_first_period_info(self, concept, instance):
-        """Return (best_frame, period_start, period_end) for first detected period or None."""
-        if instance.period_peaks:
-            p = instance.period_peaks[0]
-            return p["best_frame"], p["start"], p["end"]
+        """Return (first_frame, period_start, period_end) for first detected period or None."""
         mask_dir = os.path.join(
             self.project.project_dir, "concepts", concept.name,
             "instances", str(instance.sam3_obj_id), "masks"
@@ -3212,21 +3214,12 @@ class SAM3VideoUI:
         if not periods:
             return None
         start, end = periods[0]
-        sample = list(range(start, end + 1))
-        if len(sample) > 20:
-            step = len(sample) / 20
-            sample = [sample[int(i * step)] for i in range(20)]
-        best_frame, best_area = None, 0
-        for f in sample:
+        # Walk forward from the period start to find the first frame with a non-empty mask.
+        for f in range(start, end + 1):
             m = load_sam3_mask(mask_dir, f)
-            if m is not None:
-                area = int((m > 127).sum())
-                if area > best_area:
-                    best_area = area
-                    best_frame = f
-        if best_frame is None:
-            return None
-        return best_frame, start, end
+            if m is not None and int((m > 127).sum()) > 0:
+                return f, start, end
+        return None
 
     def absorb_instance(self, target: 'SAM3Instance', source: 'SAM3Instance'):
         """Launch the guided mask-confirmation wizard for an absorb.

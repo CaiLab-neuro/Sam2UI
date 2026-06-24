@@ -1189,6 +1189,8 @@ def replay_concept_refinements(
             text=concept.text_prompt,
         )
 
+        live_obj_ids = {inst.sam3_obj_id for inst in concept.instances if not inst.deleted}
+
         # Pre-initialise all LIVE instances from their original first-period masks.
         # This registers late-appearing instances with their correct sam3_obj_id before
         # propagation, setting max_obj_id = max(live obj_ids).  Ghost IDs assigned to
@@ -1198,18 +1200,30 @@ def replay_concept_refinements(
             sam3_model, session_id, concept, project_dir, orig_width, orig_height
         )
 
-        # Remove deleted instances — text-based detection is deterministic so obj_ids
-        # match the stored sam3_obj_id values exactly.  Because _preload_original_masks
-        # has already set max_obj_id to the highest live obj_id, ghost sub-states created
-        # during propagation for deleted instances' physical counterparts will receive
-        # IDs above that ceiling.
+        # Two categories of non-live obj_ids require different handling:
+        #
+        # (a) ABSORBED instances — detected by the model but removed from concept.instances
+        #     by the absorb wizard (the user said "this is the same object as another one").
+        #     We call remove_object() so their sub-states are gone and their pixels are
+        #     freed for the absorbing instance to claim via points/anchors.
+        #
+        # (b) DELETED instances — explicitly marked deleted=True (the user said "I don't want
+        #     this object at all").  We intentionally leave their sub-states alive.  The
+        #     non-overlapping constraint then prevents that region from being re-detected as a
+        #     new ghost instance during propagation, and from being claimed by live instances.
+        #     Their masks are gated out by live_obj_ids before writing.
         deleted_obj_ids = {inst.sam3_obj_id for inst in concept.instances if inst.deleted}
-        for del_id in deleted_obj_ids:
+        inner_state = sam3_model._all_inference_states[session_id]["state"]
+        session_obj_ids = set(
+            int(x) for x in inner_state.get("tracker_metadata", {}).get("obj_ids_all_gpu", [])
+        )
+        absorbed_obj_ids = session_obj_ids - live_obj_ids - deleted_obj_ids
+        for abs_id in absorbed_obj_ids:
             try:
-                sam3_model.remove_object(session_id=session_id, obj_id=del_id)
-                print(f"  Removed deleted instance obj_id={del_id} from session.")
+                sam3_model.remove_object(session_id=session_id, obj_id=abs_id)
+                print(f"  Removed absorbed obj_id={abs_id} from session (pixels freed).")
             except Exception as e:
-                print(f"  Warning: could not remove obj_id={del_id}: {e}")
+                print(f"  Warning: could not remove absorbed obj_id={abs_id}: {e}")
 
         concept_dir = os.path.join(project_dir, "concepts", concept.name)
         if restore_cond_states:
@@ -1289,8 +1303,6 @@ def replay_concept_refinements(
         total_pixels = orig_width * orig_height
         instances_root = os.path.join(project_dir, "concepts", concept.name, "instances")
         output_dirs: dict = {}  # obj_id_int -> output_dir (cached per unique object)
-
-        live_obj_ids = {inst.sam3_obj_id for inst in concept.instances if not inst.deleted}
 
         # Record which frames already have mask data for each live instance, so we can
         # overwrite previous non-zero masks with explicit zeros when refinement produces
