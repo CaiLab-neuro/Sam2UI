@@ -1148,7 +1148,8 @@ def replay_concept_refinements(
     # "mask_anchor" entries are skipped here — they carry no point prompts and
     # must not clear other annotations at the same frame.  Their effect is applied
     # via _inject_mask_anchors() which reads directly from mask_anchor_frames.
-    obj_frame_points: dict = defaultdict(dict)
+    obj_frame_points: dict = defaultdict(dict)   # obj_id -> {frame_idx -> [points]}
+    obj_frame_boxes: dict = defaultdict(dict)    # obj_id -> {frame_idx -> [boxes xywh rel]}
     for obj_id, (rpath, all_entries, inst) in refinements_by_instance.items():
         for r in all_entries:
             if r.get("type") == "mask_anchor":
@@ -1161,6 +1162,17 @@ def replay_concept_refinements(
                 obj_frame_points[obj_id][frame_idx] = pts
             else:
                 obj_frame_points[obj_id].pop(frame_idx, None)
+            # Boxes stored as pixel coords; convert to xywh relative on load.
+            raw_boxes = r.get("boxes", [])
+            boxes_xywh = [(b["x1"] / orig_width,
+                           b["y1"] / orig_height,
+                           (b["x2"] - b["x1"]) / orig_width,
+                           (b["y2"] - b["y1"]) / orig_height)
+                          for b in raw_boxes]
+            if boxes_xywh:
+                obj_frame_boxes[obj_id][frame_idx] = boxes_xywh
+            else:
+                obj_frame_boxes[obj_id].pop(frame_idx, None)
 
     n_pending = sum(len(p) for _, p in instances_with_pending)
     total_frames_replayed = sum(len(v) for v in obj_frame_points.values())
@@ -1202,28 +1214,36 @@ def replay_concept_refinements(
 
         # Two categories of non-live obj_ids require different handling:
         #
-        # (a) ABSORBED instances — detected by the model but removed from concept.instances
-        #     by the absorb wizard (the user said "this is the same object as another one").
+        # (a) ABSORBED sources — instances with deleted=True AND absorbed_source=True.
+        #     The user said "this duplicate is the same object as another one I'm keeping."
         #     We call remove_object() so their sub-states are gone and their pixels are
-        #     freed for the absorbing instance to claim via points/anchors.
+        #     freed for the absorbing target to claim via points/anchors.  Leaving them
+        #     alive would cause non-overlapping constraints to fight the live instance.
         #
-        # (b) DELETED instances — explicitly marked deleted=True (the user said "I don't want
-        #     this object at all").  We intentionally leave their sub-states alive.  The
-        #     non-overlapping constraint then prevents that region from being re-detected as a
-        #     new ghost instance during propagation, and from being claimed by live instances.
-        #     Their masks are gated out by live_obj_ids before writing.
-        deleted_obj_ids = {inst.sam3_obj_id for inst in concept.instances if inst.deleted}
+        # (b) DELETED instances — deleted=True, absorbed_source=False (user said "I don't
+        #     want this object").  We intentionally leave their sub-states alive so the
+        #     non-overlapping constraint prevents that region from spawning a new ghost
+        #     instance.  Their masks are gated out by live_obj_ids before writing.
+        #
+        # (c) Phantom obj_ids — completely absent from concept.instances (not in live,
+        #     deleted, or absorbed sets).  Also call remove_object() for these.
+        absorbed_source_ids = {inst.sam3_obj_id for inst in concept.instances
+                               if inst.deleted and getattr(inst, 'absorbed_source', False)}
+        deleted_obj_ids = {inst.sam3_obj_id for inst in concept.instances
+                           if inst.deleted and not getattr(inst, 'absorbed_source', False)}
         inner_state = sam3_model._all_inference_states[session_id]["state"]
         session_obj_ids = set(
             int(x) for x in inner_state.get("tracker_metadata", {}).get("obj_ids_all_gpu", [])
         )
-        absorbed_obj_ids = session_obj_ids - live_obj_ids - deleted_obj_ids
+        phantom_obj_ids = session_obj_ids - live_obj_ids - deleted_obj_ids - absorbed_source_ids
+        absorbed_obj_ids = absorbed_source_ids | phantom_obj_ids
         for abs_id in absorbed_obj_ids:
             try:
                 sam3_model.remove_object(session_id=session_id, obj_id=abs_id)
-                print(f"  Removed absorbed obj_id={abs_id} from session (pixels freed).")
+                label = "absorbed source" if abs_id in absorbed_source_ids else "phantom"
+                print(f"  Removed {label} obj_id={abs_id} from session (pixels freed).")
             except Exception as e:
-                print(f"  Warning: could not remove absorbed obj_id={abs_id}: {e}")
+                print(f"  Warning: could not remove obj_id={abs_id}: {e}")
 
         concept_dir = os.path.join(project_dir, "concepts", concept.name)
         if restore_cond_states:
@@ -1253,19 +1273,22 @@ def replay_concept_refinements(
         manually_added_ids = {inst.sam3_obj_id for inst in concept.instances
                               if getattr(inst, 'manually_added', False) and not inst.deleted}
         for obj_id in manually_added_ids:
-            if obj_id not in obj_frame_points:
-                continue  # no pending points → nothing to initialize
-            for frame_idx in sorted(obj_frame_points[obj_id].keys()):
-                pts = obj_frame_points[obj_id][frame_idx]
+            if obj_id not in obj_frame_points and obj_id not in obj_frame_boxes:
+                continue  # no pending annotations → nothing to initialize
+            all_frames = sorted(set(obj_frame_points.get(obj_id, {})) | set(obj_frame_boxes.get(obj_id, {})))
+            for frame_idx in all_frames:
+                pts = obj_frame_points.get(obj_id, {}).get(frame_idx, [])
+                boxes = obj_frame_boxes.get(obj_id, {}).get(frame_idx, [])
                 pts_normalized = [[x / orig_width, y / orig_height] for x, y, _ in pts]
                 pt_labels = [1 if is_positive else 0 for _, _, is_positive in pts]
-                sam3_model.add_prompt(
-                    session_id=session_id,
-                    frame_idx=frame_idx,
-                    obj_id=obj_id,
-                    points=pts_normalized,
-                    point_labels=pt_labels,
-                )
+                kw = dict(session_id=session_id, frame_idx=frame_idx, obj_id=obj_id)
+                if pts_normalized:
+                    kw["points"] = pts_normalized
+                    kw["point_labels"] = pt_labels
+                if boxes:
+                    kw["bounding_boxes"] = boxes
+                    kw["bounding_box_labels"] = [1] * len(boxes)
+                sam3_model.add_prompt(**kw)
                 inner_state["feature_cache"].pop(frame_idx, None)
             n_frames = len(obj_frame_points[obj_id])
             print(f"  Initialized manually-added instance obj_id={obj_id} "
@@ -1274,20 +1297,24 @@ def replay_concept_refinements(
         # Add refinement prompts for text-detected instances on each annotated frame.
         # All calls use obj_id= (no text=) so reset_state is NOT triggered.
         # Manually-added instances were fully handled above — skip them here.
-        for obj_id, frame_points in obj_frame_points.items():
+        all_annotated_ids = set(obj_frame_points) | set(obj_frame_boxes)
+        for obj_id in all_annotated_ids:
             if obj_id in manually_added_ids:
                 continue
-            for frame_idx in sorted(frame_points.keys()):
-                pts = frame_points[frame_idx]
+            all_frames = sorted(set(obj_frame_points.get(obj_id, {})) | set(obj_frame_boxes.get(obj_id, {})))
+            for frame_idx in all_frames:
+                pts = obj_frame_points.get(obj_id, {}).get(frame_idx, [])
+                boxes = obj_frame_boxes.get(obj_id, {}).get(frame_idx, [])
                 pts_normalized = [[x / orig_width, y / orig_height] for x, y, _ in pts]
                 pt_labels = [1 if is_positive else 0 for _, _, is_positive in pts]
-                sam3_model.add_prompt(
-                    session_id=session_id,
-                    frame_idx=frame_idx,
-                    obj_id=obj_id,
-                    points=pts_normalized,
-                    point_labels=pt_labels,
-                )
+                kw = dict(session_id=session_id, frame_idx=frame_idx, obj_id=obj_id)
+                if pts_normalized:
+                    kw["points"] = pts_normalized
+                    kw["point_labels"] = pt_labels
+                if boxes:
+                    kw["bounding_boxes"] = boxes
+                    kw["bounding_box_labels"] = [1] * len(boxes)
+                sam3_model.add_prompt(**kw)
                 inner_state["feature_cache"].pop(frame_idx, None)
 
         # Inject mask-conditioning anchors (from absorb wizard) before propagation.
@@ -1375,6 +1402,15 @@ def replay_concept_refinements(
 
         # Wipe mask files for deleted instances — they were excluded from propagation so
         # their on-disk masks are now stale and should not appear in any future compositing.
+        #
+        # Two sub-cases:
+        #   • User-deleted (absorbed_source=False): recreate empty dir so subsequent runs
+        #     don't mistake an absent dir for "not yet detected".
+        #   • Absorbed sources (absorbed_source=True): their original masks were kept until
+        #     now for ghost rendering / union-check in the UI.  This refinement run has
+        #     incorporated them into the target via mask anchors, so the originals are no
+        #     longer needed.  remove_object() was called for these IDs above, so they
+        #     produced NO new masks during propagation — deleting here is safe.
         import shutil
         for inst in concept.instances:
             if not inst.deleted:
@@ -1383,10 +1419,13 @@ def replay_concept_refinements(
                 project_dir, "concepts", concept.name,
                 "instances", str(inst.sam3_obj_id), "masks"
             )
+            is_absorbed = getattr(inst, 'absorbed_source', False)
             if os.path.isdir(mask_dir):
                 shutil.rmtree(mask_dir)
-                os.makedirs(mask_dir, exist_ok=True)
-                print(f"  Cleared masks for deleted instance obj_id={inst.sam3_obj_id}.")
+                if not is_absorbed:
+                    os.makedirs(mask_dir, exist_ok=True)
+            label = "absorbed source" if is_absorbed else "deleted"
+            print(f"  Cleared masks for {label} instance obj_id={inst.sam3_obj_id}.")
 
         # Report instance directories on disk that weren't covered by this refinement run.
         # This happens when a prior run detected more objects than this run (e.g., the text
@@ -1408,7 +1447,7 @@ def replay_concept_refinements(
                 and not inst.deleted
                 and inst.sam3_obj_id not in obj_frame_points
             }
-            stale = on_disk - set(pixel_counts_by_obj.keys()) - deleted_obj_ids - manually_added_no_pending
+            stale = on_disk - set(pixel_counts_by_obj.keys()) - deleted_obj_ids - absorbed_source_ids - manually_added_no_pending
             if stale:
                 print(f"  NOTE: {len(stale)} instance dir(s) on disk not updated by this "
                       f"refinement run: {sorted(stale)}")
@@ -1634,31 +1673,51 @@ def online_replay_concept_refinements(
     for instance, pending_entries in instances_with_pending:
         for entry in pending_entries:
             if entry.get("type") == "mask_anchor":
-                continue  # no point prompts; mask is injected via _inject_mask_anchors
+                continue  # mask is injected via _inject_mask_anchors
             frame_idx = entry["frame_idx"]
             raw_pts = entry.get("points", [])
-            if not raw_pts:
+            raw_boxes = entry.get("boxes", [])
+            if not raw_pts and not raw_boxes:
                 continue
-            pt_coords = torch.tensor(
-                [[p["x"] / orig_width, p["y"] / orig_height] for p in raw_pts],
-                dtype=torch.float32,
-            )
-            pt_labels = torch.tensor(
-                [1 if p["is_positive"] else 0 for p in raw_pts],
-                dtype=torch.int32,
-            )
-            print(f"Online refinement: adding {len(raw_pts)} point(s) at frame {frame_idx} "
-                  f"for obj {instance.sam3_obj_id}")
-            sam3_model.add_prompt(
-                session_id=session_id,
-                frame_idx=frame_idx,
-                points=pt_coords,
-                point_labels=pt_labels,
-                obj_id=instance.sam3_obj_id,
-            )
+            kw = dict(session_id=session_id, frame_idx=frame_idx,
+                      obj_id=instance.sam3_obj_id)
+            if raw_pts:
+                kw["points"] = torch.tensor(
+                    [[p["x"] / orig_width, p["y"] / orig_height] for p in raw_pts],
+                    dtype=torch.float32,
+                )
+                kw["point_labels"] = torch.tensor(
+                    [1 if p["is_positive"] else 0 for p in raw_pts],
+                    dtype=torch.int32,
+                )
+            if raw_boxes:
+                kw["bounding_boxes"] = torch.tensor(
+                    [[b["x1"] / orig_width, b["y1"] / orig_height,
+                      (b["x2"] - b["x1"]) / orig_width,
+                      (b["y2"] - b["y1"]) / orig_height]
+                     for b in raw_boxes],
+                    dtype=torch.float32,
+                )
+                kw["bounding_box_labels"] = torch.ones(len(raw_boxes), dtype=torch.int32)
+            print(f"Online refinement: adding {len(raw_pts)} pt(s) + {len(raw_boxes)} box(es) "
+                  f"at frame {frame_idx} for obj {instance.sam3_obj_id}")
+            sam3_model.add_prompt(**kw)
 
     # Inject mask-conditioning anchors (from absorb wizard) before propagation.
     _inject_mask_anchors(sam3_model, session_id, concept, project_dir)
+
+    # Remove absorbed sources from the session so their pixels are freed for the absorbing
+    # target.  Unlike truly-deleted instances (kept alive to block re-detection), absorbed
+    # sources competing via non-overlapping constraints actively prevent the absorbing
+    # instance from claiming the merged region.
+    live_obj_ids = {inst.sam3_obj_id for inst in concept.instances if not inst.deleted}
+    for inst in concept.instances:
+        if inst.deleted and getattr(inst, 'absorbed_source', False):
+            try:
+                sam3_model.remove_object(session_id=session_id, obj_id=inst.sam3_obj_id)
+                print(f"  Removed absorbed source obj_id={inst.sam3_obj_id} from live session.")
+            except Exception as e:
+                print(f"  Warning: could not remove absorbed source obj_id={inst.sam3_obj_id}: {e}")
 
     # Single propagation pass — non-overlapping applied across ALL instances simultaneously
     inst_names = [inst.user_name for inst, _ in instances_with_pending]
@@ -1672,8 +1731,7 @@ def online_replay_concept_refinements(
     output_dirs: dict = {}  # obj_id_int -> output_dir (cached per unique object)
     # In the live session, deleted instances' sub-states are still present (remove_object
     # is not called from the UI on delete to preserve undo).  Gate output so their masks
-    # are not written to disk.
-    live_obj_ids = {inst.sam3_obj_id for inst in concept.instances if not inst.deleted}
+    # are not written to disk.  (live_obj_ids already computed above.)
     try:
         for out in sam3_model.propagate_in_video(
             session_id=session_id,

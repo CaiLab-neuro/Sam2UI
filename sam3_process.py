@@ -1118,14 +1118,18 @@ def refine_project(args):
 
 
 def _refine_project_impl(args, project):
-    # Purge mask dirs for instances already marked deleted in project.json.
+    # Purge mask dirs for user-deleted instances (deleted=True, absorbed_source=False).
     # Handles the rsync case: annotation machine marks deletions in project.json,
     # processing machine syncs the JSON but still has the old mask files on disk.
+    # Absorbed sources are skipped here — their masks are deleted post-refinement by
+    # replay_concept_refinements once the absorb anchor has been propagated.
     _purge_count = 0
     for _concept in project.concepts:
         for _inst in _concept.instances:
             if not _inst.deleted:
                 continue
+            if getattr(_inst, 'absorbed_source', False):
+                continue  # kept until post-refinement cleanup
             _masks_dir = os.path.join(
                 project.project_dir, "concepts", _concept.name,
                 "instances", str(_inst.sam3_obj_id), "masks"
@@ -1148,14 +1152,6 @@ def _refine_project_impl(args, project):
         project.frames_dir = frame_dir
         project.save()
         print(f"Frame cache pinned to: {frame_dir}")
-
-    resource_path = project.get_frames_dir()
-    if not os.path.isdir(resource_path):
-        print(f"Extracting frames to {resource_path}...")
-        from sam3_utils import extract_frames_from_video
-        extract_frames_from_video(project.video_path, resource_path)
-    else:
-        print(f"Reusing existing frames in {resource_path}")
 
     # --- Pass 1: detect concepts flagged for full re-detection ----------------
     # The UI's "Reset & Re-detect" button writes a sentinel file
@@ -1200,6 +1196,14 @@ def _refine_project_impl(args, project):
     if not concepts_to_redetect and not concepts_to_refine:
         print("No pending annotations found. Add points in sam3_ui.py using 'Save for Batch'.")
         return 0
+
+    resource_path = project.get_frames_dir()
+    if not os.path.isdir(resource_path):
+        print(f"Extracting frames to {resource_path}...")
+        from sam3_utils import extract_frames_from_video
+        extract_frames_from_video(project.video_path, resource_path)
+    else:
+        print(f"Reusing existing frames in {resource_path}")
 
     if concepts_to_redetect:
         print(f"\nFound {len(concepts_to_redetect)} concept(s) flagged for full re-detection:")
@@ -1342,6 +1346,25 @@ def _refine_project_impl(args, project):
                 mask_format=project.mask_format,
                 cache_size=args.cache_size,
             )
+            # Refinement succeeded: absorbed sources have been incorporated into the
+            # target's anchor-based propagation and their original mask files have been
+            # deleted by the pipeline.  Remove them from project metadata now so their
+            # obj_ids are free to be reused without confusion on future redetections.
+            absorbed_ids_removed = set()
+            concept.instances = [
+                inst for inst in concept.instances
+                if not (inst.deleted and getattr(inst, 'absorbed_source', False))
+                or absorbed_ids_removed.add(inst.sam3_obj_id) or False
+            ]
+            if absorbed_ids_removed:
+                # Prune stale IDs from any target's absorbed_source_ids list
+                for inst in concept.instances:
+                    inst.absorbed_source_ids = [
+                        sid for sid in inst.absorbed_source_ids
+                        if sid not in absorbed_ids_removed
+                    ]
+                print(f"  Removed {len(absorbed_ids_removed)} absorbed source(s) from "
+                      f"project metadata: obj_ids {sorted(absorbed_ids_removed)}")
         except Exception as e:
             errors.append((cname, str(e)))
             print(f"  Error refining concept '{cname}': {e}")

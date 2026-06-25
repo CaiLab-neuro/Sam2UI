@@ -118,9 +118,19 @@ class SAM3Instance:
     # target's own first-period identity is pinned only the first time it gains an
     # absorbed instance — later absorbs into the same target don't repeat it.
     received_absorb_anchor: bool = False
+    # True when this instance was the SOURCE of an absorb operation (deleted=True AND
+    # absorbed_source=True).  The pipeline calls remove_object() for absorbed sources so
+    # their pixels are freed for the absorbing target.  Contrast with purely-deleted
+    # instances (deleted=True, absorbed_source=False) whose sub-states are kept alive to
+    # suppress re-detection of unwanted objects via non-overlapping constraints.
+    absorbed_source: bool = False
     # Frame indices in concepts/<name>/instances/<id>/mask_anchors/ that are used as
     # SAM3 mask-conditioning anchors (set via the absorb wizard or mask-removal undo).
     mask_anchor_frames: List[int] = field(default_factory=list)
+    # sam3_obj_ids of instances that were absorbed into this instance (via the absorb
+    # wizard).  Used to surface each component's original masks when a future instance
+    # is absorbed into this one, so the user can decide whether to union each separately.
+    absorbed_source_ids: List[int] = field(default_factory=list)
 
     def get_effective_color(self, concept_color: Tuple[int, int, int]) -> Tuple[int, int, int]:
         """Get instance color (override if set, otherwise use concept color)"""
@@ -145,7 +155,9 @@ class SAM3Instance:
             "presence_norm": self.presence_norm,
             "manually_added": self.manually_added,
             "received_absorb_anchor": self.received_absorb_anchor,
+            "absorbed_source": self.absorbed_source,
             "mask_anchor_frames": self.mask_anchor_frames,
+            "absorbed_source_ids": self.absorbed_source_ids,
         }
 
     @classmethod
@@ -169,7 +181,9 @@ class SAM3Instance:
             presence_norm=data.get("presence_norm", 0.0),
             manually_added=data.get("manually_added", False),
             received_absorb_anchor=data.get("received_absorb_anchor", False),
+            absorbed_source=data.get("absorbed_source", False),
             mask_anchor_frames=data.get("mask_anchor_frames", []),
+            absorbed_source_ids=data.get("absorbed_source_ids", []),
         )
 
 
@@ -243,6 +257,11 @@ class SAM3Project:
     mjpeg_video_path: Optional[str] = None  # Re-encoded MJPEG video if created
     frames_dir: Optional[str] = None        # Persistent extracted-frame directory (JPEGs)
     mask_format: str = "png"  # "png" or "npz" — applies to all mask saves in this project
+    # Alternative locations tried when the primary video/frames paths are unreachable.
+    # Populated automatically by the UI when the user manually locates a missing file.
+    # Stored as plain strings; paths from other OSes are skipped gracefully at load time.
+    alt_video_paths: List[str] = field(default_factory=list)
+    alt_frames_dirs: List[str] = field(default_factory=list)
     # path -> mtime at last load/save, for detecting external writes (e.g. a concurrent
     # `sam3_process.py --refine` run). Not persisted to project.json.
     _loaded_mtimes: Dict[str, float] = field(default_factory=dict, init=False, repr=False, compare=False)
@@ -313,6 +332,8 @@ class SAM3Project:
             "fps": self.fps,
             "mjpeg_video_path": self.mjpeg_video_path,
             "frames_dir": self.frames_dir,
+            "alt_video_paths": self.alt_video_paths,
+            "alt_frames_dirs": self.alt_frames_dirs,
             "concepts": [
                 {
                     "name": c.name,
@@ -384,6 +405,8 @@ class SAM3Project:
             fps=project_data.get("fps", 30.0),
             mjpeg_video_path=project_data.get("mjpeg_video_path"),
             frames_dir=project_data.get("frames_dir"),
+            alt_video_paths=project_data.get("alt_video_paths", []),
+            alt_frames_dirs=project_data.get("alt_frames_dirs", []),
             concept_order=project_data.get("concept_order", []),
             device=project_data.get("global_settings", {}).get("device", "cuda:0"),
             default_opacity=project_data.get("global_settings", {}).get("default_opacity", 0.5),

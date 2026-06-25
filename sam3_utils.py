@@ -594,7 +594,8 @@ class DynamicFrameCompositor:
 
     def get_composited_frame(self, frame_idx: int, alpha_multiplier: float = 1.0,
                              focus_concept_name: Optional[str] = None,
-                             target_hw: Optional[tuple] = None) -> np.ndarray:
+                             target_hw: Optional[tuple] = None,
+                             render_absorbed_for: Optional[str] = None) -> np.ndarray:
         """
         Composite a single frame with all visible concepts.
 
@@ -611,6 +612,10 @@ class DynamicFrameCompositor:
                 giving a ~6× speedup for 1600×1200 → 640×480.  Masks are also resized
                 (NEAREST) before blending.  The returned frame is at target_hw size so
                 the caller can skip a second PIL resize step.
+            render_absorbed_for: Concept name whose absorbed-source instances should also
+                be composited, using their absorbing target's color at reduced opacity.
+                Useful when showing the selected concept so the user can see the original
+                masks of absorbed instances (e.g. during the union-check dialog).
 
         Returns:
             Composited frame (RGB uint8) at target_hw size if given, else native size.
@@ -707,6 +712,49 @@ class DynamicFrameCompositor:
                 _t_blend += time.perf_counter() - _tb
 
         _t_loop_end = time.perf_counter()
+
+        # Absorbed-source ghost rendering: for the selected concept only, draw masks of
+        # instances that were absorbed into a target, using the target's color at 60% of
+        # normal opacity so they appear as a faint "ghost" overlay.  This lets the user
+        # see original mask boundaries during the union-check dialog and while annotating.
+        if render_absorbed_for is not None and alpha_multiplier > 0.0:
+            abs_concept = self.project.get_concept_by_name(render_absorbed_for)
+            if abs_concept and abs_concept.visible:
+                # Build reverse mapping: absorbed source obj_id -> absorbing target instance
+                src_to_target = {}
+                for inst in abs_concept.instances:
+                    if not inst.deleted and inst.absorbed_source_ids:
+                        for sid in inst.absorbed_source_ids:
+                            src_to_target[sid] = inst
+                for inst in abs_concept.instances:
+                    if not (inst.deleted and inst.absorbed_source):
+                        continue
+                    target_inst = src_to_target.get(inst.sam3_obj_id)
+                    if target_inst is None:
+                        continue
+                    abs_mask_dir = os.path.join(
+                        self.project.get_concept_dir(abs_concept.name),
+                        "instances", str(inst.sam3_obj_id), "masks",
+                    )
+                    mask = load_sam3_mask(abs_mask_dir, frame_idx)
+                    if mask is None:
+                        continue
+                    if mask.shape[0] != h or mask.shape[1] != w:
+                        mask = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
+                    self._last_masks[(abs_concept.name, inst.sam3_obj_id)] = mask
+                    color = np.array(
+                        target_inst.get_effective_color(abs_concept.color_rgb),
+                        dtype=np.float32,
+                    )
+                    # 60% of normal alpha so ghosts are visually distinct from active masks
+                    np.multiply(mask, 0.6 * alpha_multiplier / 255.0,
+                                out=self._s1, casting='unsafe')
+                    np.subtract(1.0, self._s1, out=self._s2)
+                    for c in range(3):
+                        overlay_rgb[:, :, c] *= self._s2
+                        np.multiply(self._s1, color[c], out=self._s3)
+                        overlay_rgb[:, :, c] += self._s3
+                    np.maximum(overlay_alpha, self._s1, out=overlay_alpha)
 
         # Final blend: frame_rgb = frame_rgb*(1-alpha) + overlay_rgb*alpha, zero (H,W,3) temps
         _tf = time.perf_counter()

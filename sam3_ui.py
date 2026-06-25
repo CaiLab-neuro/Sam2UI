@@ -63,6 +63,26 @@ from sam3_pipeline import (
 from sam3_utils import DynamicFrameCompositor, generate_concept_color, validate_text_prompt, export_to_sam2_format, load_sam3_mask
 
 
+# ── App-level settings (persisted across sessions, independent of any project) ─
+_APP_SETTINGS_PATH = Path.home() / ".sam3_ui_settings.json"
+
+
+def _load_app_settings() -> dict:
+    try:
+        if _APP_SETTINGS_PATH.exists():
+            return json.loads(_APP_SETTINGS_PATH.read_text())
+    except Exception:
+        pass
+    return {}
+
+
+def _save_app_settings(settings: dict) -> None:
+    try:
+        _APP_SETTINGS_PATH.write_text(json.dumps(settings, indent=2))
+    except Exception as e:
+        print(f"Warning: could not save app settings: {e}")
+
+
 class SAM3VideoUI:
     """Main UI application for SAM3 hierarchical video segmentation"""
 
@@ -95,12 +115,17 @@ class SAM3VideoUI:
         # All currently selected (concept, instance) pairs; may have more than one.
         self.selected_instances: List[tuple] = []  # [(SAM3Concept, SAM3Instance), ...]
         self.point_removal_mode = False
+        self.box_draw_mode = False          # left-click-drag draws a box instead of a point
         self.refinement_points: List[tuple] = []  # [(x, y, is_positive), ...]
+        self.refinement_boxes: List[tuple] = []   # [(x1, y1, x2, y2), ...] in display coords
+        self._box_draw_start = None         # (cx, cy) in display coords at drag start
+        self._box_draw_canvas_id = None     # canvas item id for live-drag preview rectangle
         self.undo_stack: List[dict] = []  # {'type': 'point'|'remove_point'|'delete_instance', ...}
         self.redo_stack: List[dict] = []
         # Absorb wizard state (None when no wizard is active)
         self._absorb_wizard: Optional[dict] = None
         self._wizard_pending_points: List[tuple] = []  # points placed in wizard point mode
+        self._wizard_pending_boxes: List[tuple] = []   # boxes drawn in wizard point/box mode
         # True when instance renames/deletes/adds are in memory but not yet written to JSON.
         # Flushed by save_points_for_batch, apply_refinement, and the explicit Save Project.
         self._metadata_dirty: bool = False
@@ -149,10 +174,13 @@ class SAM3VideoUI:
         # add/remove.  Survives frame navigation; written to disk by save_points_for_batch /
         # apply_refinement.
         self._points_cache: Dict[tuple, Dict[int, List[tuple]]] = {}
+        # Parallel box cache: same key structure, values are [(x1, y1, x2, y2), ...].
+        self._boxes_cache: Dict[tuple, Dict[int, List[tuple]]] = {}
         # All annotations including propagated=True — same structure as _points_cache.
         # Used for "Next/Prev Ann" navigation so already-applied annotations remain navigable.
         # Updated live alongside _points_cache on every add/remove/undo/redo.
         self._all_annotations_cache: Dict[tuple, Dict[int, List[tuple]]] = {}
+        self._all_boxes_cache: Dict[tuple, Dict[int, List[tuple]]] = {}
         # Tracks which instance keys have been modified since the last project load so that
         # save_points_for_batch can correctly overwrite (including clearing deleted points).
         self._dirty_keys: set = set()
@@ -177,6 +205,10 @@ class SAM3VideoUI:
 
         # Rate-limit perf diagnostics: print at most once every 2 seconds
         self._last_perf_print: float = 0.0
+
+        # App-level settings (last opened project dir, etc.)
+        _app = _load_app_settings()
+        self._last_project_dir: Optional[str] = _app.get("last_project_dir")
 
         # Suppress redundant display_frame() calls triggered by selection_set() inside
         # update_concept_tree() — the caller always calls display_frame() explicitly after.
@@ -242,6 +274,9 @@ class SAM3VideoUI:
                               command=self.export_concept_list)
         file_menu.add_command(label="Import Concept List...",
                               command=self.import_concept_list)
+        file_menu.add_separator()
+        file_menu.add_command(label="Manage Video Paths...",
+                              command=self.manage_paths_dialog)
         file_menu.add_separator()
         file_menu.add_command(label="Save Project",
                               command=self.save_project)
@@ -353,12 +388,22 @@ class SAM3VideoUI:
     def _setup_video_panel(self, parent):
         """Setup center panel with video display"""
 
+        # Project folder name bar (updated whenever a project is loaded)
+        self._project_folder_label = tk.Label(
+            parent, text="No project loaded",
+            font=("Arial", 8), fg='#888888', bg='#1e1e1e', anchor=tk.W,
+            padx=6, pady=1,
+        )
+        self._project_folder_label.pack(fill=tk.X, side=tk.TOP)
+
         # Canvas for video display
         self.canvas = tk.Canvas(parent, bg='black')
         self.canvas.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
-        # Bind click events for refinement (left=positive, right=negative)
+        # Bind click events for refinement (left=positive point or box drag, right=negative)
         self.canvas.bind('<Button-1>', self.on_canvas_click)
+        self.canvas.bind('<B1-Motion>', self._on_box_drag_motion)
+        self.canvas.bind('<ButtonRelease-1>', self._on_box_drag_end)
         self.canvas.bind('<Button-3>', self.on_canvas_right_click)
 
         # Redraw when canvas is resized so video fills the new size
@@ -585,8 +630,14 @@ class SAM3VideoUI:
         refine_frame = tk.LabelFrame(parent, text="Refinement", padx=10, pady=10)
         refine_frame.pack(fill=tk.X, padx=5, pady=5)
 
-        tk.Label(refine_frame, text="Left click: positive  |  Right click: negative",
-                 font=("Arial", 8), fg="gray").pack(anchor=tk.W, pady=(2, 4))
+        tk.Label(refine_frame, text="Left click: positive point  |  Right click: negative point",
+                 font=("Arial", 8), fg="gray").pack(anchor=tk.W, pady=(2, 0))
+        self.box_mode_btn = tk.Button(
+            refine_frame, text="Box Mode: OFF",
+            command=self._toggle_box_mode,
+            bg='#404040', fg='white', activebackground='#505050',
+        )
+        self.box_mode_btn.pack(fill=tk.X, pady=(2, 4))
 
         tk.Button(refine_frame, text="Clear Frame Annotations",
                  command=self.clear_frame_annotations).pack(fill=tk.X, pady=2)
@@ -615,7 +666,7 @@ class SAM3VideoUI:
         tk.Button(refine_frame, text="Flash Overlap (o)",
                  command=self.flash_overlap_regions).pack(fill=tk.X, pady=(1, 2))
 
-        self.points_label = tk.Label(refine_frame, text="Points: 0", anchor=tk.W)
+        self.points_label = tk.Label(refine_frame, text="Points: 0  Boxes: 0", anchor=tk.W)
         self.points_label.pack(fill=tk.X, pady=2)
 
         self.session_label = tk.Label(refine_frame, text="Session: none",
@@ -641,7 +692,8 @@ class SAM3VideoUI:
         alpha_row.pack(fill=tk.X, pady=(2, 0))
         tk.Label(alpha_row, text="Mask alpha:").pack(side=tk.LEFT)
         tk.Scale(alpha_row, variable=self.mask_alpha_var, from_=0.0, to=1.0,
-                 resolution=0.05, orient=tk.HORIZONTAL, length=120,
+                 resolution=0.05, orient=tk.HORIZONTAL, length=160, width=18,
+                 sliderlength=20, troughcolor='#444444', activebackground='#ffd700',
                  command=lambda _: self.display_frame()).pack(side=tk.LEFT)
 
     # ============================================================
@@ -765,19 +817,22 @@ class SAM3VideoUI:
         """Navigate to a specific frame, loading any saved annotations for that frame."""
         frame_idx = max(0, min(frame_idx, self.num_frames - 1))
         self.current_frame_idx = frame_idx
+        # frame_slider.set() fires on_slider_change synchronously, which calls
+        # _load_annotations_for_current_frame + display_frame — no need to repeat them.
         self.frame_slider.set(frame_idx)
-        self._load_annotations_for_current_frame()
-        self.display_frame()
 
     def _load_annotations_for_current_frame(self):
         """Load ALL cached annotations (including already-propagated) for the current
-        frame/instance into self.refinement_points. Does NOT touch the undo/redo stack."""
+        frame/instance into self.refinement_points/boxes. Does NOT touch the undo/redo stack."""
         self.refinement_points.clear()
+        self.refinement_boxes.clear()
         key = self._instance_key()
         if key:
-            cached = self._all_annotations_cache.get(key, {}).get(self.current_frame_idx, [])
-            self.refinement_points.extend(cached)
-        self.points_label.config(text=f"Points: {len(self.refinement_points)}")
+            cached_pts = self._all_annotations_cache.get(key, {}).get(self.current_frame_idx, [])
+            self.refinement_points.extend(cached_pts)
+            cached_boxes = self._all_boxes_cache.get(key, {}).get(self.current_frame_idx, [])
+            self.refinement_boxes.extend(cached_boxes)
+        self._update_ann_label()
 
     def jump_to_first_period(self):
         """Jump to the start of the first continuous detected period for this instance."""
@@ -1148,32 +1203,37 @@ class SAM3VideoUI:
             self._updating_tree = False
 
     def _update_points_cache(self):
-        """Sync self.refinement_points → _points_cache and _all_annotations_cache for the current frame/instance."""
+        """Sync refinement_points + refinement_boxes → caches for the current frame/instance."""
         key = self._instance_key()
         if key is None:
             return
         pts = list(self.refinement_points)
+        boxes = list(self.refinement_boxes)
+        # Points cache
         frame_dict = self._points_cache.setdefault(key, {})
-        if pts:
-            frame_dict[self.current_frame_idx] = pts
-        else:
-            # Tombstone: an empty list marks "user cleared this frame's points" so
-            # _flush_instance_cache_to_file drops the frame's historical entries.
-            # A plain pop would be indistinguishable from an untouched frame and
-            # the removed points would resurrect on the next --refine replay.
-            frame_dict[self.current_frame_idx] = []
+        frame_dict[self.current_frame_idx] = pts  # empty = tombstone
+        # Boxes cache
+        box_dict = self._boxes_cache.setdefault(key, {})
+        box_dict[self.current_frame_idx] = boxes  # empty = tombstone
+        # All-annotations caches (used for navigation; don't carry tombstones)
         all_dict = self._all_annotations_cache.setdefault(key, {})
         if pts:
             all_dict[self.current_frame_idx] = pts
         else:
             all_dict.pop(self.current_frame_idx, None)
+        all_box_dict = self._all_boxes_cache.setdefault(key, {})
+        if boxes:
+            all_box_dict[self.current_frame_idx] = boxes
+        else:
+            all_box_dict.pop(self.current_frame_idx, None)
         self._dirty_keys.add(key)
 
     def _load_points_cache_from_project(self):
-        """Populate _points_cache (pending only) and _all_annotations_cache (all entries)
-        from every instance's refinements.json in the project."""
+        """Populate point/box caches (pending only) and all-annotation caches from refinements.json."""
         self._points_cache.clear()
+        self._boxes_cache.clear()
         self._all_annotations_cache.clear()
+        self._all_boxes_cache.clear()
         self._dirty_keys.clear()
         if not self.project:
             return
@@ -1189,30 +1249,44 @@ class SAM3VideoUI:
                     continue
                 with open(rpath) as f:
                     entries = json.load(f).get("refinements", [])
-                pending_dict: Dict[int, List[tuple]] = {}
-                all_dict: Dict[int, List[tuple]] = {}
+                pending_pts: Dict[int, List[tuple]] = {}
+                pending_box: Dict[int, List[tuple]] = {}
+                all_pts: Dict[int, List[tuple]] = {}
+                all_box: Dict[int, List[tuple]] = {}
                 for entry in entries:
                     frame_idx = entry.get("frame_idx")
                     if frame_idx is None:
                         continue
                     pts = [(p["x"], p["y"], p["is_positive"])
                            for p in entry.get("points", [])]
-                    # All annotations (propagated or not) for navigation
+                    boxes = [(b["x1"], b["y1"], b["x2"], b["y2"])
+                             for b in entry.get("boxes", [])]
                     if pts:
-                        all_dict[frame_idx] = pts
+                        all_pts[frame_idx] = pts
                     else:
-                        all_dict.pop(frame_idx, None)
-                    # Pending only for display/save
+                        all_pts.pop(frame_idx, None)
+                    if boxes:
+                        all_box[frame_idx] = boxes
+                    else:
+                        all_box.pop(frame_idx, None)
                     if not entry.get("propagated", False):
                         if pts:
-                            pending_dict[frame_idx] = pts
+                            pending_pts[frame_idx] = pts
                         else:
-                            pending_dict.pop(frame_idx, None)
+                            pending_pts.pop(frame_idx, None)
+                        if boxes:
+                            pending_box[frame_idx] = boxes
+                        else:
+                            pending_box.pop(frame_idx, None)
                 key = (concept.name, inst.sam3_obj_id)
-                if pending_dict:
-                    self._points_cache[key] = pending_dict
-                if all_dict:
-                    self._all_annotations_cache[key] = all_dict
+                if pending_pts:
+                    self._points_cache[key] = pending_pts
+                if pending_box:
+                    self._boxes_cache[key] = pending_box
+                if all_pts:
+                    self._all_annotations_cache[key] = all_pts
+                if all_box:
+                    self._all_boxes_cache[key] = all_box
 
     def _on_canvas_configure(self, event):
         """Redraw video when the canvas is resized (debounced 80 ms to avoid per-pixel floods)."""
@@ -1341,14 +1415,14 @@ class SAM3VideoUI:
             # Fast path: only remove the old playhead items (background image unchanged)
             canvas.delete("playhead")
 
-        # Draw playhead (always): black shadow + white line + triangle, tagged "playhead"
+        # Draw playhead (always): black shadow + bright line + triangle, tagged "playhead"
         if f_start <= self.current_frame_idx <= f_end:
             cx = (self.current_frame_idx - f_start) / visible * w
-            canvas.create_line(cx + 1, 0, cx + 1, h, fill='black', width=2, tags="playhead")
-            canvas.create_line(cx, 0, cx, h, fill='white', width=2, tags="playhead")
-            ts = 4
-            canvas.create_polygon(cx - ts, 0, cx + ts, 0, cx, ts + 1,
-                                   fill='white', outline='black', width=1, tags="playhead")
+            canvas.create_line(cx + 1, 0, cx + 1, h, fill='black', width=4, tags="playhead")
+            canvas.create_line(cx, 0, cx, h, fill='#ffd700', width=3, tags="playhead")
+            ts = 7
+            canvas.create_polygon(cx - ts, 0, cx + ts, 0, cx, ts + 3,
+                                   fill='#ffd700', outline='black', width=1, tags="playhead")
 
         # Update quality colorbars (only the playhead position needs to move)
         self._draw_quality_colorbars()
@@ -1450,11 +1524,11 @@ class SAM3VideoUI:
             canvas.delete("qplayhead")
             if f_start <= self.current_frame_idx <= f_end:
                 cx = (self.current_frame_idx - f_start) / visible * w
-                canvas.create_line(cx + 1, 0, cx + 1, h, fill='black', width=3, tags="qplayhead")
-                canvas.create_line(cx, 0, cx, h, fill='#ffdd00', width=2, tags="qplayhead")
-                ts = 4
-                canvas.create_polygon(cx - ts, 0, cx + ts, 0, cx, ts + 2,
-                                      fill='#ffdd00', outline='black', width=1, tags="qplayhead")
+                canvas.create_line(cx + 1, 0, cx + 1, h, fill='black', width=4, tags="qplayhead")
+                canvas.create_line(cx, 0, cx, h, fill='#ffd700', width=3, tags="qplayhead")
+                ts = 6
+                canvas.create_polygon(cx - ts, 0, cx + ts, 0, cx, ts + 3,
+                                      fill='#ffd700', outline='black', width=1, tags="qplayhead")
 
         if self._quality_bars_dirty:
             _put_image(self.quality_overlap_canvas,
@@ -1496,10 +1570,15 @@ class SAM3VideoUI:
     def _create_compositor(self):
         """Create DynamicFrameCompositor for self.project.
 
-        If the stored video path is inaccessible, prompts the user to locate the
-        video file.  The chosen path is used only for this session — it is NOT
-        written back to project.json, so saving will never overwrite the original
-        stored path.
+        Search order when the stored paths are unreachable:
+          1. Stored video_path / mjpeg_video_path / frames_dir (handled inside compositor)
+          2. alt_video_paths list (tried automatically, verified by frame count)
+          3. alt_frames_dirs list (tried automatically, verified by frame count)
+          4. User prompt (chosen path added to alt list so it is found automatically next time)
+
+        The compositor is created with a temporarily patched project attribute when using
+        an alternative path; the patch is always reverted so save() never writes the
+        machine-local override back to project.json.
 
         Returns the compositor, or None if the user cancelled.
         """
@@ -1508,38 +1587,345 @@ class SAM3VideoUI:
         except ValueError as exc:
             if "Failed to open video" not in str(exc):
                 raise
-        # Video unavailable — ask the user to locate it
+
+        # Try stored alternative paths before prompting the user
+        comp = self._try_alt_paths_compositor()
+        if comp is not None:
+            return comp
+
+        # All automatic options exhausted — ask the user
         stored = self.project.video_path or "(unknown)"
         messagebox.showinfo(
             "Video Not Found",
             f"The video file could not be opened:\n\n{stored}\n\n"
-            "Please locate the video file to continue.",
+            "Please locate the video file or a frames directory to continue.",
         )
-        chosen = filedialog.askopenfilename(
-            title="Locate source video",
-            filetypes=[
-                ("Video files", "*.mp4 *.avi *.mov *.mkv *.webm *.m4v"),
-                ("All files", "*.*"),
-            ],
-        )
-        if not chosen:
-            return None
-        # Temporarily patch project.video_path for compositor init so the
-        # constructor can open the file — restored immediately after so that
-        # save() never persists the local override path.
-        _orig = self.project.video_path
-        self.project.video_path = chosen
+        return self._prompt_user_for_video()
+
+    # ── Alternative-path helpers ─────────────────────────────────────────────
+
+    def _try_alt_paths_compositor(self) -> Optional[DynamicFrameCompositor]:
+        """Try alt_video_paths then alt_frames_dirs; return compositor on first hit."""
+        for alt in list(getattr(self.project, 'alt_video_paths', [])):
+            comp = self._try_video_path(alt)
+            if comp is not None:
+                print(f"[VideoPath] Auto-found video at alt path: {alt}")
+                return comp
+        for alt in list(getattr(self.project, 'alt_frames_dirs', [])):
+            comp = self._try_frames_dir(alt)
+            if comp is not None:
+                print(f"[VideoPath] Auto-found frames at alt dir: {alt}")
+                return comp
+        return None
+
+    def _try_video_path(self, path: str) -> Optional[DynamicFrameCompositor]:
+        """Try to create a compositor using *path* as the video file.
+
+        Returns compositor on success, None on any failure.
+        Cross-platform: silently skips paths that do not exist on this OS.
+        """
         try:
-            return DynamicFrameCompositor(self.project)
-        finally:
-            self.project.video_path = _orig
+            p = Path(path)
+            if not p.is_file():
+                return None
+            if not self._verify_video_frame_count(str(p)):
+                return None
+            _orig = self.project.video_path
+            self.project.video_path = str(p)
+            try:
+                return DynamicFrameCompositor(self.project)
+            except Exception:
+                return None
+            finally:
+                self.project.video_path = _orig
+        except Exception:
+            return None
+
+    def _try_frames_dir(self, path: str) -> Optional[DynamicFrameCompositor]:
+        """Try to create a compositor using *path* as the frames directory.
+
+        Returns compositor on success, None on any failure.
+        """
+        try:
+            p = Path(path)
+            if not p.is_dir():
+                return None
+            if not self._verify_frames_dir_count(str(p)):
+                return None
+            _orig = self.project.frames_dir
+            self.project.frames_dir = str(p)
+            try:
+                return DynamicFrameCompositor(self.project)
+            except Exception:
+                return None
+            finally:
+                self.project.frames_dir = _orig
+        except Exception:
+            return None
+
+    def _verify_video_frame_count(self, video_path: str) -> bool:
+        """Return True if the video has roughly the expected number of frames (≤1% off)."""
+        try:
+            cap = cv2.VideoCapture(video_path)
+            if not cap.isOpened():
+                return False
+            count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            cap.release()
+            expected = self.project.num_frames
+            return abs(count - expected) <= max(2, int(expected * 0.01))
+        except Exception:
+            return False
+
+    def _verify_frames_dir_count(self, frames_dir: str) -> bool:
+        """Return True if the directory contains roughly the expected number of image files."""
+        try:
+            count = sum(
+                1 for f in os.listdir(frames_dir)
+                if f.lower().endswith(('.jpg', '.jpeg', '.png'))
+            )
+            expected = self.project.num_frames
+            return abs(count - expected) <= max(2, int(expected * 0.01))
+        except Exception:
+            return False
+
+    def _prompt_user_for_video(self) -> Optional[DynamicFrameCompositor]:
+        """Ask user to locate video file or frames directory.
+
+        On success, saves the chosen path to the project's alt list so future
+        loads find it automatically without prompting.
+        """
+        # Offer two options
+        choice = messagebox.askyesno(
+            "Locate Video",
+            "Would you like to locate a video file?\n\n"
+            "Click Yes to browse for a video file.\n"
+            "Click No to browse for a frames directory instead.",
+        )
+        if choice:  # Yes → video file
+            chosen = filedialog.askopenfilename(
+                title="Locate source video",
+                filetypes=[
+                    ("Video files", "*.mp4 *.avi *.mov *.mkv *.webm *.m4v"),
+                    ("All files", "*.*"),
+                ],
+            )
+            if not chosen:
+                return None
+            if not self._verify_video_frame_count(chosen):
+                if not messagebox.askyesno(
+                    "Frame Count Mismatch",
+                    f"This video's frame count does not match the project "
+                    f"({self.project.num_frames} frames expected).\n\n"
+                    "Use it anyway?",
+                ):
+                    return None
+            _orig = self.project.video_path
+            self.project.video_path = chosen
+            try:
+                comp = DynamicFrameCompositor(self.project)
+                self._add_alt_video_path(chosen)
+                return comp
+            except Exception as e:
+                messagebox.showerror("Error", f"Could not open video:\n{e}")
+                return None
+            finally:
+                self.project.video_path = _orig
+        else:  # No → frames directory
+            chosen = filedialog.askdirectory(title="Locate frames directory")
+            if not chosen:
+                return None
+            if not self._verify_frames_dir_count(chosen):
+                if not messagebox.askyesno(
+                    "Frame Count Mismatch",
+                    f"This directory's frame count does not match the project "
+                    f"({self.project.num_frames} frames expected).\n\n"
+                    "Use it anyway?",
+                ):
+                    return None
+            _orig = self.project.frames_dir
+            self.project.frames_dir = chosen
+            try:
+                comp = DynamicFrameCompositor(self.project)
+                self._add_alt_frames_dir(chosen)
+                return comp
+            except Exception as e:
+                messagebox.showerror("Error", f"Could not use frames directory:\n{e}")
+                return None
+            finally:
+                self.project.frames_dir = _orig
+
+    def _add_alt_video_path(self, path: str) -> None:
+        """Add *path* to project.alt_video_paths (dedup) and save."""
+        path = str(Path(path))  # normalise separators for this OS
+        if path not in self.project.alt_video_paths:
+            self.project.alt_video_paths.append(path)
+            self._safe_project_save()
+
+    def _add_alt_frames_dir(self, path: str) -> None:
+        """Add *path* to project.alt_frames_dirs (dedup) and save."""
+        path = str(Path(path))
+        if path not in self.project.alt_frames_dirs:
+            self.project.alt_frames_dirs.append(path)
+            self._safe_project_save()
+
+    # ── Last-project-dir helpers ─────────────────────────────────────────────
+
+    def _get_last_project_parent(self) -> Optional[str]:
+        """Return the parent directory of the last opened project, for initialdir."""
+        if self._last_project_dir:
+            try:
+                parent = str(Path(self._last_project_dir).parent)
+                if os.path.isdir(parent):
+                    return parent
+            except Exception:
+                pass
+        return None
+
+    def _remember_project_dir(self, project_dir: str) -> None:
+        """Persist *project_dir* as the last-opened project dir."""
+        try:
+            self._last_project_dir = str(Path(project_dir))
+            _app = _load_app_settings()
+            _app["last_project_dir"] = self._last_project_dir
+            _save_app_settings(_app)
+        except Exception as e:
+            print(f"Warning: could not persist last project dir: {e}")
+
+    # ── Project label helper ──────────────────────────────────────────────────
+
+    def _update_project_label(self) -> None:
+        """Refresh the project folder name shown above the canvas."""
+        if not hasattr(self, '_project_folder_label'):
+            return
+        if not self.project:
+            self._project_folder_label.config(text="No project loaded", fg='#888888')
+            return
+        path = self.project.project_dir
+        max_len = 70
+        if len(path) > max_len:
+            display = f"...{path[-(max_len - 3):]}"
+        else:
+            display = path
+        self._project_folder_label.config(
+            text=f"Project: {display}", fg='#cccccc'
+        )
+
+    # ── Manage paths dialog ───────────────────────────────────────────────────
+
+    def manage_paths_dialog(self) -> None:
+        """Show a dialog listing all video/frame paths and allowing deletions."""
+        if not self.project:
+            messagebox.showwarning("Warning", "No project loaded.")
+            return
+
+        top = tk.Toplevel(self.root)
+        top.title("Manage Video Paths")
+        top.geometry("700x480")
+        top.transient(self.root)
+        top.grab_set()
+
+        tk.Label(top, text="Video / Frame paths for this project",
+                 font=("Arial", 10, "bold")).pack(pady=(10, 4))
+        tk.Label(top,
+                 text="Alternative paths are tried automatically when the primary path is missing.",
+                 font=("Arial", 8), fg='#666666').pack()
+
+        frame = tk.Frame(top)
+        frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=8)
+
+        # Scrollable content
+        canvas = tk.Canvas(frame, bg='#f5f5f5')
+        sb = tk.Scrollbar(frame, orient=tk.VERTICAL, command=canvas.yview)
+        canvas.configure(yscrollcommand=sb.set)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        inner = tk.Frame(canvas, bg='#f5f5f5')
+        inner_id = canvas.create_window((0, 0), window=inner, anchor=tk.NW)
+
+        def _on_inner_resize(event):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+            canvas.itemconfig(inner_id, width=event.width)
+
+        inner.bind('<Configure>', _on_inner_resize)
+        canvas.bind('<Configure>', lambda e: canvas.itemconfig(inner_id, width=e.width))
+
+        def _section(label):
+            tk.Label(inner, text=label, font=("Arial", 9, "bold"),
+                     bg='#f5f5f5', anchor=tk.W).pack(fill=tk.X, padx=4, pady=(10, 2))
+
+        def _ro_row(text, tag="(primary)"):
+            row = tk.Frame(inner, bg='#f5f5f5')
+            row.pack(fill=tk.X, padx=4, pady=1)
+            tk.Label(row, text=tag, font=("Arial", 8), fg='#999999',
+                     bg='#f5f5f5', width=12, anchor=tk.E).pack(side=tk.LEFT)
+            tk.Label(row, text=text or "(none)", font=("Arial", 8),
+                     fg='#444444', bg='#e8e8e8', anchor=tk.W,
+                     relief=tk.SUNKEN, padx=4).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 0))
+
+        def _alt_list(path_list: list, remove_fn):
+            """Render a deletable list of alternative paths."""
+            if not path_list:
+                tk.Label(inner, text="  (none)", font=("Arial", 8),
+                         fg='#aaaaaa', bg='#f5f5f5').pack(anchor=tk.W, padx=16)
+                return
+            for i, p in enumerate(list(path_list)):
+                row = tk.Frame(inner, bg='#f5f5f5')
+                row.pack(fill=tk.X, padx=4, pady=1)
+                reachable = False
+                try:
+                    reachable = Path(p).exists()
+                except Exception:
+                    pass
+                color = '#335522' if reachable else '#aa3322'
+                status = "[found]" if reachable else "[missing]"
+                tk.Label(row, text=status, font=("Arial", 8), fg=color,
+                         bg='#f5f5f5', width=10, anchor=tk.E).pack(side=tk.LEFT)
+                tk.Label(row, text=p, font=("Arial", 8), fg='#444444',
+                         bg='#e8e8e8', anchor=tk.W, relief=tk.SUNKEN,
+                         padx=4).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 0))
+                idx_capture = i
+
+                def _del(idx=idx_capture, pl=path_list, fn=remove_fn):
+                    fn(idx)
+                    top.destroy()
+                    self.manage_paths_dialog()  # refresh
+
+                tk.Button(row, text="Remove", font=("Arial", 8),
+                          command=_del).pack(side=tk.RIGHT, padx=4)
+
+        _section("Primary video path")
+        _ro_row(self.project.video_path)
+
+        _section("MJPEG video path")
+        _ro_row(self.project.mjpeg_video_path)
+
+        _section("Primary frames directory")
+        _ro_row(self.project.frames_dir)
+
+        _section("Alternative video paths (tried in order)")
+        def _rm_video(idx):
+            self.project.alt_video_paths.pop(idx)
+            self._safe_project_save()
+
+        def _rm_frames(idx):
+            self.project.alt_frames_dirs.pop(idx)
+            self._safe_project_save()
+
+        _alt_list(self.project.alt_video_paths, _rm_video)
+
+        _section("Alternative frames directories (tried in order)")
+        _alt_list(self.project.alt_frames_dirs, _rm_frames)
+
+        tk.Button(top, text="Close", command=top.destroy).pack(pady=8)
 
     def load_video(self):
         """Load a video file and create new project"""
 
         video_path = filedialog.askopenfilename(
             title="Select Video File",
-            filetypes=[("Video files", "*.mp4 *.avi *.mov *.mkv"), ("All files", "*.*")]
+            filetypes=[("Video files", "*.mp4 *.avi *.mov *.mkv"), ("All files", "*.*")],
+            initialdir=self._get_last_project_parent(),
         )
 
         if not video_path:
@@ -1556,7 +1942,10 @@ class SAM3VideoUI:
             num_frames, dims, fps = get_video_info(video_path)
 
             # Ask for project directory
-            project_dir = filedialog.askdirectory(title="Select Project Directory")
+            project_dir = filedialog.askdirectory(
+                title="Select Project Directory",
+                initialdir=self._get_last_project_parent(),
+            )
             if not project_dir:
                 self.status_var.set("Video load cancelled.")
                 return
@@ -1574,6 +1963,9 @@ class SAM3VideoUI:
             # Save project
             self._safe_project_save()
 
+            # Persist last project dir for next file dialog
+            self._remember_project_dir(project_dir)
+
             # Setup video state
             self.video_path = video_path
             self.num_frames = num_frames
@@ -1588,6 +1980,7 @@ class SAM3VideoUI:
             self._load_points_cache_from_project()
 
             # Update UI
+            self._update_project_label()
             self.frame_slider.configure(to=num_frames - 1)
             self.selected_concept = None
             self.selected_instance = None
@@ -1609,7 +2002,10 @@ class SAM3VideoUI:
     def load_project(self):
         """Load existing SAM3 project"""
 
-        project_dir = filedialog.askdirectory(title="Select Project Directory")
+        project_dir = filedialog.askdirectory(
+            title="Select Project Directory",
+            initialdir=self._get_last_project_parent(),
+        )
         if not project_dir:
             return
 
@@ -1624,6 +2020,9 @@ class SAM3VideoUI:
             # Load project
             self.project = SAM3Project.load(project_dir)
             _tp1 = _time.perf_counter()
+
+            # Persist last project dir for next file dialog
+            self._remember_project_dir(project_dir)
 
             # Setup video state
             self.video_path = self.project.video_path
@@ -1651,6 +2050,7 @@ class SAM3VideoUI:
             self._load_quality_metrics(project_dir)
 
             # Update UI
+            self._update_project_label()
             self.frame_slider.configure(to=self.num_frames - 1)
             self.selected_concept = None
             self.selected_instance = None
@@ -1789,7 +2189,7 @@ class SAM3VideoUI:
         if not targets or not self.project:
             return frame_rgb
 
-        frame = frame_rgb.copy()
+        frame = None
         for concept, inst in targets:
             if not concept or not inst:
                 continue
@@ -1803,11 +2203,13 @@ class SAM3VideoUI:
                 mask = load_sam3_mask(_inst_mask_dir, self.current_frame_idx)
             if mask is None:
                 continue
+            if frame is None:
+                frame = frame_rgb.copy()
             binary = (mask > 127).astype(np.uint8)
             contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             cv2.drawContours(frame, contours, -1, (255, 255, 255), 3)
             cv2.drawContours(frame, contours, -1, (0, 0, 0), 1)
-        return frame
+        return frame if frame is not None else frame_rgb
 
     def _draw_instance_labels(self, frame_rgb: np.ndarray,
                               masks_cache: Optional[dict] = None) -> np.ndarray:
@@ -1898,10 +2300,9 @@ class SAM3VideoUI:
             else:
                 _focus_concept = None
 
-            # During playback only: downscale to canvas resolution before compositing so
-            # all numpy work (blend, cvtcolor, etc.) runs at ~6× fewer pixels.
-            # During annotation/scrubbing: always composite at native resolution so click
-            # coordinates and mask precision are unaffected.
+            # During playback: downscale to canvas resolution before compositing so all
+            # numpy work (blend, cvtcolor, etc.) runs at ~6× fewer pixels.
+            # During scrubbing: composite at native resolution for full visual quality.
             canvas_width = self.canvas.winfo_width()
             canvas_height = self.canvas.winfo_height()
             target_hw = None
@@ -1929,6 +2330,8 @@ class SAM3VideoUI:
                     alpha_multiplier=_alpha,
                     focus_concept_name=_focus_concept,
                     target_hw=target_hw,
+                    render_absorbed_for=(self.selected_concept.name
+                                        if self.selected_concept else None),
                 )
             masks_cache = self.compositor.get_last_masks()
 
@@ -1956,12 +2359,17 @@ class SAM3VideoUI:
                         binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                     cv2.drawContours(frame_rgb, contours, -1, (0, 220, 220), 2)
 
-                if wiz['mode'] == 'point' and self._wizard_pending_points:
+                if wiz['mode'] == 'point':
                     for wx, wy, wpos in self._wizard_pending_points:
                         wpx, wpy = int(wx * _scale_x), int(wy * _scale_y)
                         wcol = (0, 255, 0) if wpos else (255, 0, 0)
                         cv2.circle(frame_rgb, (wpx, wpy), 5, wcol, -1)
                         cv2.circle(frame_rgb, (wpx, wpy), 7, (255, 255, 255), 2)
+                    for bx1, by1, bx2, by2 in self._wizard_pending_boxes:
+                        cv2.rectangle(frame_rgb,
+                                      (int(bx1 * _scale_x), int(by1 * _scale_y)),
+                                      (int(bx2 * _scale_x), int(by2 * _scale_y)),
+                                      (0, 220, 220), 2)
 
             # Normal mode: draw orange anchor boundary if current frame is a mask anchor.
             elif (not _is_playing and self.selected_instance and self.selected_concept
@@ -1992,11 +2400,14 @@ class SAM3VideoUI:
 
             # Flash mask: white overlay on selected instance's mask region
             if self.flash_mask_in_progress and self.flash_mask_on and self.selected_instance and self.selected_concept:
-                _fmask_dir = os.path.join(
-                    self.project.project_dir, "concepts", self.selected_concept.name,
-                    "instances", str(self.selected_instance.sam3_obj_id), "masks",
-                )
-                m = load_sam3_mask(_fmask_dir, self.current_frame_idx)
+                _fmask_key = (self.selected_concept.name, self.selected_instance.sam3_obj_id)
+                m = masks_cache.get(_fmask_key)
+                if m is None:
+                    _fmask_dir = os.path.join(
+                        self.project.project_dir, "concepts", self.selected_concept.name,
+                        "instances", str(self.selected_instance.sam3_obj_id), "masks",
+                    )
+                    m = load_sam3_mask(_fmask_dir, self.current_frame_idx)
                 if m is not None:
                     fh, fw = frame_rgb.shape[:2]
                     if m.shape[0] != fh or m.shape[1] != fw:
@@ -2017,8 +2428,8 @@ class SAM3VideoUI:
                 red_overlay[overlap_mask] = [255, 60, 0]
                 frame_rgb = cv2.addWeighted(frame_rgb, 0.4, red_overlay, 0.6, 0)
 
-            # Draw saved/pending refinement points — scale from native video coords to frame size
-            if self.refinement_points:
+            # Draw saved/pending refinement points and boxes
+            if self.refinement_points or self.refinement_boxes:
                 frame_rgb = frame_rgb.copy()
                 flash_pts = self.flash_points_in_progress and self.flash_points_on
                 radius = 10 if flash_pts else 5
@@ -2030,6 +2441,15 @@ class SAM3VideoUI:
                         cv2.circle(frame_rgb, (px, py), halo + 3, (255, 255, 255), 3)
                     cv2.circle(frame_rgb, (px, py), radius, color, -1)
                     cv2.circle(frame_rgb, (px, py), halo, (255, 255, 255), 2)
+                for x1, y1, x2, y2 in self.refinement_boxes:
+                    cv2.rectangle(frame_rgb,
+                                  (int(x1 * _scale_x), int(y1 * _scale_y)),
+                                  (int(x2 * _scale_x), int(y2 * _scale_y)),
+                                  (0, 255, 100), 2)
+                    cv2.rectangle(frame_rgb,
+                                  (int(x1 * _scale_x) - 1, int(y1 * _scale_y) - 1),
+                                  (int(x2 * _scale_x) + 1, int(y2 * _scale_y) + 1),
+                                  (255, 255, 255), 1)
 
             # Wrap in PIL — compositor already returned at canvas size, no resize needed.
             # Fallback PIL resize only when canvas wasn't ready (target_hw is None).
@@ -2111,6 +2531,13 @@ class SAM3VideoUI:
         speed_factor = max(1, round(self.playback_speed.get()))
         delta *= speed_factor
         new_idx = max(0, min(self.current_frame_idx + delta, self.num_frames - 1))
+        # Clamp to wizard period when active so frame navigation stays within the period
+        if self._absorb_wizard:
+            wiz = self._absorb_wizard
+            period = (wiz['source_period'] if wiz['phase'] == 'source'
+                      else wiz.get('target_period'))
+            if period:
+                new_idx = max(period[0], min(period[1], new_idx))
         self.current_frame_idx = new_idx
         zoom = self.slider_zoom_level.get()
         if zoom > 1:
@@ -2119,9 +2546,9 @@ class SAM3VideoUI:
             if new_idx < slider_min or new_idx > slider_max:
                 window_size = max(1, slider_max - slider_min)
                 self._execute_zoom_jump(new_idx, window_size, self.num_frames)
+        # frame_slider.set() fires on_slider_change synchronously, which calls
+        # _load_annotations_for_current_frame + display_frame — no need to repeat them.
         self.frame_slider.set(new_idx)
-        self._load_annotations_for_current_frame()
-        self.display_frame()
 
     # ============================================================
     # Concept Tree Management
@@ -2653,7 +3080,7 @@ class SAM3VideoUI:
         self.selected_label.config(text="None")
         self.name_entry.delete(0, tk.END)
         self.refinement_points.clear()
-        self.points_label.config(text="Points: 0")
+        self.points_label.config(text="Points: 0  Boxes: 0")
 
         self.undo_stack.append({
             'type': 'reset_concept',
@@ -2690,70 +3117,25 @@ class SAM3VideoUI:
         self.root.wait_window(dialog.top)
 
     def _change_concept_prompt(self, concept, new_prompt: str):
-        """Apply a text-prompt change: update in memory, mark for re-detection, push undo."""
-        import copy
-
+        """Update the concept's text prompt in memory and save to disk."""
         old_prompt = concept.text_prompt
         if old_prompt == new_prompt:
             self.status_var.set("Prompt unchanged.")
             return
 
-        n_inst = len([i for i in concept.instances if not i.deleted])
-        confirm = messagebox.askyesno(
-            "Change Prompt & Re-detect",
-            f"Change prompt for concept '{concept.name}'?\n\n"
-            f"  Old: {old_prompt}\n"
-            f"  New: {new_prompt}\n\n"
-            f"This will (when you click 'Save Changes for Refinement'):\n"
-            f"  - Delete all {n_inst} instance(s) and their masks from disk\n"
-            f"  - Clear all annotation points for this concept\n"
-            f"  - Write a sentinel so --refine re-runs text detection\n\n"
-            f"Nothing is deleted yet. You can undo this with Ctrl+Z."
-        )
-        if not confirm:
-            return
-
-        self._release_session(concept.name)
-
-        snapshot_instances = copy.deepcopy(concept.instances)
-        snapshot_status = concept.status
-
-        # Update prompt and clear stale state in memory only
         concept.text_prompt = new_prompt
-        concept.instances = []
-        concept.status = ConceptStatus.PENDING
-        self._concepts_pending_reset.add(concept.name)
-
-        keys_to_drop = [k for k in list(self._points_cache) if k[0] == concept.name]
-        for k in keys_to_drop:
-            self._points_cache.pop(k, None)
-            self._all_annotations_cache.pop(k, None)
-            self._dirty_keys.discard(k)
-        self._invalidate_presence_cache()
-
-        self.selected_instance = None
-        self.selected_label.config(text="None")
-        self.name_entry.delete(0, tk.END)
-        self.refinement_points.clear()
-        self.points_label.config(text="Points: 0")
+        self.project.save()
 
         self.undo_stack.append({
             'type': 'change_prompt',
             'concept_name': concept.name,
             'old_prompt': old_prompt,
             'new_prompt': new_prompt,
-            'snapshot_instances': snapshot_instances,
-            'snapshot_status': snapshot_status,
         })
         self.redo_stack.clear()
 
         self.update_concept_tree()
-        self.compositor = DynamicFrameCompositor(self.project)
-        self.display_frame()
-        self._update_session_status()
-        self.status_var.set(
-            f"Prompt for '{concept.name}' changed. "
-            f"Click 'Save Changes for Refinement' to apply, or Ctrl+Z to undo.")
+        self.status_var.set(f"Prompt for '{concept.name}' updated to '{new_prompt}'.")
 
     # ============================================================
     # Instance Operations
@@ -3076,14 +3458,12 @@ class SAM3VideoUI:
             messagebox.showwarning("Warning", "Please select a concept first.")
             return
 
-        name = simpledialog.askstring(
-            "New Instance",
-            f"Name for the new instance in concept '{self.selected_concept.name}':",
-            parent=self.root
-        )
-        if not name or not name.strip():
+        vocab_names = self.vocabulary.get(self.selected_concept.name, [])
+        dlg = NewInstanceNameDialog(self.root, self.selected_concept.name, vocab_names)
+        self.root.wait_window(dlg.top)
+        if not dlg.result:
             return
-        name = name.strip()
+        name = dlg.result
 
         existing_ids = {inst.sam3_obj_id for inst in self.selected_concept.instances}
         new_id = max(existing_ids, default=-1) + 1
@@ -3099,9 +3479,24 @@ class SAM3VideoUI:
         self.selected_concept.instances.append(new_inst)
         self._metadata_dirty = True
 
-        # Select the new instance
-        self.selected_instance = new_inst
+        # Rebuild tree, then select the new instance (suppressing auto-jump so
+        # we stay on the current frame instead of jumping to first detected frame).
         self.update_concept_tree()
+        self._updating_tree = True
+        try:
+            for concept_item in self.concept_tree.get_children():
+                for inst_item in self.concept_tree.get_children(concept_item):
+                    tags = self.concept_tree.item(inst_item, 'tags')
+                    if (tags and len(tags) >= 3 and tags[0] == 'instance' and
+                            tags[1] == self.selected_concept.name and
+                            int(tags[2]) == new_id):
+                        self.concept_tree.selection_set(inst_item)
+                        self.concept_tree.see(inst_item)
+                        break
+        finally:
+            self._updating_tree = False
+        # Ensure Python state reflects the new instance regardless of tree events.
+        self.selected_instance = new_inst
         self._load_annotations_for_current_frame()
         self._update_presence_bar()
         self.display_frame()
@@ -3270,6 +3665,7 @@ class SAM3VideoUI:
             'original_instance': self.selected_instance,
         }
         self._wizard_pending_points = []
+        self._wizard_pending_boxes = []
         self._wizard_enter_phase('source', src_best)
 
     def _wizard_enter_phase(self, phase: str, jump_to: int):
@@ -3278,6 +3674,8 @@ class SAM3VideoUI:
         wiz['phase'] = phase
         wiz['mode'] = 'confirm'
         self._wizard_pending_points = []
+        self._wizard_pending_boxes = []
+        self._wizard_pending_boxes = []
 
         if phase == 'source':
             inst = wiz['source']
@@ -3329,19 +3727,36 @@ class SAM3VideoUI:
         else:
             self._wiz_confirm_btn.config(state=tk.DISABLED)
             self._wiz_point_btn.config(state=tk.DISABLED)
-            has_pts = bool(self._wizard_pending_points)
-            self._wiz_confirm_pts_btn.config(state=tk.NORMAL if has_pts else tk.DISABLED)
+            has_ann = bool(self._wizard_pending_points) or bool(self._wizard_pending_boxes)
+            self._wiz_confirm_pts_btn.config(state=tk.NORMAL if has_ann else tk.DISABLED)
             self._wiz_back_btn.config(state=tk.NORMAL)
 
     def _wizard_confirm_mask(self):
-        """User accepted the current frame's mask as conditioning anchor."""
+        """User accepted the current frame's mask as conditioning anchor.
+
+        For the source phase: immediately check whether the target or any
+        instance previously absorbed into it has a mask at this same frame.
+        If so, show a per-component union dialog before advancing.  The user
+        can choose to union any subset, switch to point+box mode (which also
+        discards the mask just accepted), or skip the union and keep the mask
+        as-is.
+        """
         wiz = self._absorb_wizard
         if wiz is None:
             return
-        wiz[f"{wiz['phase']}_result"] = {
-            'type': 'mask',
-            'frame_idx': self.current_frame_idx,
-        }
+        frame_idx = self.current_frame_idx
+
+        if wiz['phase'] == 'source':
+            extra_mask, use_annot = self._wizard_check_union_at_frame(wiz, frame_idx)
+            if use_annot:
+                # User wants to annotate instead — discard the accepted mask and
+                # enter point+box mode so they can place their own prompts.
+                self._wizard_switch_to_point_mode()
+                return
+            wiz['source_result'] = {'type': 'mask', 'frame_idx': frame_idx}
+            wiz['source_extra_union_mask'] = extra_mask
+        else:
+            wiz[f"{wiz['phase']}_result"] = {'type': 'mask', 'frame_idx': frame_idx}
         self._wizard_advance()
 
     def _wizard_switch_to_point_mode(self):
@@ -3351,6 +3766,7 @@ class SAM3VideoUI:
             return
         wiz['mode'] = 'point'
         self._wizard_pending_points = []
+        self._wizard_pending_boxes = []
         self._wizard_update_action_buttons()
         self.status_var.set(
             "Point mode: left-click positive, right-click negative. "
@@ -3365,21 +3781,23 @@ class SAM3VideoUI:
             return
         wiz['mode'] = 'confirm'
         self._wizard_pending_points = []
+        self._wizard_pending_boxes = []
         self._wizard_update_action_buttons()
         self.display_frame()
 
     def _wizard_confirm_points(self):
-        """User confirmed their manually-placed points for this phase."""
+        """User confirmed their manually-placed points/boxes for this phase."""
         wiz = self._absorb_wizard
         if wiz is None:
             return
-        if not self._wizard_pending_points:
-            messagebox.showwarning("No points", "Place at least one point first.")
+        if not self._wizard_pending_points and not self._wizard_pending_boxes:
+            messagebox.showwarning("No annotation", "Place at least one point or draw a box first.")
             return
         wiz[f"{wiz['phase']}_result"] = {
             'type': 'points',
             'frame_idx': self.current_frame_idx,
             'points': list(self._wizard_pending_points),
+            'boxes': list(self._wizard_pending_boxes),
         }
         self._wizard_advance()
 
@@ -3405,9 +3823,126 @@ class SAM3VideoUI:
         self._mark_presence_dirty()
         self._update_presence_bar()
 
+    def _wizard_check_union_at_frame(self, wiz, frame_idx):
+        """Check if the target (or any instance it absorbed) has masks at frame_idx.
+
+        Components checked:
+          1. Target's own detection masks (from its masks/ dir).
+          2. Each instance previously absorbed into the target (absorbed_source_ids),
+             using their original masks/ dir — so each prior absorb is shown separately.
+
+        If any components are found, shows a per-component dialog (with the current
+        frame already visible behind it) offering three choices:
+          - "Use as union": pixel-wise OR of source mask + checked components.
+          - "Point/box mode": discard the accepted mask, enter point+box annotation
+            mode so the user can place their own prompts from scratch.
+          - "Skip union": keep only the source mask, ignore all components.
+
+        Returns:
+            (extra_union_mask, use_annotation_mode)
+            extra_union_mask : numpy uint8 array or None
+            use_annotation_mode : bool — if True, caller should switch to point/box mode
+        """
+        import numpy as np
+        concept = wiz['concept']
+        target = wiz['target']
+        source = wiz['source']
+
+        components = []   # list of (label: str, mask: np.ndarray)
+
+        # Target's own original detection mask at frame_idx
+        tgt_mask_dir = os.path.join(
+            self.project.project_dir, "concepts", concept.name,
+            "instances", str(target.sam3_obj_id), "masks"
+        )
+        m = load_sam3_mask(tgt_mask_dir, frame_idx)
+        if m is not None and int((m > 127).sum()) > 0:
+            components.append(
+                (f"'{target.user_name}' own detection (obj {target.sam3_obj_id})", m)
+            )
+
+        # Each instance previously absorbed into the target — original masks
+        for src_id in target.absorbed_source_ids:
+            if src_id == source.sam3_obj_id:
+                continue
+            src_inst = concept.get_instance_by_sam3_id(src_id)
+            label = (f"'{src_inst.user_name}'" if src_inst else f"obj {src_id}")
+            src_mask_dir = os.path.join(
+                self.project.project_dir, "concepts", concept.name,
+                "instances", str(src_id), "masks"
+            )
+            m = load_sam3_mask(src_mask_dir, frame_idx)
+            if m is not None and int((m > 127).sum()) > 0:
+                components.append(
+                    (f"{label} original mask (prev. absorbed, obj {src_id})", m)
+                )
+
+        if not components:
+            return None, False
+
+        result = {'extra': None, 'use_annot': False}
+        dlg = tk.Toplevel(self.root)
+        dlg.title(f"Target overlap at frame {frame_idx}")
+        dlg.transient(self.root)
+        dlg.grab_set()
+        dlg.resizable(False, False)
+
+        tk.Label(
+            dlg,
+            text=(f"At frame {frame_idx}, '{target.user_name}' (or instances\n"
+                  f"previously absorbed into it) also have masks.\n\n"
+                  f"'{source.user_name}' is being absorbed into '{target.user_name}'.\n"
+                  f"Select which component masks to include in the anchor\n"
+                  f"(pixel-wise union with '{source.user_name}' mask):"),
+            justify=tk.LEFT,
+        ).pack(padx=12, pady=(12, 4), anchor=tk.W)
+
+        check_vars = []
+        for label, m in components:
+            v = tk.BooleanVar(value=True)
+            check_vars.append((v, m))
+            tk.Checkbutton(dlg, text=label, variable=v).pack(anchor=tk.W, padx=24)
+
+        tk.Label(
+            dlg,
+            text=("Tip: if the masks are not clean enough to union properly,\n"
+                  "use 'Point/box mode' to place your own prompts and discard\n"
+                  "the mask you just accepted."),
+            fg="#aaaaaa", justify=tk.LEFT, font=("Arial", 8),
+        ).pack(padx=12, pady=(8, 2), anchor=tk.W)
+
+        def on_union():
+            extra = None
+            for v, m in check_vars:
+                if v.get():
+                    binary = (m > 127).astype(np.uint8) * 255
+                    extra = binary if extra is None else np.maximum(extra, binary)
+            result['extra'] = extra
+            dlg.destroy()
+
+        def on_annot():
+            result['use_annot'] = True
+            dlg.destroy()
+
+        def on_skip():
+            dlg.destroy()
+
+        btn_row = tk.Frame(dlg)
+        btn_row.pack(pady=10)
+        tk.Button(btn_row, text="Use as union", command=on_union,
+                  width=14).pack(side=tk.LEFT, padx=4)
+        tk.Button(btn_row, text="Point/box mode", command=on_annot,
+                  width=14).pack(side=tk.LEFT, padx=4)
+        tk.Button(btn_row, text="Skip union", command=on_skip,
+                  width=12).pack(side=tk.LEFT, padx=4)
+
+        self.root.wait_window(dlg)
+        return result['extra'], result['use_annot']
+
     def _complete_absorb_wizard(self):
         """Stage all confirmed anchors, mark source deleted, push undo entry."""
         import shutil as _shutil
+        import numpy as np
         wiz = self._absorb_wizard
         if wiz is None:
             return
@@ -3418,6 +3953,12 @@ class SAM3VideoUI:
         copied_paths: List[str] = []
         staged_point_entries: List[dict] = []
         target_anchor_was_new = wiz['target_period'] is not None
+
+        # Union mask collected during source-phase confirmation (already decided by user).
+        extra_union_mask = wiz.get('source_extra_union_mask')
+        union_frame = (wiz['source_result']['frame_idx']
+                       if wiz['source_result'] and wiz['source_result']['type'] == 'mask'
+                       else None)
 
         def _apply_result(result, src_inst, label_tag: str):
             """Copy mask or stage points for the TARGET instance."""
@@ -3436,10 +3977,21 @@ class SAM3VideoUI:
                         f"'{src_inst.user_name}'. Skipping mask anchor."
                     )
                     return
+                # Union with user-selected extra masks (only for the source anchor at the
+                # confirmed frame).  For the target phase writing at the same frame, union
+                # with whatever was already written so neither overwrites the other.
+                if label_tag == "auto_absorb_positive" and extra_union_mask is not None and frame_idx == union_frame:
+                    mask_np = np.maximum(mask_np.astype(np.uint8), extra_union_mask)
                 dst_dir = Path(self.project.project_dir) / "concepts" / concept.name / \
                           "instances" / str(target.sam3_obj_id) / "mask_anchors"
                 dst_dir.mkdir(parents=True, exist_ok=True)
                 dst_path = dst_dir / f"{frame_idx:06d}.png"
+                # If anchor file already exists at this frame (e.g. source phase already
+                # wrote a union mask here), union rather than overwrite.
+                if dst_path.exists():
+                    existing = cv2.imread(str(dst_path), cv2.IMREAD_GRAYSCALE)
+                    if existing is not None and existing.shape == mask_np.shape:
+                        mask_np = np.maximum(mask_np.astype(np.uint8), existing.astype(np.uint8))
                 cv2.imwrite(str(dst_path), mask_np)
                 if frame_idx not in target.mask_anchor_frames:
                     target.mask_anchor_frames.append(frame_idx)
@@ -3468,7 +4020,8 @@ class SAM3VideoUI:
             elif result['type'] == 'points':
                 from datetime import datetime as _dt
                 frame_idx = result['frame_idx']
-                pts = result['points']
+                pts = result.get('points', [])
+                boxes = result.get('boxes', [])
                 entry = {
                     "timestamp": _dt.now().isoformat(),
                     "frame_idx": frame_idx,
@@ -3476,6 +4029,9 @@ class SAM3VideoUI:
                     "propagated": False,
                     label_tag: True,
                 }
+                if boxes:
+                    entry["boxes"] = [{"x1": x1, "y1": y1, "x2": x2, "y2": y2}
+                                      for x1, y1, x2, y2 in boxes]
                 self._stage_anchors_to_cache(concept, target, [entry])
                 staged_point_entries.append(entry)
 
@@ -3484,8 +4040,14 @@ class SAM3VideoUI:
             _apply_result(wiz['target_result'], target, "auto_absorb_self_anchor")
 
         source.deleted = True
+        source.absorbed_source = True
         source.visible = False
         target.received_absorb_anchor = True
+        # Record the source's ID on the target so future absorbs into the same
+        # target can surface each historical component's original masks for
+        # individual union decisions.
+        if source.sam3_obj_id not in target.absorbed_source_ids:
+            target.absorbed_source_ids.append(source.sam3_obj_id)
 
         self.undo_stack.append({
             'type': 'absorb_wizard',
@@ -3533,6 +4095,7 @@ class SAM3VideoUI:
                 self.selected_instance = orig_i
             self._absorb_wizard = None
         self._wizard_pending_points = []
+        self._wizard_pending_boxes = []
         if self._wizard_banner.winfo_ismapped():
             self._wizard_banner.pack_forget()
         self._load_annotations_for_current_frame()
@@ -3714,10 +4277,31 @@ class SAM3VideoUI:
                                 'frame_idx': self.current_frame_idx})
         self.redo_stack.clear()
         self._update_points_cache()
-        self.points_label.config(text=f"Points: {len(self.refinement_points)}")
+        self._update_ann_label()
         self.display_frame()
         self.status_var.set(f"Removed point at ({removed[0]:.0f}, {removed[1]:.0f}). Ctrl+Z to undo.")
         return True
+
+    def _wizard_remove_pending_point(self, x: float, y: float):
+        """Remove the closest pending wizard point within 20px of (x, y). Ctrl+Z also works."""
+        if not self._wizard_pending_points:
+            self.status_var.set("No wizard points to remove.")
+            return
+        min_dist = float('inf')
+        closest_idx = None
+        for i, (px, py, _) in enumerate(self._wizard_pending_points):
+            dist = ((x - px) ** 2 + (y - py) ** 2) ** 0.5
+            if dist < min_dist:
+                min_dist = dist
+                closest_idx = i
+        if closest_idx is None or min_dist > 20:
+            self.status_var.set("No wizard point nearby to remove.")
+            return
+        removed = self._wizard_pending_points.pop(closest_idx)
+        self._wizard_update_action_buttons()
+        self.display_frame()
+        kind = "positive" if removed[2] else "negative"
+        self.status_var.set(f"Removed {kind} wizard point at ({removed[0]:.0f}, {removed[1]:.0f}). Ctrl+Z to undo.")
 
     def _canvas_to_image_coords(self, event_x: int, event_y: int):
         """Convert canvas pixel coordinates to image pixel coordinates. Returns (x, y) or None."""
@@ -3742,11 +4326,79 @@ class SAM3VideoUI:
         y = max(0, min(y, img_height - 1))
         return x, y
 
+    def _toggle_box_mode(self):
+        self.box_draw_mode = not self.box_draw_mode
+        if self.box_draw_mode:
+            self.box_mode_btn.config(text="Box Mode: ON", bg='#2a6a2a')
+        else:
+            self.box_mode_btn.config(text="Box Mode: OFF", bg='#404040')
+            self._box_draw_start = None
+            if self._box_draw_canvas_id:
+                self.canvas.delete(self._box_draw_canvas_id)
+                self._box_draw_canvas_id = None
+
+    def _on_box_drag_motion(self, event):
+        """Update live-drag rectangle preview when in box mode."""
+        if not self._box_draw_start:
+            return
+        x0c, y0c = self._box_draw_start
+        if self._box_draw_canvas_id:
+            self.canvas.delete(self._box_draw_canvas_id)
+        self._box_draw_canvas_id = self.canvas.create_rectangle(
+            x0c, y0c, event.x, event.y,
+            outline='yellow', width=2, dash=(4, 2),
+        )
+
+    def _on_box_drag_end(self, event):
+        """Finish a box drag: convert to image coords and store."""
+        if not self._box_draw_start:
+            return
+        x0c, y0c = self._box_draw_start
+        self._box_draw_start = None
+        if self._box_draw_canvas_id:
+            self.canvas.delete(self._box_draw_canvas_id)
+            self._box_draw_canvas_id = None
+
+        # Require a minimum drag distance to distinguish from a plain click
+        if abs(event.x - x0c) < 5 or abs(event.y - y0c) < 5:
+            return
+
+        c0 = self._canvas_to_image_coords(x0c, y0c)
+        c1 = self._canvas_to_image_coords(event.x, event.y)
+        if c0 is None or c1 is None:
+            return
+        x1, y1 = min(c0[0], c1[0]), min(c0[1], c1[1])
+        x2, y2 = max(c0[0], c1[0]), max(c0[1], c1[1])
+        box = (x1, y1, x2, y2)
+
+        in_wizard = self._absorb_wizard and self._absorb_wizard['mode'] == 'point'
+        if in_wizard:
+            self._wizard_pending_boxes.append(box)
+            self._wizard_update_action_buttons()
+            self.display_frame()
+            return
+
+        self.refinement_boxes.append(box)
+        self.undo_stack.append({'type': 'box', 'box': box,
+                                'concept_name': self.selected_concept.name,
+                                'obj_id': self.selected_instance.sam3_obj_id,
+                                'frame_idx': self.current_frame_idx})
+        self.redo_stack.clear()
+        self._update_points_cache()
+        self._update_ann_label()
+        self.display_frame()
+
     def on_canvas_click(self, event):
-        """Handle canvas click for refinement (add positive point, or remove if in removal mode)"""
+        """Handle canvas click for refinement (add positive point, or start box drag)."""
 
         if not self.selected_instance:
             return
+
+        # In box mode: record drag start; the actual box is committed on ButtonRelease.
+        if self.box_draw_mode or (self._absorb_wizard and self._absorb_wizard['mode'] == 'point' and self.box_draw_mode):
+            if not self.point_removal_mode:
+                self._box_draw_start = (event.x, event.y)
+                return
 
         coords = self._canvas_to_image_coords(event.x, event.y)
         if coords is None:
@@ -3754,9 +4406,12 @@ class SAM3VideoUI:
         x, y = coords
 
         if self._absorb_wizard and self._absorb_wizard['mode'] == 'point':
-            self._wizard_pending_points.append((x, y, True))
-            self._wizard_update_action_buttons()
-            self.display_frame()
+            if self.point_removal_mode:
+                self._wizard_remove_pending_point(x, y)
+            else:
+                self._wizard_pending_points.append((x, y, True))
+                self._wizard_update_action_buttons()
+                self.display_frame()
             return
 
         if self.point_removal_mode:
@@ -3764,7 +4419,7 @@ class SAM3VideoUI:
                 self.remove_mask_anchor_at_location(x, y)
             return
 
-        # Add positive point (left click)
+        # Add positive point (left click in point mode)
         pt = (x, y, True)
         self.refinement_points.append(pt)
         self.undo_stack.append({'type': 'point', 'point': pt,
@@ -3773,9 +4428,7 @@ class SAM3VideoUI:
                                 'frame_idx': self.current_frame_idx})
         self.redo_stack.clear()
         self._update_points_cache()
-
-        # Update display
-        self.points_label.config(text=f"Points: {len(self.refinement_points)}")
+        self._update_ann_label()
         self.display_frame()
 
     def on_canvas_right_click(self, event):
@@ -3789,9 +4442,12 @@ class SAM3VideoUI:
         x, y = coords
 
         if self._absorb_wizard and self._absorb_wizard['mode'] == 'point':
-            self._wizard_pending_points.append((x, y, False))
-            self._wizard_update_action_buttons()
-            self.display_frame()
+            if self.point_removal_mode:
+                self._wizard_remove_pending_point(x, y)
+            else:
+                self._wizard_pending_points.append((x, y, False))
+                self._wizard_update_action_buttons()
+                self.display_frame()
             return
 
         if self.point_removal_mode:
@@ -3807,8 +4463,14 @@ class SAM3VideoUI:
                                 'frame_idx': self.current_frame_idx})
         self.redo_stack.clear()
         self._update_points_cache()
-        self.points_label.config(text=f"Points: {len(self.refinement_points)}")
+        self._update_ann_label()
         self.display_frame()
+
+    def _update_ann_label(self):
+        """Refresh the points/boxes count label."""
+        n_pts = len(self.refinement_points)
+        n_box = len(self.refinement_boxes)
+        self.points_label.config(text=f"Points: {n_pts}  Boxes: {n_box}")
 
     # clear_refinement_points removed — duplicate of clear_frame_annotations.
     # The "Clear Unsaved Points" button has been removed; use Ctrl+Z to undo
@@ -3833,6 +4495,16 @@ class SAM3VideoUI:
 
     def undo_action(self, event=None):
         """Undo the last undoable action (Ctrl+Z). Navigates to the action's frame."""
+        if self._absorb_wizard and self._absorb_wizard['mode'] == 'point':
+            if self._wizard_pending_points:
+                removed = self._wizard_pending_points.pop()
+                self._wizard_update_action_buttons()
+                self.display_frame()
+                kind = "positive" if removed[2] else "negative"
+                self.status_var.set(f"Undid {kind} wizard point at ({removed[0]:.0f}, {removed[1]:.0f}).")
+            else:
+                self.status_var.set("No wizard points to undo.")
+            return
         if not self.undo_stack:
             return
         action = self.undo_stack.pop()
@@ -3852,10 +4524,25 @@ class SAM3VideoUI:
             except (ValueError, TypeError):
                 pass
             self._update_points_cache()
-            self.points_label.config(text=f"Points: {len(self.refinement_points)}")
+            self._update_ann_label()
             self.display_frame()
             kind = "positive" if pt[2] else "negative"
             self.status_var.set(f"Undid {kind} point at frame {action.get('frame_idx', '?')}.")
+
+        elif t == 'box':
+            if not self._apply_point_action_context(action):
+                self.status_var.set("Cannot undo: instance no longer exists.")
+                return
+            box = action['box']
+            try:
+                idx = max(i for i, b in enumerate(self.refinement_boxes) if b == box)
+                self.refinement_boxes.pop(idx)
+            except (ValueError, TypeError):
+                pass
+            self._update_points_cache()
+            self._update_ann_label()
+            self.display_frame()
+            self.status_var.set(f"Undid box at frame {action.get('frame_idx', '?')}.")
 
         elif t == 'remove_point':
             if not self._apply_point_action_context(action):
@@ -3864,7 +4551,7 @@ class SAM3VideoUI:
             idx = min(action['index'], len(self.refinement_points))
             self.refinement_points.insert(idx, action['point'])
             self._update_points_cache()
-            self.points_label.config(text=f"Points: {len(self.refinement_points)}")
+            self._update_ann_label()
             self.display_frame()
             self.status_var.set(f"Restored removed point at frame {action.get('frame_idx', '?')}.")
 
@@ -3873,6 +4560,7 @@ class SAM3VideoUI:
                 self.status_var.set("Cannot undo: instance no longer exists.")
                 return
             self.refinement_points.extend(action['points'])
+            self.refinement_boxes.extend(action.get('boxes', []))
             self._update_points_cache()
             # Restore mask anchor if one was removed.
             if action.get('anchor_data') is not None:
@@ -3885,9 +4573,11 @@ class SAM3VideoUI:
                     inst.mask_anchor_frames.append(frame_idx)
                     inst.mask_anchor_frames.sort()
                 self._metadata_dirty = True
-            self.points_label.config(text=f"Points: {len(self.refinement_points)}")
+            self._update_ann_label()
             self.display_frame()
-            self.status_var.set(f"Restored {len(action['points'])} point(s) at frame "
+            n_pts = len(action['points'])
+            n_box = len(action.get('boxes', []))
+            self.status_var.set(f"Restored {n_pts} point(s) and {n_box} box(es) at frame "
                                 f"{action.get('frame_idx', '?')}.")
 
         elif t == 'clear_all_instance':
@@ -3909,7 +4599,7 @@ class SAM3VideoUI:
                     and self.selected_instance.sam3_obj_id == action['obj_id']):
                 self.refinement_points.clear()
                 self.refinement_points.extend(action['current_pts_snap'])
-            self.points_label.config(text=f"Points: {len(self.refinement_points)}")
+            self._update_ann_label()
             self.display_frame()
             self.status_var.set(
                 f"Undid clear-all: restored annotations for instance (obj {action['obj_id']}).")
@@ -3926,6 +4616,7 @@ class SAM3VideoUI:
 
         elif t == 'absorb_instance':
             action['source'].deleted = False
+            action['source'].absorbed_source = False
             action['source'].visible = True
             self._unstage_anchors_from_cache(
                 action['concept'], action['target'], action['pos_entries'])
@@ -3941,7 +4632,12 @@ class SAM3VideoUI:
 
         elif t == 'absorb_wizard':
             action['source'].deleted = False
+            action['source'].absorbed_source = False
             action['source'].visible = True
+            # Remove from target's absorbed history
+            src_id = action['source'].sam3_obj_id
+            if src_id in action['target'].absorbed_source_ids:
+                action['target'].absorbed_source_ids.remove(src_id)
             # Remove copied mask files from target's mask_anchors/
             for p in action.get('copied_mask_paths', []):
                 try:
@@ -4007,12 +4703,8 @@ class SAM3VideoUI:
             concept = self.project.get_concept_by_name(cname)
             if concept:
                 concept.text_prompt = action['old_prompt']
-                concept.instances = action['snapshot_instances']
-                concept.status = action['snapshot_status']
-                self._concepts_pending_reset.discard(cname)
+                self.project.save()
                 self.update_concept_tree()
-                self.compositor = DynamicFrameCompositor(self.project)
-                self.display_frame()
                 self.status_var.set(
                     f"Undid prompt change for '{cname}' "
                     f"(restored: '{action['old_prompt']}').")
@@ -4032,10 +4724,20 @@ class SAM3VideoUI:
                 return
             self.refinement_points.append(action['point'])
             self._update_points_cache()
-            self.points_label.config(text=f"Points: {len(self.refinement_points)}")
+            self._update_ann_label()
             self.display_frame()
             kind = "positive" if action['point'][2] else "negative"
             self.status_var.set(f"Redid {kind} point at frame {action.get('frame_idx', '?')}.")
+
+        elif t == 'box':
+            if not self._apply_point_action_context(action):
+                self.status_var.set("Cannot redo: instance no longer exists.")
+                return
+            self.refinement_boxes.append(action['box'])
+            self._update_points_cache()
+            self._update_ann_label()
+            self.display_frame()
+            self.status_var.set(f"Redid box at frame {action.get('frame_idx', '?')}.")
 
         elif t == 'remove_point':
             if not self._apply_point_action_context(action):
@@ -4047,7 +4749,7 @@ class SAM3VideoUI:
             elif self.refinement_points:
                 self.refinement_points.pop()
             self._update_points_cache()
-            self.points_label.config(text=f"Points: {len(self.refinement_points)}")
+            self._update_ann_label()
             self.display_frame()
             self.status_var.set(f"Re-removed point at frame {action.get('frame_idx', '?')}.")
 
@@ -4056,6 +4758,7 @@ class SAM3VideoUI:
                 self.status_var.set("Cannot redo: instance no longer exists.")
                 return
             self.refinement_points.clear()
+            self.refinement_boxes.clear()
             self._update_points_cache()
             if action.get('anchor_data') is not None:
                 inst = self.selected_instance
@@ -4070,7 +4773,7 @@ class SAM3VideoUI:
                     if p.exists():
                         p.unlink()
                 self._metadata_dirty = True
-            self.points_label.config(text="Points: 0")
+            self.points_label.config(text="Points: 0  Boxes: 0")
             self.display_frame()
             self.status_var.set(f"Re-cleared frame {action.get('frame_idx', '?')}.")
 
@@ -4086,7 +4789,7 @@ class SAM3VideoUI:
                     and self.selected_concept.name == action['concept_name']
                     and self.selected_instance.sam3_obj_id == action['obj_id']):
                 self.refinement_points.clear()
-            self.points_label.config(text="Points: 0")
+            self.points_label.config(text="Points: 0  Boxes: 0")
             self.display_frame()
             self.status_var.set(
                 f"Re-cleared all annotations for instance (obj {action['obj_id']}).")
@@ -4119,8 +4822,12 @@ class SAM3VideoUI:
             # Re-copy masks + re-stage points + re-delete source
             import shutil as _shutil
             action['source'].deleted = True
+            action['source'].absorbed_source = True
             action['source'].visible = False
             action['target'].received_absorb_anchor = True
+            src_id = action['source'].sam3_obj_id
+            if src_id not in action['target'].absorbed_source_ids:
+                action['target'].absorbed_source_ids.append(src_id)
             for p in action.get('copied_mask_paths', []):
                 try:
                     frame_idx = int(Path(p).stem)
@@ -4190,18 +4897,8 @@ class SAM3VideoUI:
             concept = self.project.get_concept_by_name(cname)
             if concept:
                 concept.text_prompt = action['new_prompt']
-                concept.instances = []
-                concept.status = ConceptStatus.PENDING
-                self._concepts_pending_reset.add(cname)
-                keys_to_drop = [k for k in list(self._points_cache) if k[0] == cname]
-                for k in keys_to_drop:
-                    self._points_cache.pop(k, None)
-                    self._all_annotations_cache.pop(k, None)
-                    self._dirty_keys.discard(k)
-                self._invalidate_presence_cache()
+                self.project.save()
                 self.update_concept_tree()
-                self.compositor = DynamicFrameCompositor(self.project)
-                self.display_frame()
                 self.status_var.set(
                     f"Re-applied prompt change for '{cname}' "
                     f"(now: '{action['new_prompt']}').")
@@ -4262,32 +4959,41 @@ class SAM3VideoUI:
         if not self.project:
             return 0
         key = (concept_name, obj_id)
-        cached = self._points_cache.get(key, {})
+        cached_pts = self._points_cache.get(key, {})
+        cached_boxes = self._boxes_cache.get(key, {})
+        # Frames touched by either points or boxes
+        all_touched_frames = set(cached_pts) | set(cached_boxes)
         rpath = os.path.join(
             self.project.project_dir, "concepts", concept_name,
             "instances", str(obj_id), "refinements.json"
         )
-        # Nothing to write and no file to update
-        if not cached and not os.path.exists(rpath):
+        if not all_touched_frames and not os.path.exists(rpath):
             return 0
         os.makedirs(os.path.dirname(rpath), exist_ok=True)
         applied = []
         if os.path.exists(rpath):
             with open(rpath) as f:
                 applied = [r for r in json.load(f).get("refinements", [])
-                           if (r.get("propagated", False) and r.get("frame_idx") not in cached)
+                           if (r.get("propagated", False) and r.get("frame_idx") not in all_touched_frames)
                            or (not r.get("propagated", False) and r.get("type") == "mask_anchor")]
         from datetime import datetime
         pending = []
-        for frame_idx, pts in sorted(cached.items()):
-            if pts:
-                pending.append({
+        for frame_idx in sorted(all_touched_frames):
+            pts = cached_pts.get(frame_idx, [])
+            boxes = cached_boxes.get(frame_idx, [])
+            if pts or boxes:
+                entry = {
                     "timestamp": datetime.now().isoformat(),
                     "frame_idx": frame_idx,
-                    "points": [{"x": x, "y": y, "is_positive": is_pos}
-                               for x, y, is_pos in pts],
                     "propagated": False,
-                })
+                }
+                if pts:
+                    entry["points"] = [{"x": x, "y": y, "is_positive": is_pos}
+                                       for x, y, is_pos in pts]
+                if boxes:
+                    entry["boxes"] = [{"x1": x1, "y1": y1, "x2": x2, "y2": y2}
+                                      for x1, y1, x2, y2 in boxes]
+                pending.append(entry)
         with open(rpath, "w") as f:
             json.dump({"refinements": applied + pending}, f, indent=2)
         return len(pending)
@@ -4303,7 +5009,9 @@ class SAM3VideoUI:
         frame_idx = self.current_frame_idx
 
         snapshot = list(self.refinement_points)
+        box_snapshot = list(self.refinement_boxes)
         self.refinement_points.clear()
+        self.refinement_boxes.clear()
         # Tombstone in cache — disk write deferred to explicit save.
         self._update_points_cache()
 
@@ -4326,18 +5034,19 @@ class SAM3VideoUI:
                     p.unlink()
             self._metadata_dirty = True
 
-        if snapshot or anchor_data is not None:
+        if snapshot or box_snapshot or anchor_data is not None:
             self.undo_stack.append({
                 'type': 'clear_frame',
                 'concept_name': self.selected_concept.name,
                 'obj_id': inst.sam3_obj_id,
                 'frame_idx': frame_idx,
                 'points': snapshot,
+                'boxes': box_snapshot,
                 'anchor_data': anchor_data,
                 'anchor_dir': anchor_dir if anchor_data is not None else None,
             })
             self.redo_stack.clear()
-        self.points_label.config(text="Points: 0")
+        self.points_label.config(text="Points: 0  Boxes: 0")
         self.display_frame()
         self.status_var.set(f"Cleared all annotations at frame {frame_idx}. "
                             "Ctrl+Z to undo. Save Changes for Refinement or Apply to persist.")
@@ -4394,7 +5103,7 @@ class SAM3VideoUI:
         })
         self.redo_stack.clear()
 
-        self.points_label.config(text="Points: 0")
+        self.points_label.config(text="Points: 0  Boxes: 0")
         self.display_frame()
         self.status_var.set(
             f"Cleared all annotations for '{inst.user_name}' ({total} frame(s)). "
@@ -4402,7 +5111,11 @@ class SAM3VideoUI:
         )
 
     def _purge_deleted_instance_masks(self, concepts=None):
-        """Remove mask dirs for all deleted instances.
+        """Remove mask dirs for user-deleted instances.
+
+        Absorbed sources (deleted=True, absorbed_source=True) are intentionally
+        skipped here — their original mask files are preserved until the next
+        --refine run processes the absorb and deletes them at that point.
 
         Args:
             concepts: iterable of SAM3Concept to check, or None to check all.
@@ -4417,6 +5130,8 @@ class SAM3VideoUI:
             for inst in concept.instances:
                 if not inst.deleted:
                     continue
+                if inst.absorbed_source:
+                    continue  # preserved until --refine completes
                 masks_dir = os.path.join(
                     self.project.project_dir, "concepts", concept.name,
                     "instances", str(inst.sam3_obj_id), "masks"
@@ -4473,12 +5188,14 @@ class SAM3VideoUI:
         n_resets = len(self._concepts_pending_reset)
         self._concepts_pending_reset.clear()
 
-        # Warn that pending instance deletions are permanent once committed.
+        # Warn that pending user-initiated deletions are permanent once committed.
+        # Absorbed sources (deleted=True, absorbed_source=True) are NOT shown here —
+        # their mask files are intentionally kept as historical data for future union checks.
         pending_deletes = [
             (c.name, inst.user_name)
             for n in self.project.concept_order
             for c in [self.project.get_concept_by_name(n)] if c
-            for inst in c.instances if inst.deleted
+            for inst in c.instances if inst.deleted and not inst.absorbed_source
         ]
         if pending_deletes:
             names_preview = ", ".join(f"'{nm}'" for _, nm in pending_deletes[:5])
@@ -4492,14 +5209,16 @@ class SAM3VideoUI:
             ):
                 return
 
-        # Commit pending instance deletions: remove mask dirs from disk now,
-        # then remove them from concept.instances so they don't re-trigger this
-        # dialog on the next save.
+        # Commit pending user-initiated deletions: remove mask dirs from disk now,
+        # then remove them from concept.instances.
+        # Absorbed sources are kept in concept.instances (with deleted=True, absorbed_source=True)
+        # so future absorbs into the same target can still find their historical masks.
         self._purge_deleted_instance_masks()
         for n in self.project.concept_order:
             c = self.project.get_concept_by_name(n)
             if c:
-                c.instances = [inst for inst in c.instances if not inst.deleted]
+                c.instances = [inst for inst in c.instances
+                               if not inst.deleted or inst.absorbed_source]
 
         # After purging, stale delete_instance undo entries would restore ghost instances
         # with no mask files — scrub them so Ctrl+Z can't create ghosts.
@@ -4725,7 +5444,7 @@ class SAM3VideoUI:
         self.compositor = DynamicFrameCompositor(self.project)  # Refresh compositor
         self.update_concept_tree()  # Refresh coverage % from updated metadata
         self.display_frame()
-        self.points_label.config(text="Points: 0")
+        self.points_label.config(text="Points: 0  Boxes: 0")
         self.status_var.set("Refinement applied successfully.")
         messagebox.showinfo("Success", "Refinement applied and masks updated.")
 
@@ -5696,6 +6415,52 @@ class ExportSAM2Dialog:
         messagebox.showinfo("Export Complete", msg)
 
 
+class NewInstanceNameDialog:
+    """Small dialog for naming a new instance.
+
+    Shows a combobox pre-populated with vocabulary names for the concept when a
+    vocabulary is loaded; otherwise behaves like a plain text entry.
+    """
+
+    def __init__(self, parent, concept_name: str, vocab_names: List[str]):
+        self.result: Optional[str] = None
+
+        self.top = tk.Toplevel(parent)
+        self.top.title("New Instance")
+        self.top.geometry("380x160")
+        self.top.transient(parent)
+        self.top.grab_set()
+        self.top.resizable(False, False)
+
+        tk.Label(self.top,
+                 text=f"Name for the new instance in concept '{concept_name}':",
+                 font=("Arial", 10), wraplength=350, justify=tk.LEFT
+                 ).pack(pady=(14, 6), padx=14, anchor=tk.W)
+
+        self.combo = ttk.Combobox(self.top, values=vocab_names, width=38)
+        self.combo.pack(padx=14, anchor=tk.W)
+        self.combo.focus_set()
+
+        if vocab_names:
+            tk.Label(self.top,
+                     text="(Choose from vocabulary or type a custom name)",
+                     font=("Arial", 8), fg="gray").pack(padx=14, anchor=tk.W, pady=(2, 0))
+
+        btn_frame = tk.Frame(self.top)
+        btn_frame.pack(pady=12)
+        tk.Button(btn_frame, text="OK", width=10, command=self._ok).pack(side=tk.LEFT, padx=5)
+        tk.Button(btn_frame, text="Cancel", width=10, command=self.top.destroy).pack(side=tk.LEFT, padx=5)
+
+        self.top.bind("<Return>", lambda e: self._ok())
+        self.top.bind("<Escape>", lambda e: self.top.destroy())
+
+    def _ok(self):
+        name = self.combo.get().strip()
+        if name:
+            self.result = name
+        self.top.destroy()
+
+
 class AbsorbInstanceDialog:
     """Dialog for choosing which instance the current (selected) instance should be
     absorbed into.
@@ -5746,9 +6511,19 @@ class AbsorbInstanceDialog:
         self.listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         sb.config(command=self.listbox.yview)
 
-        for inst in targets:
+        has_higher_id = any(inst.sam3_obj_id > source.sam3_obj_id for inst in targets)
+        for i, inst in enumerate(targets):
             coverage = (inst.num_frames_with_mask / ui.num_frames * 100) if ui.num_frames > 0 else 0
-            self.listbox.insert(tk.END, f"{inst.user_name}  (ID {inst.sam3_obj_id}, {coverage:.1f}% coverage)")
+            label = f"{inst.user_name}  (ID {inst.sam3_obj_id}, {coverage:.1f}% coverage)"
+            self.listbox.insert(tk.END, label)
+            if inst.sam3_obj_id > source.sam3_obj_id:
+                self.listbox.itemconfig(i, foreground="#aaaaaa")
+
+        if has_higher_id:
+            tk.Label(self.top,
+                     text="Grayed entries have a higher ID than the source — they were\n"
+                          "detected later and absorbing into them is less reliable.",
+                     font=("Arial", 8), fg="#aaaaaa", justify=tk.LEFT).pack(padx=10, anchor=tk.W)
 
         btn_frame = tk.Frame(self.top)
         btn_frame.pack(pady=12)
@@ -6024,7 +6799,7 @@ class EditPromptDialog:
         self.prompt_entry.focus_set()
 
         tk.Label(self.top,
-                 text="Changing the prompt marks the concept for full re-detection.",
+                 text="Updates the prompt text. Existing instances and masks are kept.",
                  font=("Arial", 8), fg="gray").pack(padx=10, anchor=tk.W)
 
         btn_frame = tk.Frame(self.top)
