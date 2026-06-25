@@ -459,6 +459,24 @@ def _parallel_refine_worker_main(
                     mask_format=project.mask_format,
                     cache_size=cache_size,
                 )
+                # Remove absorbed sources from the concept before saving metadata,
+                # mirroring the cleanup done in _refine_project_impl for the serial path.
+                absorbed_ids_removed = {
+                    inst.sam3_obj_id for inst in concept.instances
+                    if inst.deleted and getattr(inst, 'absorbed_source', False)
+                }
+                if absorbed_ids_removed:
+                    concept.instances = [
+                        inst for inst in concept.instances
+                        if not (inst.deleted and getattr(inst, 'absorbed_source', False))
+                    ]
+                    for inst in concept.instances:
+                        inst.absorbed_source_ids = [
+                            sid for sid in inst.absorbed_source_ids
+                            if sid not in absorbed_ids_removed
+                        ]
+                # Persist updated presence fields and cleaned-up instance list.
+                project._save_concept_metadata(concept)
             result_queue.put(("done", worker_id, cname))
         except Exception as e:
             traceback.print_exc()

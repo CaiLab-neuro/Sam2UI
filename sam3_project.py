@@ -262,6 +262,8 @@ class SAM3Project:
     # Stored as plain strings; paths from other OSes are skipped gracefully at load time.
     alt_video_paths: List[str] = field(default_factory=list)
     alt_frames_dirs: List[str] = field(default_factory=list)
+    # True when the source is a single image (treated as a 1-frame video internally).
+    is_image: bool = False
     # path -> mtime at last load/save, for detecting external writes (e.g. a concurrent
     # `sam3_process.py --refine` run). Not persisted to project.json.
     _loaded_mtimes: Dict[str, float] = field(default_factory=dict, init=False, repr=False, compare=False)
@@ -334,6 +336,7 @@ class SAM3Project:
             "frames_dir": self.frames_dir,
             "alt_video_paths": self.alt_video_paths,
             "alt_frames_dirs": self.alt_frames_dirs,
+            "is_image": self.is_image,
             "concepts": [
                 {
                     "name": c.name,
@@ -407,6 +410,7 @@ class SAM3Project:
             frames_dir=project_data.get("frames_dir"),
             alt_video_paths=project_data.get("alt_video_paths", []),
             alt_frames_dirs=project_data.get("alt_frames_dirs", []),
+            is_image=project_data.get("is_image", False),
             concept_order=project_data.get("concept_order", []),
             device=project_data.get("global_settings", {}).get("device", "cuda:0"),
             default_opacity=project_data.get("global_settings", {}).get("default_opacity", 0.5),
@@ -437,7 +441,8 @@ class SAM3Project:
     @classmethod
     def create_new(cls, project_dir: str, video_path: str, num_frames: int,
                    frame_dimensions: Tuple[int, int], fps: float = 30.0,
-                   device: str = "cuda:0", mask_format: str = "png") -> 'SAM3Project':
+                   device: str = "cuda:0", mask_format: str = "png",
+                   is_image: bool = False, frames_dir: Optional[str] = None) -> 'SAM3Project':
         """Create new project with directory structure"""
         os.makedirs(project_dir, exist_ok=True)
         os.makedirs(os.path.join(project_dir, "concepts"), exist_ok=True)
@@ -450,6 +455,8 @@ class SAM3Project:
             fps=fps,
             device=device,
             mask_format=mask_format,
+            is_image=is_image,
+            frames_dir=frames_dir,
         )
 
         # Save video info

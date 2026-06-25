@@ -142,6 +142,13 @@ class SAM3VideoUI:
         # (compositor + mask I/O) is slower than the target frame period.
         self._render_pending: bool = False
 
+        # Nav panel row references — stored so image mode can hide them.
+        self._nav_row1: Optional[tk.Frame] = None   # play/pause + frame nav
+        self._nav_row2: Optional[tk.Frame] = None   # presence bar
+        self._nav_row3: Optional[tk.Frame] = None   # zoom + speed
+        self._nav_row4: Optional[tk.Frame] = None   # quality colorbars
+        self._export_btn: Optional[tk.Button] = None  # "Export Video/Image" button
+
         # Timeline zoom (slider window)
         self.slider_zoom_level = tk.IntVar(value=1)
         self.slider_window_center = 0
@@ -380,8 +387,9 @@ class SAM3VideoUI:
                  command=self.edit_concept_prompt_dialog).pack(fill=tk.X, pady=2)
         tk.Button(btn_frame, text="Reload Project",
                  command=self.reload_project).pack(fill=tk.X, pady=2)
-        tk.Button(btn_frame, text="Export Video",
-                 command=self.export_video).pack(fill=tk.X, pady=2)
+        self._export_btn = tk.Button(btn_frame, text="Export Video",
+                                     command=self.export_video)
+        self._export_btn.pack(fill=tk.X, pady=2)
         tk.Button(btn_frame, text="Export SAM2 Format...",
                  command=self.export_sam2_format_dialog).pack(fill=tk.X, pady=2)
 
@@ -464,7 +472,7 @@ class SAM3VideoUI:
         self._wiz_cancel_btn.pack(side=tk.LEFT, padx=2)
 
         # ── Row 1: play/pause + frame nav + counter ───────────────────────────
-        row1 = tk.Frame(parent)
+        self._nav_row1 = row1 = tk.Frame(parent)
         row1.pack(fill=tk.X, padx=5, pady=(3, 0))
 
         self.play_button = tk.Button(row1, text="Play", width=5,
@@ -486,7 +494,7 @@ class SAM3VideoUI:
         # intentionally not packed — not visible
 
         # ── Row 2: combined timeline scrubber + instance presence bar ─────────
-        row2 = tk.Frame(parent)
+        self._nav_row2 = row2 = tk.Frame(parent)
         row2.pack(fill=tk.X, padx=5, pady=(1, 0))
 
         self.presence_canvas = tk.Canvas(row2, height=22, bg='#2a2a2a',
@@ -499,7 +507,7 @@ class SAM3VideoUI:
         self.presence_canvas.bind('<B1-Motion>', self._on_presence_bar_click)
 
         # ── Row 3 (compact): timeline zoom + playback speed ────────────────────
-        row3 = tk.Frame(parent)
+        self._nav_row3 = row3 = tk.Frame(parent)
         row3.pack(fill=tk.X, padx=5, pady=(1, 3))
 
         tk.Label(row3, text="Zoom:", font=("Arial", 7)).pack(side=tk.LEFT)
@@ -530,7 +538,7 @@ class SAM3VideoUI:
         self._update_speed_button_highlight()
 
         # ── Row 4 (compact): quality colorbars (overlap + background ratio) ────
-        row4 = tk.Frame(parent)
+        self._nav_row4 = row4 = tk.Frame(parent)
         row4.pack(fill=tk.X, padx=5, pady=(1, 3))
 
         tk.Label(row4, text="Overlap:", font=("Arial", 7), fg="gray", width=7,
@@ -1919,12 +1927,60 @@ class SAM3VideoUI:
 
         tk.Button(top, text="Close", command=top.destroy).pack(pady=8)
 
+    # ── Image-mode helpers ────────────────────────────────────────────────────
+
+    _IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.tiff', '.tif', '.bmp', '.webp', '.gif'}
+
+    @property
+    def is_image_mode(self) -> bool:
+        return self.project is not None and getattr(self.project, 'is_image', False)
+
+    def _get_image_info(self, image_path: str):
+        """Return (num_frames=1, (width, height), fps=1.0) from an image file."""
+        with Image.open(image_path) as img:
+            width, height = img.size
+        return 1, (width, height), 1.0
+
+    def _prepare_image_frames_dir(self, image_path: str, project_dir: str) -> str:
+        """Convert image to 000000.jpg in <project_dir>/frames/. Returns frames_dir."""
+        frames_dir = os.path.join(project_dir, "frames")
+        os.makedirs(frames_dir, exist_ok=True)
+        dest = os.path.join(frames_dir, "000000.jpg")
+        with Image.open(image_path) as img:
+            img.convert("RGB").save(dest, "JPEG", quality=95)
+        return frames_dir
+
+    def _update_nav_visibility(self):
+        """Show or hide video-only nav rows based on whether current project is an image."""
+        rows_and_packs = [
+            (self._nav_row1, dict(fill=tk.X, padx=5, pady=(3, 0))),
+            (self._nav_row2, dict(fill=tk.X, padx=5, pady=(1, 0))),
+            (self._nav_row3, dict(fill=tk.X, padx=5, pady=(1, 3))),
+            (self._nav_row4, dict(fill=tk.X, padx=5, pady=(1, 3))),
+        ]
+        if self.is_image_mode:
+            for row, _ in rows_and_packs:
+                if row:
+                    row.pack_forget()
+            if self._export_btn:
+                self._export_btn.config(text="Export Image")
+        else:
+            for row, pack_kw in rows_and_packs:
+                if row:
+                    row.pack(**pack_kw)
+            if self._export_btn:
+                self._export_btn.config(text="Export Video")
+
     def load_video(self):
-        """Load a video file and create new project"""
+        """Load a video file or image and create new project"""
 
         video_path = filedialog.askopenfilename(
-            title="Select Video File",
-            filetypes=[("Video files", "*.mp4 *.avi *.mov *.mkv"), ("All files", "*.*")],
+            title="Select Video or Image File",
+            filetypes=[
+                ("Video files", "*.mp4 *.avi *.mov *.mkv"),
+                ("Image files", "*.jpg *.jpeg *.png *.tiff *.tif *.bmp *.webp"),
+                ("All files", "*.*"),
+            ],
             initialdir=self._get_last_project_parent(),
         )
 
@@ -1934,12 +1990,17 @@ class SAM3VideoUI:
         # Release any live sessions before loading a new video
         self._release_all_sessions()
 
+        is_image = Path(video_path).suffix.lower() in self._IMAGE_EXTS
+
         try:
-            self.status_var.set("Loading video...")
+            self.status_var.set("Loading image..." if is_image else "Loading video...")
             self.root.update()
 
-            # Get video info
-            num_frames, dims, fps = get_video_info(video_path)
+            # Get media info
+            if is_image:
+                num_frames, dims, fps = self._get_image_info(video_path)
+            else:
+                num_frames, dims, fps = get_video_info(video_path)
 
             # Ask for project directory
             project_dir = filedialog.askdirectory(
@@ -1947,8 +2008,15 @@ class SAM3VideoUI:
                 initialdir=self._get_last_project_parent(),
             )
             if not project_dir:
-                self.status_var.set("Video load cancelled.")
+                self.status_var.set("Load cancelled.")
                 return
+
+            # For images: copy/convert into a persistent frames dir so SAM3 can use it.
+            frames_dir = None
+            if is_image:
+                self.status_var.set("Preparing image frames...")
+                self.root.update()
+                frames_dir = self._prepare_image_frames_dir(video_path, project_dir)
 
             # Create project
             self.project = SAM3Project.create_new(
@@ -1957,7 +2025,9 @@ class SAM3VideoUI:
                 num_frames=num_frames,
                 frame_dimensions=dims,
                 fps=fps,
-                device=self.device
+                device=self.device,
+                is_image=is_image,
+                frames_dir=frames_dir,
             )
 
             # Save project
@@ -1979,7 +2049,8 @@ class SAM3VideoUI:
             # Populate in-memory annotation cache from project files
             self._load_points_cache_from_project()
 
-            # Update UI
+            # Update UI — hide/show nav controls based on image vs video
+            self._update_nav_visibility()
             self._update_project_label()
             self.frame_slider.configure(to=num_frames - 1)
             self.selected_concept = None
@@ -1989,15 +2060,18 @@ class SAM3VideoUI:
             self._auto_select_first_instance()
             self.display_frame()
 
-            self.status_var.set(f"Loaded: {Path(video_path).name} ({num_frames} frames, {dims[0]}x{dims[1]}, {fps:.2f} fps)")
+            if is_image:
+                self.status_var.set(f"Loaded image: {Path(video_path).name} ({dims[0]}x{dims[1]})")
+            else:
+                self.status_var.set(f"Loaded: {Path(video_path).name} ({num_frames} frames, {dims[0]}x{dims[1]}, {fps:.2f} fps)")
 
         except Exception as e:
             import traceback
-            print(f"\n=== ERROR: Failed to load video ===")
+            print(f"\n=== ERROR: Failed to load {'image' if is_image else 'video'} ===")
             traceback.print_exc()
             print(f"=====================================\n")
-            messagebox.showerror("Error", f"Failed to load video:\n{e}")
-            self.status_var.set("Error loading video.")
+            messagebox.showerror("Error", f"Failed to load {'image' if is_image else 'video'}:\n{e}")
+            self.status_var.set("Error loading file.")
 
     def load_project(self):
         """Load existing SAM3 project"""
@@ -2049,7 +2123,8 @@ class SAM3VideoUI:
             # Load quality metrics if available
             self._load_quality_metrics(project_dir)
 
-            # Update UI
+            # Update UI — hide/show nav controls based on image vs video
+            self._update_nav_visibility()
             self._update_project_label()
             self.frame_slider.configure(to=self.num_frames - 1)
             self.selected_concept = None
@@ -2230,8 +2305,16 @@ class SAM3VideoUI:
         # the ~2 MB clone on frames where no instance mask is present.
         frame = None
 
+        focus_concept = (
+            self.selected_concept
+            if self.focus_mode_var.get() and self.selected_concept
+            else None
+        )
+
         for concept in self.project.concepts:
             if not concept.visible:
+                continue
+            if focus_concept is not None and concept is not focus_concept:
                 continue
             for inst in concept.instances:
                 if inst.deleted or not inst.visible:
@@ -5805,11 +5888,46 @@ class SAM3VideoUI:
     # Export
     # ============================================================
 
-    def export_video(self):
-        """Export composited video"""
+    def export_image(self):
+        """Export composited image for image-mode projects."""
 
         if not self.compositor:
             messagebox.showwarning("Warning", "No project loaded.")
+            return
+
+        output_path = filedialog.asksaveasfilename(
+            title="Export Image",
+            defaultextension=".png",
+            filetypes=[
+                ("PNG Image", "*.png"),
+                ("TIFF Image", "*.tiff"),
+                ("JPEG Image", "*.jpg"),
+                ("All files", "*.*"),
+            ],
+        )
+        if not output_path:
+            return
+
+        try:
+            alpha = self.mask_alpha_var.get() if self.show_masks_var.get() else 0.0
+            frame_rgb = self.compositor.get_composited_frame(0, alpha_multiplier=alpha)
+            Image.fromarray(frame_rgb).save(output_path)
+            self.status_var.set(f"Image exported to {Path(output_path).name}")
+            messagebox.showinfo("Success", f"Image exported to:\n{output_path}")
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            messagebox.showerror("Error", f"Failed to export image:\n{e}")
+
+    def export_video(self):
+        """Export composited video (or image if project is in image mode)."""
+
+        if not self.compositor:
+            messagebox.showwarning("Warning", "No project loaded.")
+            return
+
+        if self.is_image_mode:
+            self.export_image()
             return
 
         output_path = filedialog.asksaveasfilename(
