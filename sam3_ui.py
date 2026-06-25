@@ -198,7 +198,7 @@ class SAM3VideoUI:
         self._canvas_image_id = None   # persistent canvas item; avoids delete+create each frame
         self.show_labels_var = tk.BooleanVar(value=True)
         self.show_masks_var = tk.BooleanVar(value=True)
-        self.focus_mode_var = tk.BooleanVar(value=False)
+        self.focus_mode_var = tk.BooleanVar(value=True)
         self.skip_delete_confirm_var = tk.BooleanVar(value=False)
         self.auto_jump_var = tk.BooleanVar(value=True)
         self.mask_alpha_var = tk.DoubleVar(value=0.5)
@@ -817,9 +817,9 @@ class SAM3VideoUI:
         """Navigate to a specific frame, loading any saved annotations for that frame."""
         frame_idx = max(0, min(frame_idx, self.num_frames - 1))
         self.current_frame_idx = frame_idx
-        # frame_slider.set() fires on_slider_change synchronously, which calls
-        # _load_annotations_for_current_frame + display_frame — no need to repeat them.
         self.frame_slider.set(frame_idx)
+        self._load_annotations_for_current_frame()
+        self.display_frame()
 
     def _load_annotations_for_current_frame(self):
         """Load ALL cached annotations (including already-propagated) for the current
@@ -2546,9 +2546,9 @@ class SAM3VideoUI:
             if new_idx < slider_min or new_idx > slider_max:
                 window_size = max(1, slider_max - slider_min)
                 self._execute_zoom_jump(new_idx, window_size, self.num_frames)
-        # frame_slider.set() fires on_slider_change synchronously, which calls
-        # _load_annotations_for_current_frame + display_frame — no need to repeat them.
         self.frame_slider.set(new_idx)
+        self._load_annotations_for_current_frame()
+        self.display_frame()
 
     # ============================================================
     # Concept Tree Management
