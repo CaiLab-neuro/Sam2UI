@@ -1420,8 +1420,10 @@ class SAM3VideoUI:
                                   image=self._presence_bar_photo)
             self._presence_bar_dirty = False
         else:
-            # Fast path: only remove the old playhead items (background image unchanged)
-            canvas.delete("playhead")
+            pass  # background image unchanged
+
+        # Always remove old playhead before redrawing
+        canvas.delete("playhead")
 
         # Draw playhead (always): black shadow + bright line + triangle, tagged "playhead"
         if f_start <= self.current_frame_idx <= f_end:
