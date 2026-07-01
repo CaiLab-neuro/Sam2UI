@@ -9,6 +9,14 @@ import pickle
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+matplotlib.rcParams.update({
+    "font.size": 20,
+    "axes.titlesize": 24,
+    "axes.labelsize": 20,
+    "xtick.labelsize": 18,
+    "ytick.labelsize": 18,
+    "legend.fontsize": 18,
+})
 import logging, sys
 import argparse
 import re
@@ -225,6 +233,12 @@ Inputs:
         Note: these files can include additional columns such as
               *source_frame_idx*.
 
+        Alternatively, pass *--gaze-csv* and *--world-csv* to point directly at a
+        single pair of CSV files, bypassing the *{subject_id}_{camera}_*.csv* naming
+        convention. Requires exactly one *--subject-id* and one *--camera-id*
+        (no auto-discovery). gaze_world_dir is still required positionally but is
+        unused for path resolution in this mode.
+
     3) Segmentation mask directory: /path/to/segmentation_masks
     The script resolves the mask source for each subject/camera in this order:
         a) Direct SAM3: mask_dir itself contains project.json
@@ -350,8 +364,15 @@ class GazeObjectAligner:
         logger: Optional[logging.Logger] = None,
         recompute: bool = False,
         within_job_workers: int = 1,
+        gaze_csv_path: Optional[str] = None,
+        world_csv_path: Optional[str] = None,
+        category_sort: str = "first_seen",
+        gaze_confidence_threshold: float = 0.5,
+        gaze_radius: int = 20,
     ):
         self.gaze_world_dir = gaze_world_dir
+        self.gaze_csv_path = gaze_csv_path
+        self.world_csv_path = world_csv_path
         self.mask_dir = mask_dir
         self.output_dir = output_dir
         self.blink_dir = blink_dir
@@ -362,6 +383,9 @@ class GazeObjectAligner:
         self.plot_figures = plot_figures
         self.recompute = recompute
         self.within_job_workers = within_job_workers
+        self.category_sort = category_sort
+        self.gaze_confidence_threshold = gaze_confidence_threshold
+        self.gaze_radius = gaze_radius
         self.ignore_objects = self.load_ignore_objects(ignore_object_list)
         if self.ignore_objects:
             self.logger.info(
@@ -676,6 +700,7 @@ class GazeObjectAligner:
         gaze_df: pd.DataFrame,
         subject_gaze_probabilities: dict[int, dict[str, float]],
         out_dir: Path,
+        category_display_map: Optional[dict] = None,
     ) -> None:
         """Create method figures: trajectory trace and confidence heatmap."""
         if gaze_df.empty:
@@ -783,17 +808,78 @@ class GazeObjectAligner:
                 cleaned = "no_object"
             gaze_categories.append(cleaned)
 
-        category_order = list(dict.fromkeys(gaze_categories))
+        seen_order = list(dict.fromkeys(gaze_categories))
+        has_no_object = "no_object" in seen_order
+        real_categories = [cat for cat in seen_order if cat != "no_object"]
+
+        # Discover every category scored in subject_gaze_probabilities, including ones that
+        # never won the per-point argmax label (e.g. consistently second-best behind a
+        # larger overlapping mask), so both the heatmap and frequency-based sorting reflect
+        # the full population of scores, not just who "won" each point.
+        heatmap_categories = list(real_categories)
+        for probs_one_gaze in subject_gaze_probabilities.values():
+            for mask_name in probs_one_gaze.keys():
+                category = self._mask_name_to_category(mask_name)
+                if category not in heatmap_categories:
+                    heatmap_categories.append(category)
+
+        heatmap_row = {cat: i for i, cat in enumerate(heatmap_categories)}
+        confidence_matrix = np.zeros((len(heatmap_categories), len(plot_df)), dtype=float)
+        for col_idx, gaze_index in enumerate(plot_df.index):
+            probs_one_gaze = subject_gaze_probabilities.get(gaze_index, {})
+            if probs_one_gaze:
+                per_category_conf = {}
+                for mask_name, conf in probs_one_gaze.items():
+                    category = self._mask_name_to_category(mask_name)
+                    conf_val = float(conf)
+                    if category not in per_category_conf or conf_val > per_category_conf[category]:
+                        per_category_conf[category] = conf_val
+                for category, conf_val in per_category_conf.items():
+                    confidence_matrix[heatmap_row[category], col_idx] = conf_val
+            elif "gazed_object_confidence" in plot_df.columns:
+                category = gaze_categories[col_idx]
+                if category in heatmap_row:
+                    conf_val = float(plot_df.iloc[col_idx]["gazed_object_confidence"])
+                    if np.isfinite(conf_val):
+                        confidence_matrix[heatmap_row[category], col_idx] = max(0.0, conf_val)
+
+        if self.category_sort == "frequency":
+            # "Frequency" is approximated by mean confidence across ALL gaze points (not a
+            # count of argmax wins): a category that consistently scores moderately but
+            # rarely wins outright (e.g. a small mask overlapping a much larger one) still
+            # ranks appropriately, instead of being under-counted by a hard win-count.
+            avg_conf = confidence_matrix.mean(axis=1)
+            order_indices = sorted(range(len(heatmap_categories)), key=lambda i: avg_conf[i], reverse=True)
+            heatmap_categories = [heatmap_categories[i] for i in order_indices]
+            confidence_matrix = confidence_matrix[order_indices, :]
+            heatmap_row = {cat: i for i, cat in enumerate(heatmap_categories)}
+
+        real_categories = [cat for cat in heatmap_categories if cat in real_categories]
+
+        # "no_object" is not a real gazed object; pin it to the last row with a fixed
+        # neutral color instead of letting first-seen/frequency order place it arbitrarily
+        # and assign it a near-invisible tab20 color.
+        if has_no_object:
+            heatmap_categories.append("no_object")
+            confidence_matrix = np.vstack([confidence_matrix, np.zeros((1, confidence_matrix.shape[1]))])
+        heatmap_row = {cat: i for i, cat in enumerate(heatmap_categories)}
+
+        category_order = real_categories + (["no_object"] if has_no_object else [])
         category_to_y = {cat: i for i, cat in enumerate(category_order)}
+        display_map = category_display_map or {}
 
         figures_dir = Path(out_dir) / "figures"
         figures_dir.mkdir(parents=True, exist_ok=True)
 
         trajectory_height = float(np.clip(1.3 + 0.35 * len(category_order), 3.5, 18.0))
-        trajectory_fig, trajectory_ax = plt.subplots(figsize=(12, trajectory_height))
+        trajectory_fig, trajectory_ax = plt.subplots(figsize=(20, trajectory_height))
         cmap = plt.get_cmap("tab20")
+        NO_OBJECT_COLOR = (0.55, 0.55, 0.55, 1.0)
+        category_colors = {"no_object": NO_OBJECT_COLOR}
+        for idx, cat in enumerate(real_categories):
+            category_colors[cat] = cmap(idx % cmap.N)
         y_values = np.array([category_to_y[cat] for cat in gaze_categories], dtype=float)
-        point_colors = [cmap(category_to_y[cat] % cmap.N) for cat in gaze_categories]
+        point_colors = [category_colors[cat] for cat in gaze_categories]
 
         trajectory_ax.plot(
             time_s,
@@ -812,7 +898,7 @@ class GazeObjectAligner:
             zorder=3,
         )
         trajectory_ax.set_yticks(np.arange(len(category_order)))
-        trajectory_ax.set_yticklabels(category_order)
+        trajectory_ax.set_yticklabels([display_map.get(cat, cat) for cat in category_order])
         trajectory_ax.set_xlabel("Time (s)")
         trajectory_ax.set_ylabel("Gazed Category")
         trajectory_ax.set_title(f"Gaze trajectory ({subject_id_temp}, {camera_temp})")
@@ -828,34 +914,8 @@ class GazeObjectAligner:
         plt.close(trajectory_fig)
         self.logger.info("Saved trajectory plot to %s and %s", trajectory_png, trajectory_pdf)
 
-        heatmap_categories = list(category_order)
-        for probs_one_gaze in subject_gaze_probabilities.values():
-            for mask_name in probs_one_gaze.keys():
-                category = self._mask_name_to_category(mask_name)
-                if category not in heatmap_categories:
-                    heatmap_categories.append(category)
-        heatmap_row = {cat: i for i, cat in enumerate(heatmap_categories)}
-        confidence_matrix = np.zeros((len(heatmap_categories), len(plot_df)), dtype=float)
-
-        for col_idx, gaze_index in enumerate(plot_df.index):
-            probs_one_gaze = subject_gaze_probabilities.get(gaze_index, {})
-            if probs_one_gaze:
-                per_category_conf = {}
-                for mask_name, conf in probs_one_gaze.items():
-                    category = self._mask_name_to_category(mask_name)
-                    conf_val = float(conf)
-                    if category not in per_category_conf or conf_val > per_category_conf[category]:
-                        per_category_conf[category] = conf_val
-                for category, conf_val in per_category_conf.items():
-                    confidence_matrix[heatmap_row[category], col_idx] = conf_val
-            elif "gazed_object_confidence" in plot_df.columns:
-                category = gaze_categories[col_idx]
-                conf_val = float(plot_df.iloc[col_idx]["gazed_object_confidence"])
-                if np.isfinite(conf_val):
-                    confidence_matrix[heatmap_row[category], col_idx] = max(0.0, conf_val)
-
         heatmap_height = float(np.clip(1.3 + 0.35 * len(heatmap_categories), 3.5, 20.0))
-        heatmap_fig, heatmap_ax = plt.subplots(figsize=(12, heatmap_height))
+        heatmap_fig, heatmap_ax = plt.subplots(figsize=(20, heatmap_height))
         y_edges = np.arange(len(heatmap_categories) + 1, dtype=float)
         mesh = heatmap_ax.pcolormesh(
             time_edges,
@@ -867,7 +927,7 @@ class GazeObjectAligner:
             shading="auto",
         )
         heatmap_ax.set_yticks(np.arange(len(heatmap_categories)) + 0.5)
-        heatmap_ax.set_yticklabels(heatmap_categories)
+        heatmap_ax.set_yticklabels([display_map.get(cat, cat) for cat in heatmap_categories])
         heatmap_ax.set_xlabel("Time (s)")
         heatmap_ax.set_ylabel("Gazed Category")
         heatmap_ax.set_title(f"Gaze confidence heatmap ({subject_id_temp}, {camera_temp})")
@@ -894,9 +954,13 @@ class GazeObjectAligner:
         Returns:
             pd.DataFrame: A DataFrame containing the gaze data within the cut video duration.
         """
-        gaze_path = Path(self.gaze_world_dir) / f"{subj}_{camera}_gaze.csv"
+        gaze_path = Path(self.gaze_csv_path) if self.gaze_csv_path else (
+            Path(self.gaze_world_dir) / f"{subj}_{camera}_gaze.csv"
+        )
         gaze_dic = pd.read_csv(gaze_path)
-        world_cam_path = Path(self.gaze_world_dir) / f"{subj}_{camera}_world_timestamps.csv"
+        world_cam_path = Path(self.world_csv_path) if self.world_csv_path else (
+            Path(self.gaze_world_dir) / f"{subj}_{camera}_world_timestamps.csv"
+        )
         world_cam_dic = pd.read_csv(world_cam_path)
         self.logger.info(
             "Loaded gaze/world CSV: gaze_rows=%d world_rows=%d",
@@ -1039,8 +1103,12 @@ class GazeObjectAligner:
                         )
                 # Cache for load_mask() serial path
                 self._sam3_instances_cache = sam3_instances
+                # Category strings are "{concept_name}_{user_name}" (see _mask_name_to_category);
+                # map them back to just the instance (user) name for plot y-tick labels.
+                category_display_map = {f"{c}_{u}": u for c, u, _ in sam3_instances}
             else:
                 self.logger.info("SAM2 mode: mask directory at %s", mask_subject)
+                category_display_map = {}
 
             mask_summary = self.summarize_mask_frames(mask_subject)
             post_blink_frame_ids = set(gaze_blink_removed["frame_idx"].astype(int).unique())
@@ -1102,8 +1170,7 @@ class GazeObjectAligner:
             gaze_blink_removed['gazed_object_id'] = None
             gaze_blink_removed['gazed_object'] = None
             gaze_blink_removed['gazed_object_confidence'] = 0.0
-            _r = 20
-            _disk = _disk_template(_r)
+            _r = self.gaze_radius
 
             excluded_objects_suffix = self.excluded_objects_output_suffix()
             pkl_path = out_dir / f"{subject_id_temp}_{camera_temp}_gaze_object_probabilities{excluded_objects_suffix}.pkl"
@@ -1123,9 +1190,10 @@ class GazeObjectAligner:
                         best_name = max(probs, key=lambda k: probs[k])
                         best_conf = float(probs[best_name])
                         if best_conf > 0.0:
+                            gaze_blink_removed.loc[i, 'gazed_object_confidence'] = best_conf
+                        if best_conf >= self.gaze_confidence_threshold:
                             gaze_blink_removed.loc[i, 'gazed_object_id'] = best_name.split('.')[0].split('_')[-1]
                             gaze_blink_removed.loc[i, 'gazed_object'] = '_'.join(best_name.split('.')[0].split('_')[2:-1])
-                            gaze_blink_removed.loc[i, 'gazed_object_confidence'] = best_conf
                             assigned_gaze_points += 1
                             assigned_confidences.append(best_conf)
             else:
@@ -1165,9 +1233,10 @@ class GazeObjectAligner:
                     best_name = max(probs, key=probs.__getitem__)
                     best_conf = float(probs[best_name])
                     if best_conf > 0.0:
+                        gaze_blink_removed.loc[i, 'gazed_object_confidence'] = best_conf
+                    if best_conf >= self.gaze_confidence_threshold:
                         gaze_blink_removed.loc[i, 'gazed_object_id'] = best_name.split('.')[0].split('_')[-1]
                         gaze_blink_removed.loc[i, 'gazed_object'] = '_'.join(best_name.split('.')[0].split('_')[2:-1])
-                        gaze_blink_removed.loc[i, 'gazed_object_confidence'] = best_conf
                         assigned_gaze_points += 1
                         assigned_confidences.append(best_conf)
                         self.logger.debug(
@@ -1236,6 +1305,7 @@ class GazeObjectAligner:
                     gaze_df=gaze_blink_removed,
                     subject_gaze_probabilities=subject_gaze_probabilities,
                     out_dir=out_dir,
+                    category_display_map=category_display_map,
                 )
             else:
                 self.logger.info("Skipping method figures because --skip-figures was provided.")
@@ -1267,6 +1337,11 @@ def process_subject_camera_pair(args):
         plot_figures,
         recompute,
         within_job_workers,
+        gaze_csv_path,
+        world_csv_path,
+        category_sort,
+        gaze_confidence_threshold,
+        gaze_radius,
         log_queue,
     ) = args
 
@@ -1284,6 +1359,11 @@ def process_subject_camera_pair(args):
         logger=logger,
         recompute=recompute,
         within_job_workers=within_job_workers,
+        gaze_csv_path=gaze_csv_path,
+        world_csv_path=world_csv_path,
+        category_sort=category_sort,
+        gaze_confidence_threshold=gaze_confidence_threshold,
+        gaze_radius=gaze_radius,
     )
     logger.info("Processing started.")
     gaze_aligner.process_subject(subject_id_temp, camera_temp)
@@ -1327,9 +1407,21 @@ def main():
         '    /path/to/segmentation_masks \\\n'
         '    /path/to/output_directory\n\n'
 
+        '  # Direct gaze/world CSV paths (bypasses {subject}_{camera}_*.csv naming)\n'
+        '  python process_gaze_mask_alignment.py \\\n'
+        '    /path/to/gaze_world_data \\\n'
+        '    /path/to/segmentation_masks \\\n'
+        '    /path/to/output_directory \\\n'
+        '    --subject-id 27 --camera-id child \\\n'
+        '    --gaze-csv /path/to/any_gaze.csv \\\n'
+        '    --world-csv /path/to/any_world_timestamps.csv\n\n'
+
         'Notes:\n'
         '  - gaze_world_dir must contain both {subject}_{camera}_gaze.csv and\n'
-        '    {subject}_{camera}_world_timestamps.csv.\n'
+        '    {subject}_{camera}_world_timestamps.csv, unless --gaze-csv/--world-csv\n'
+        '    are used to point directly at a single pair of CSV files (requires\n'
+        '    exactly one --subject-id and one --camera-id; gaze_world_dir is still\n'
+        '    required positionally but unused for path resolution in that mode).\n'
         '  - mask_dir resolution order (first match used):\n'
         '      1) mask_dir itself is a SAM3 project (contains project.json)\n'
         '      2) mask_dir itself contains SAM2 mask files\n'
@@ -1348,11 +1440,28 @@ def main():
         '    --skip-figures is provided.'
     ))
 
-    parser.add_argument('gaze_world_dir', help='Path to the gaze timestamps files and Egocentric Video Frame timestamps files')
+    parser.add_argument(
+        'gaze_world_dir', nargs='?', default=None,
+        help='Path to the gaze timestamps files and Egocentric Video Frame timestamps files. '
+             'Optional when both --gaze-csv and --world-csv are provided.',
+    )
     parser.add_argument('mask_dir', help='Directory containing SAM2 mask files or SAM3 project directory')
     parser.add_argument('output_dir', help='Directory to save output files')
     parser.add_argument('--subject-id', dest='subject_id', help='Subject ID e.g. 27 or 27,28')
     parser.add_argument('--camera-id', help='Camera ID e.g. child or child,parent')
+    parser.add_argument(
+        '--gaze-csv', dest='gaze_csv', default=None,
+        help='Optional direct path to a single gaze CSV file, bypassing the '
+             '{subject}_{camera}_gaze.csv naming convention inside gaze_world_dir. '
+             'Must be used together with --world-csv, and requires exactly one '
+             'subject/camera pair (via --subject-id/--camera-id).',
+    )
+    parser.add_argument(
+        '--world-csv', dest='world_csv', default=None,
+        help='Optional direct path to a single world-camera timestamps CSV file, '
+             'bypassing the {subject}_{camera}_world_timestamps.csv naming convention. '
+             'Must be used together with --gaze-csv.',
+    )
     parser.add_argument('--blink-dir', help='If remove gaze during blinks', required=False)
     parser.add_argument('--log-path', help='Path to the log file', required=False)
     parser.add_argument(
@@ -1389,6 +1498,30 @@ def main():
         action='store_true',
         help='Force recomputation from masks even if a cached probabilities pkl already exists.',
     )
+    parser.add_argument(
+        '--gaze-confidence-threshold',
+        type=float,
+        default=0.5,
+        help='Minimum mask overlap confidence required to label a gaze point as gazing at that '
+             'object (gazed_object/gazed_object_id). The raw gazed_object_confidence value is '
+             'still recorded unthresholded. Default 0.5.',
+    )
+    parser.add_argument(
+        '--category-sort',
+        choices=['first_seen', 'frequency'],
+        default='first_seen',
+        help='Ordering of categories (rows) in the trajectory/heatmap figures: "first_seen" '
+             '(default, chronological order of first assignment) or "frequency" (most-assigned '
+             'category first).',
+    )
+    parser.add_argument(
+        '--gaze-radius',
+        type=int,
+        default=20,
+        help='Radius in pixels of the disk around each gaze point used to compute mask-overlap '
+             'confidence. Larger values are more tolerant of gaze-tracking noise but blur '
+             'distinctions between nearby/adjacent objects. Default 20.',
+    )
 
     args = parser.parse_args()
 
@@ -1398,6 +1531,10 @@ def main():
         parser.error("--within-job-workers must be >= 1.")
     if args.start_plot_time is not None and args.start_plot_time < 0:
         parser.error("--start-plot-time must be >= 0.")
+    if not (0.0 <= args.gaze_confidence_threshold <= 1.0):
+        parser.error("--gaze-confidence-threshold must be between 0.0 and 1.0.")
+    if args.gaze_radius < 1:
+        parser.error("--gaze-radius must be >= 1.")
     if args.end_plot_time is not None and args.end_plot_time < 0:
         parser.error("--end-plot-time must be >= 0.")
     if (
@@ -1406,6 +1543,17 @@ def main():
         and args.start_plot_time > args.end_plot_time
     ):
         parser.error("--start-plot-time must be <= --end-plot-time.")
+
+    if bool(args.gaze_csv) != bool(args.world_csv):
+        parser.error("--gaze-csv and --world-csv must be provided together.")
+    if args.gaze_csv and (not args.subject_id or ',' in args.subject_id or not args.camera_id or ',' in args.camera_id):
+        parser.error(
+            "--gaze-csv/--world-csv require exactly one subject (--subject-id) "
+            "and one camera (--camera-id); auto-discovery from gaze_world_dir is "
+            "not available when direct CSV paths are given."
+        )
+    if args.gaze_world_dir is None and not args.gaze_csv:
+        parser.error("gaze_world_dir is required unless --gaze-csv and --world-csv are both provided.")
 
     if args.subject_id:
         subj_ids = [id.strip() for id in args.subject_id.split(',')]
@@ -1457,6 +1605,9 @@ def main():
         logger.info(f"Plot Figures: {not args.skip_figures}")
         logger.info(f"Num Workers: {args.num_workers}")
         logger.info(f"Within-Job Workers: {args.within_job_workers}")
+        logger.info(f"Gaze Confidence Threshold: {args.gaze_confidence_threshold}")
+        logger.info(f"Category Sort: {args.category_sort}")
+        logger.info(f"Gaze Radius (px): {args.gaze_radius}")
         logger.info(f"Queue Logging: {use_queue_logging}")
         if args.blink_dir is None:
             logger.info("No blink directory provided, skipping blink labeling.")
@@ -1477,6 +1628,11 @@ def main():
                     logger=pair_logger(logger, subj, cam),
                     recompute=args.recompute,
                     within_job_workers=args.within_job_workers,
+                    gaze_csv_path=args.gaze_csv,
+                    world_csv_path=args.world_csv,
+                    category_sort=args.category_sort,
+                    gaze_confidence_threshold=args.gaze_confidence_threshold,
+                    gaze_radius=args.gaze_radius,
                 )
                 gaze_aligner.process_subject(subj, cam)
                 logger.info(f"------- Finished processing subject {subj}, camera {cam} -------")
@@ -1497,6 +1653,11 @@ def main():
                     not args.skip_figures,
                     args.recompute,
                     args.within_job_workers,
+                    args.gaze_csv,
+                    args.world_csv,
+                    args.category_sort,
+                    args.gaze_confidence_threshold,
+                    args.gaze_radius,
                     log_queue,
                 )
                 for subj, cam in subject_camera_pairs

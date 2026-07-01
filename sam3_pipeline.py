@@ -1290,14 +1290,19 @@ def replay_concept_refinements(
                 boxes = obj_frame_boxes.get(obj_id, {}).get(frame_idx, [])
                 pts_normalized = [[x / orig_width, y / orig_height] for x, y, _ in pts]
                 pt_labels = [1 if is_positive else 0 for _, _, is_positive in pts]
-                kw = dict(session_id=session_id, frame_idx=frame_idx, obj_id=obj_id)
+                # SAM3's add_prompt() rejects points and boxes in the same call
+                # ("When points are provided, text_str and boxes_xywh must be
+                # None.") — issue them as separate cond-anchor calls instead.
                 if pts_normalized:
-                    kw["points"] = pts_normalized
-                    kw["point_labels"] = pt_labels
+                    sam3_model.add_prompt(
+                        session_id=session_id, frame_idx=frame_idx, obj_id=obj_id,
+                        points=pts_normalized, point_labels=pt_labels,
+                    )
                 if boxes:
-                    kw["bounding_boxes"] = boxes
-                    kw["bounding_box_labels"] = [1] * len(boxes)
-                sam3_model.add_prompt(**kw)
+                    sam3_model.add_prompt(
+                        session_id=session_id, frame_idx=frame_idx, obj_id=obj_id,
+                        bounding_boxes=boxes, bounding_box_labels=[1] * len(boxes),
+                    )
             n_frames = len(obj_frame_points[obj_id])
             print(f"  Initialized manually-added instance obj_id={obj_id} "
                   f"via {n_frames} annotated frame(s).")
@@ -1315,14 +1320,17 @@ def replay_concept_refinements(
                 boxes = obj_frame_boxes.get(obj_id, {}).get(frame_idx, [])
                 pts_normalized = [[x / orig_width, y / orig_height] for x, y, _ in pts]
                 pt_labels = [1 if is_positive else 0 for _, _, is_positive in pts]
-                kw = dict(session_id=session_id, frame_idx=frame_idx, obj_id=obj_id)
+                # See note above: points and boxes must be separate add_prompt() calls.
                 if pts_normalized:
-                    kw["points"] = pts_normalized
-                    kw["point_labels"] = pt_labels
+                    sam3_model.add_prompt(
+                        session_id=session_id, frame_idx=frame_idx, obj_id=obj_id,
+                        points=pts_normalized, point_labels=pt_labels,
+                    )
                 if boxes:
-                    kw["bounding_boxes"] = boxes
-                    kw["bounding_box_labels"] = [1] * len(boxes)
-                sam3_model.add_prompt(**kw)
+                    sam3_model.add_prompt(
+                        session_id=session_id, frame_idx=frame_idx, obj_id=obj_id,
+                        bounding_boxes=boxes, bounding_box_labels=[1] * len(boxes),
+                    )
 
         # Inject mask-conditioning anchors (from absorb wizard) before propagation.
         _inject_mask_anchors(sam3_model, session_id, concept, project_dir)
@@ -1701,29 +1709,35 @@ def online_replay_concept_refinements(
             raw_boxes = entry.get("boxes", [])
             if not raw_pts and not raw_boxes:
                 continue
-            kw = dict(session_id=session_id, frame_idx=frame_idx,
-                      obj_id=instance.sam3_obj_id)
-            if raw_pts:
-                kw["points"] = torch.tensor(
-                    [[p["x"] / orig_width, p["y"] / orig_height] for p in raw_pts],
-                    dtype=torch.float32,
-                )
-                kw["point_labels"] = torch.tensor(
-                    [1 if p["is_positive"] else 0 for p in raw_pts],
-                    dtype=torch.int32,
-                )
-            if raw_boxes:
-                kw["bounding_boxes"] = torch.tensor(
-                    [[b["x1"] / orig_width, b["y1"] / orig_height,
-                      (b["x2"] - b["x1"]) / orig_width,
-                      (b["y2"] - b["y1"]) / orig_height]
-                     for b in raw_boxes],
-                    dtype=torch.float32,
-                )
-                kw["bounding_box_labels"] = torch.ones(len(raw_boxes), dtype=torch.int32)
             print(f"Online refinement: adding {len(raw_pts)} pt(s) + {len(raw_boxes)} box(es) "
                   f"at frame {frame_idx} for obj {instance.sam3_obj_id}")
-            sam3_model.add_prompt(**kw)
+            # SAM3's add_prompt() rejects points and boxes in the same call
+            # ("When points are provided, text_str and boxes_xywh must be
+            # None.") — issue them as separate cond-anchor calls instead.
+            if raw_pts:
+                sam3_model.add_prompt(
+                    session_id=session_id, frame_idx=frame_idx, obj_id=instance.sam3_obj_id,
+                    points=torch.tensor(
+                        [[p["x"] / orig_width, p["y"] / orig_height] for p in raw_pts],
+                        dtype=torch.float32,
+                    ),
+                    point_labels=torch.tensor(
+                        [1 if p["is_positive"] else 0 for p in raw_pts],
+                        dtype=torch.int32,
+                    ),
+                )
+            if raw_boxes:
+                sam3_model.add_prompt(
+                    session_id=session_id, frame_idx=frame_idx, obj_id=instance.sam3_obj_id,
+                    bounding_boxes=torch.tensor(
+                        [[b["x1"] / orig_width, b["y1"] / orig_height,
+                          (b["x2"] - b["x1"]) / orig_width,
+                          (b["y2"] - b["y1"]) / orig_height]
+                         for b in raw_boxes],
+                        dtype=torch.float32,
+                    ),
+                    bounding_box_labels=torch.ones(len(raw_boxes), dtype=torch.int32),
+                )
 
     # Inject mask-conditioning anchors (from absorb wizard) before propagation.
     _inject_mask_anchors(sam3_model, session_id, concept, project_dir)

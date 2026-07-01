@@ -120,7 +120,7 @@ class SAM3VideoUI:
         self.refinement_boxes: List[tuple] = []   # [(x1, y1, x2, y2), ...] in display coords
         self._box_draw_start = None         # (cx, cy) in display coords at drag start
         self._box_draw_canvas_id = None     # canvas item id for live-drag preview rectangle
-        self.undo_stack: List[dict] = []  # {'type': 'point'|'remove_point'|'delete_instance', ...}
+        self.undo_stack: List[dict] = []  # {'type': 'point'|'box'|'remove_point'|'remove_box'|'delete_instance', ...}
         self.redo_stack: List[dict] = []
         # Absorb wizard state (None when no wizard is active)
         self._absorb_wizard: Optional[dict] = None
@@ -239,6 +239,9 @@ class SAM3VideoUI:
         # Undo/redo (points and instance deletions)
         self.root.bind('<Control-z>', self.undo_action)
         self.root.bind('<Control-y>', self.redo_action)
+
+        # Ctrl+S: save pending points/annotations to disk (no propagation)
+        self.root.bind('<Control-s>', lambda e: self.save_points_for_batch())
 
         # Arrow-key navigation
         self.root.bind('<Left>', lambda e: self._handle_prev_frame_shortcut())
@@ -695,7 +698,7 @@ class SAM3VideoUI:
                  command=self.clear_frame_annotations).pack(fill=tk.X, pady=2)
 
         self.remove_mode_button = tk.Button(
-            refine_frame, text="Remove Point Mode",
+            refine_frame, text="Remove Annotation Mode",
             command=self.toggle_point_removal_mode,
             bg='#404040', fg='white', activebackground='#505050'
         )
@@ -4377,14 +4380,15 @@ class SAM3VideoUI:
     # ============================================================
 
     def toggle_point_removal_mode(self):
-        """Toggle click-to-remove mode. When active, clicking near a point removes it."""
+        """Toggle click-to-remove mode. When active, clicking near a point, box edge, or
+        mask anchor removes it."""
         self.point_removal_mode = not self.point_removal_mode
         if self.point_removal_mode:
             self.remove_mode_button.config(bg='#DC143C', activebackground='#FF6347')
-            self.status_var.set("Remove Point Mode: click near a point to delete it.")
+            self.status_var.set("Remove Annotation Mode: click near a point or box to delete it.")
         else:
             self.remove_mode_button.config(bg='#404040', activebackground='#505050')
-            self.status_var.set("Remove Point Mode off.")
+            self.status_var.set("Remove Annotation Mode off.")
 
     def remove_point_at_location(self, x: float, y: float) -> bool:
         """Remove the closest refinement point within 20px of (x, y). Returns True if removed."""
@@ -4409,6 +4413,33 @@ class SAM3VideoUI:
         self._update_ann_label()
         self.display_frame()
         self.status_var.set(f"Removed point at ({removed[0]:.0f}, {removed[1]:.0f}). Ctrl+Z to undo.")
+        return True
+
+    def remove_box_at_location(self, x: float, y: float) -> bool:
+        """Remove the smallest refinement box containing (x, y). Returns True if removed."""
+        if not self.refinement_boxes:
+            return False
+        best_idx = None
+        best_area = float('inf')
+        for i, (x1, y1, x2, y2) in enumerate(self.refinement_boxes):
+            if x1 <= x <= x2 and y1 <= y <= y2:
+                area = (x2 - x1) * (y2 - y1)
+                if area < best_area:
+                    best_area = area
+                    best_idx = i
+        if best_idx is None:
+            return False
+        removed = self.refinement_boxes.pop(best_idx)
+        self.undo_stack.append({'type': 'remove_box', 'box': removed, 'index': best_idx,
+                                'concept_name': self.selected_concept.name,
+                                'obj_id': self.selected_instance.sam3_obj_id,
+                                'frame_idx': self.current_frame_idx})
+        self.redo_stack.clear()
+        self._update_points_cache()
+        self._update_ann_label()
+        self.display_frame()
+        self.status_var.set(f"Removed box at ({removed[0]:.0f}, {removed[1]:.0f})-"
+                            f"({removed[2]:.0f}, {removed[3]:.0f}). Ctrl+Z to undo.")
         return True
 
     def _wizard_remove_pending_point(self, x: float, y: float):
@@ -4545,7 +4576,8 @@ class SAM3VideoUI:
 
         if self.point_removal_mode:
             if not self.remove_point_at_location(x, y):
-                self.remove_mask_anchor_at_location(x, y)
+                if not self.remove_box_at_location(x, y):
+                    self.remove_mask_anchor_at_location(x, y)
             return
 
         # Add positive point (left click in point mode)
@@ -4581,7 +4613,8 @@ class SAM3VideoUI:
 
         if self.point_removal_mode:
             if not self.remove_point_at_location(x, y):
-                self.remove_mask_anchor_at_location(x, y)
+                if not self.remove_box_at_location(x, y):
+                    self.remove_mask_anchor_at_location(x, y)
             return
 
         pt = (x, y, False)
@@ -4683,6 +4716,17 @@ class SAM3VideoUI:
             self._update_ann_label()
             self.display_frame()
             self.status_var.set(f"Restored removed point at frame {action.get('frame_idx', '?')}.")
+
+        elif t == 'remove_box':
+            if not self._apply_point_action_context(action):
+                self.status_var.set("Cannot undo: instance no longer exists.")
+                return
+            idx = min(action['index'], len(self.refinement_boxes))
+            self.refinement_boxes.insert(idx, action['box'])
+            self._update_points_cache()
+            self._update_ann_label()
+            self.display_frame()
+            self.status_var.set(f"Restored removed box at frame {action.get('frame_idx', '?')}.")
 
         elif t == 'clear_frame':
             if not self._apply_point_action_context(action):
@@ -4891,6 +4935,20 @@ class SAM3VideoUI:
             self._update_ann_label()
             self.display_frame()
             self.status_var.set(f"Re-removed point at frame {action.get('frame_idx', '?')}.")
+
+        elif t == 'remove_box':
+            if not self._apply_point_action_context(action):
+                self.status_var.set("Cannot redo: instance no longer exists.")
+                return
+            idx = min(action['index'], len(self.refinement_boxes))
+            if 0 <= idx < len(self.refinement_boxes):
+                self.refinement_boxes.pop(idx)
+            elif self.refinement_boxes:
+                self.refinement_boxes.pop()
+            self._update_points_cache()
+            self._update_ann_label()
+            self.display_frame()
+            self.status_var.set(f"Re-removed box at frame {action.get('frame_idx', '?')}.")
 
         elif t == 'clear_frame':
             if not self._apply_point_action_context(action):
