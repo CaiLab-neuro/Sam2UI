@@ -1435,6 +1435,11 @@ def handle_status(args):
     sep = "=" * W
     thin = "-" * W
 
+    # ── Running job check ─────────────────────────────────────────
+    from sam3_project import check_refine_lock
+    import time as _time_mod
+    lock_info = check_refine_lock(args.project)
+
     # ── Project header ────────────────────────────────────────────
     print(sep)
     print("PROJECT STATUS")
@@ -1620,6 +1625,14 @@ def handle_status(args):
         if not os.path.exists(metrics):
             print(f"\n  [OPTIONAL] Compute quality metrics:")
             print(f"    {script} {proj_arg} --quality-metrics")
+
+    if lock_info:
+        elapsed = int(_time_mod.time() - lock_info.get("started", _time_mod.time()))
+        h_e, rem = divmod(elapsed, 3600)
+        m_e, s_e = divmod(rem, 60)
+        elapsed_str = (f"{h_e}h {m_e}m {s_e}s" if h_e else
+                       f"{m_e}m {s_e}s" if m_e else f"{s_e}s")
+        print(f"\n  [RUNNING JOB] PID {lock_info['pid']} has been running for {elapsed_str}")
 
     print(sep)
     return 0

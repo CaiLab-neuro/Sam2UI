@@ -392,6 +392,8 @@ class SAM3VideoUI:
         self._export_btn.pack(fill=tk.X, pady=2)
         tk.Button(btn_frame, text="Export SAM2 Format...",
                  command=self.export_sam2_format_dialog).pack(fill=tk.X, pady=2)
+        tk.Button(btn_frame, text="Propagate",
+                 command=self.apply_refinement).pack(fill=tk.X, pady=2)
 
     def _setup_video_panel(self, parent):
         """Setup center panel with video display"""
@@ -427,17 +429,29 @@ class SAM3VideoUI:
         self._wizard_banner = tk.Frame(parent, bg='#1a3a1a', relief=tk.RIDGE, bd=1)
         # (not packed here — shown only during absorb wizard via _wizard_enter_phase)
 
+        # Pack the button cluster FIRST so it claims its natural (right-aligned)
+        # width before the text label competes for space — otherwise, on a
+        # narrow window, the text (packed/measured first) would eat the cavity
+        # and leave the buttons clipped or shoved off the right edge instead of
+        # sitting flush against the banner's right boundary.
+        wiz_right = tk.Frame(self._wizard_banner, bg='#1a3a1a')
+        wiz_right.pack(side=tk.RIGHT, padx=4, pady=3)
+
         wiz_left = tk.Frame(self._wizard_banner, bg='#1a3a1a')
         wiz_left.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8, pady=3)
         self._wizard_title_lbl = tk.Label(wiz_left, text="", bg='#1a3a1a', fg='white',
                                           font=("Arial", 9, "bold"), anchor=tk.W)
         self._wizard_title_lbl.pack(fill=tk.X)
         self._wizard_instr_lbl = tk.Label(wiz_left, text="", bg='#1a3a1a', fg='#aaffaa',
-                                          font=("Arial", 8), anchor=tk.W)
+                                          font=("Arial", 8), anchor=tk.W, wraplength=200)
         self._wizard_instr_lbl.pack(fill=tk.X)
-
-        wiz_right = tk.Frame(self._wizard_banner, bg='#1a3a1a')
-        wiz_right.pack(side=tk.RIGHT, padx=4, pady=3)
+        # Keep the instruction text wrapping to whatever width wiz_left actually
+        # has, so long instructions never push the (right-packed) buttons off
+        # the banner instead of wrapping onto a second line.
+        wiz_left.bind(
+            '<Configure>',
+            lambda e: self._wizard_instr_lbl.config(wraplength=max(1, e.width))
+        )
 
         wiz_row1 = tk.Frame(wiz_right, bg='#1a3a1a')
         wiz_row1.pack(fill=tk.X, pady=(0, 2))
@@ -558,8 +572,40 @@ class SAM3VideoUI:
     def _setup_controls_panel(self, parent):
         """Setup right panel with instance controls"""
 
+        # Scrollable container so all controls are reachable on low-resolution screens
+        _sc = tk.Canvas(parent, highlightthickness=0)
+        _sc_sb = tk.Scrollbar(parent, orient="vertical", command=_sc.yview)
+        _sc.configure(yscrollcommand=_sc_sb.set)
+        _sc_sb.pack(side=tk.RIGHT, fill=tk.Y)
+        _sc.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        inner = tk.Frame(_sc)
+        _win_id = _sc.create_window((0, 0), window=inner, anchor="nw")
+
+        def _on_inner_configure(e):
+            _sc.configure(scrollregion=_sc.bbox("all"))
+        def _on_sc_resize(e):
+            _sc.itemconfig(_win_id, width=e.width)
+        inner.bind("<Configure>", _on_inner_configure)
+        _sc.bind("<Configure>", _on_sc_resize)
+
+        # Bind mousewheel only while the pointer is over the right panel
+        def _mw(e): _sc.yview_scroll(int(-1 * (e.delta / 120)), "units")
+        def _mw_lin(e): _sc.yview_scroll(-1 if e.num == 4 else 1, "units")
+        def _on_enter(e):
+            _sc.bind_all("<MouseWheel>", _mw)
+            _sc.bind_all("<Button-4>", _mw_lin)
+            _sc.bind_all("<Button-5>", _mw_lin)
+        def _on_leave(e):
+            _sc.unbind_all("<MouseWheel>")
+            _sc.unbind_all("<Button-4>")
+            _sc.unbind_all("<Button-5>")
+        _sc.bind("<Enter>", _on_enter)
+        _sc.bind("<Leave>", _on_leave)
+        inner.bind("<Enter>", _on_enter)
+        inner.bind("<Leave>", _on_leave)
+
         # Device selector
-        device_frame = tk.LabelFrame(parent, text="Device", padx=8, pady=5)
+        device_frame = tk.LabelFrame(inner, text="Device", padx=8, pady=5)
         device_frame.pack(fill=tk.X, padx=5, pady=(5, 2))
 
         device_labels = [label for _, label in self.available_devices]
@@ -572,11 +618,11 @@ class SAM3VideoUI:
                                            fg="gray", font=("Arial", 8))
         self.model_status_label.pack(anchor=tk.W, pady=(3, 0))
 
-        tk.Label(parent, text="Instance Controls",
+        tk.Label(inner, text="Instance Controls",
                 font=("Arial", 12, "bold")).pack(pady=5)
 
         # Selected instance info
-        info_frame = tk.LabelFrame(parent, text="Selected Instance", padx=10, pady=10)
+        info_frame = tk.LabelFrame(inner, text="Selected Instance", padx=10, pady=10)
         info_frame.pack(fill=tk.X, padx=5, pady=5)
 
         self.selected_label = tk.Label(info_frame, text="None",
@@ -597,7 +643,7 @@ class SAM3VideoUI:
                  command=self.rename_instance).pack(side=tk.LEFT)
 
         # Frame navigation for selected instance
-        nav_frame = tk.LabelFrame(parent, text="Navigate Instance", padx=8, pady=5)
+        nav_frame = tk.LabelFrame(inner, text="Navigate Instance", padx=8, pady=5)
         nav_frame.pack(fill=tk.X, padx=5, pady=5)
 
         period_row = tk.Frame(nav_frame)
@@ -609,7 +655,7 @@ class SAM3VideoUI:
         tk.Button(period_row, text="Next >",
                   command=self.jump_to_next_period).pack(side=tk.LEFT, fill=tk.X, expand=True)
 
-        tk.Checkbutton(nav_frame, text="Auto-jump to first period on instance select",
+        tk.Checkbutton(nav_frame, text="Auto-jump to first period on select",
                        variable=self.auto_jump_var).pack(anchor=tk.W)
 
         ann_row = tk.Frame(nav_frame)
@@ -620,7 +666,7 @@ class SAM3VideoUI:
                   command=self.jump_to_next_annotation).pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         # Instance operations
-        ops_frame = tk.LabelFrame(parent, text="Operations", padx=10, pady=10)
+        ops_frame = tk.LabelFrame(inner, text="Operations", padx=10, pady=10)
         ops_frame.pack(fill=tk.X, padx=5, pady=5)
 
         tk.Button(ops_frame, text="New Instance (Manual Points)",
@@ -631,14 +677,12 @@ class SAM3VideoUI:
                        variable=self.skip_delete_confirm_var).pack(anchor=tk.W)
         tk.Button(ops_frame, text="Absorb Selected Into Target...",
                  command=self.absorb_instance_dialog).pack(fill=tk.X, pady=2)
-        tk.Button(ops_frame, text="Recombine Split Instances...", fg='darkorange',
-                 command=self.merge_instances_dialog).pack(fill=tk.X, pady=2)
 
-        # Refinement controls
-        refine_frame = tk.LabelFrame(parent, text="Refinement", padx=10, pady=10)
+        # Annotation controls (point/box placement and per-instance correction)
+        refine_frame = tk.LabelFrame(inner, text="Annotation", padx=10, pady=10)
         refine_frame.pack(fill=tk.X, padx=5, pady=5)
 
-        tk.Label(refine_frame, text="Left click: positive point  |  Right click: negative point",
+        tk.Label(refine_frame, text="Left click: positive  |  Right click: negative",
                  font=("Arial", 8), fg="gray").pack(anchor=tk.W, pady=(2, 0))
         self.box_mode_btn = tk.Button(
             refine_frame, text="Box Mode: OFF",
@@ -657,22 +701,10 @@ class SAM3VideoUI:
         )
         self.remove_mode_button.pack(fill=tk.X, pady=2)
 
-        tk.Button(refine_frame, text="Clear ALL Points (all frames)",
+        tk.Button(refine_frame, text="Clear ALL Annotations (all frames)",
                  fg='darkred', command=self.clear_all_instance_annotations).pack(fill=tk.X, pady=2)
         tk.Button(refine_frame, text="Save Changes for Refinement",
                  command=self.save_points_for_batch).pack(fill=tk.X, pady=2)
-        tk.Button(refine_frame, text="Apply Changes & Propagate",
-                 command=self.apply_refinement).pack(fill=tk.X, pady=2)
-
-        # Flash buttons (shortcut: f / o)
-        flash_row = tk.Frame(refine_frame)
-        flash_row.pack(fill=tk.X, pady=(4, 1))
-        tk.Button(flash_row, text="Flash Mask (f)",
-                 command=self.flash_selected_instance_mask).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 2))
-        tk.Button(flash_row, text="Flash Points",
-                 command=self.flash_frame_points).pack(side=tk.LEFT, fill=tk.X, expand=True)
-        tk.Button(refine_frame, text="Flash Overlap (o)",
-                 command=self.flash_overlap_regions).pack(fill=tk.X, pady=(1, 2))
 
         self.points_label = tk.Label(refine_frame, text="Points: 0  Boxes: 0", anchor=tk.W)
         self.points_label.pack(fill=tk.X, pady=2)
@@ -683,8 +715,8 @@ class SAM3VideoUI:
         tk.Button(refine_frame, text="Release Session",
                  command=self._release_selected_session).pack(fill=tk.X, pady=2)
 
-        # Display options
-        display_frame = tk.LabelFrame(parent, text="Display", padx=10, pady=5)
+        # Display options (including flash inspection tools)
+        display_frame = tk.LabelFrame(inner, text="Display", padx=10, pady=5)
         display_frame.pack(fill=tk.X, padx=5, pady=5)
 
         tk.Checkbutton(display_frame, text="Show instance labels",
@@ -696,13 +728,24 @@ class SAM3VideoUI:
         tk.Checkbutton(display_frame, text="Focus: selected concept only",
                        variable=self.focus_mode_var,
                        command=self.display_frame).pack(anchor=tk.W)
+
+        # Flash inspection buttons (shortcut: f / o)
+        flash_row = tk.Frame(display_frame)
+        flash_row.pack(fill=tk.X, pady=(4, 1))
+        tk.Button(flash_row, text="Flash Mask (f)",
+                 command=self.flash_selected_instance_mask).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 2))
+        tk.Button(flash_row, text="Flash Points",
+                 command=self.flash_frame_points).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        tk.Button(display_frame, text="Flash Overlap (o)",
+                 command=self.flash_overlap_regions).pack(fill=tk.X, pady=(1, 4))
+
         alpha_row = tk.Frame(display_frame)
         alpha_row.pack(fill=tk.X, pady=(2, 0))
         tk.Label(alpha_row, text="Mask alpha:").pack(side=tk.LEFT)
         tk.Scale(alpha_row, variable=self.mask_alpha_var, from_=0.0, to=1.0,
-                 resolution=0.05, orient=tk.HORIZONTAL, length=160, width=18,
+                 resolution=0.05, orient=tk.HORIZONTAL, width=18,
                  sliderlength=20, troughcolor='#444444', activebackground='#ffd700',
-                 command=lambda _: self.display_frame()).pack(side=tk.LEFT)
+                 command=lambda _: self.display_frame()).pack(side=tk.LEFT, fill=tk.X, expand=True)
 
     # ============================================================
     # Device Management
@@ -884,13 +927,14 @@ class SAM3VideoUI:
         self._go_to_frame(nxt)
 
     def _get_annotation_frames(self) -> List[int]:
-        """Return sorted list of frame indices that have annotation points or mask anchors."""
+        """Return sorted list of frame indices that have annotation points, boxes, or mask anchors."""
         if not self.selected_instance or not self.selected_concept:
             return []
         key = (self.selected_concept.name, self.selected_instance.sam3_obj_id)
         point_frames = set(self._all_annotations_cache.get(key, {}).keys())
+        box_frames = set(self._all_boxes_cache.get(key, {}).keys())
         anchor_frames = set(self.selected_instance.mask_anchor_frames)
-        return sorted(point_frames | anchor_frames)
+        return sorted(point_frames | box_frames | anchor_frames)
 
     def jump_to_prev_annotation(self):
         """Jump to the previous frame with saved annotations (wraps around)."""
@@ -4673,17 +4717,27 @@ class SAM3VideoUI:
             for f in action['tombstoned_frames']:
                 cache_entry.pop(f, None)
             cache_entry.update(action['pending_snap'])
-            # Restore all-annotations cache.
+            # Restore _boxes_cache to its pre-clear state.
+            box_cache_entry = self._boxes_cache.setdefault(key, {})
+            for f in action['tombstoned_frames']:
+                box_cache_entry.pop(f, None)
+            box_cache_entry.update(action.get('box_pending_snap', {}))
+            # Restore all-annotations caches.
             all_dict = self._all_annotations_cache.setdefault(key, {})
             all_dict.clear()
             all_dict.update(action['all_snap'])
+            all_box_dict = self._all_boxes_cache.setdefault(key, {})
+            all_box_dict.clear()
+            all_box_dict.update(action.get('box_all_snap', {}))
             self._dirty_keys.add(key)
-            # Restore current-frame live points if we're still on the same instance.
+            # Restore current-frame live points/boxes if we're still on the same instance.
             if (self.selected_concept and self.selected_instance
                     and self.selected_concept.name == action['concept_name']
                     and self.selected_instance.sam3_obj_id == action['obj_id']):
                 self.refinement_points.clear()
                 self.refinement_points.extend(action['current_pts_snap'])
+                self.refinement_boxes.clear()
+                self.refinement_boxes.extend(action.get('current_boxes_snap', []))
             self._update_ann_label()
             self.display_frame()
             self.status_var.set(
@@ -4865,15 +4919,20 @@ class SAM3VideoUI:
         elif t == 'clear_all_instance':
             key = action['key']
             cache_entry = self._points_cache.setdefault(key, {})
+            box_cache_entry = self._boxes_cache.setdefault(key, {})
             for f in action['tombstoned_frames']:
                 cache_entry[f] = []
+                box_cache_entry[f] = []
             all_dict = self._all_annotations_cache.setdefault(key, {})
             all_dict.clear()
+            all_box_dict = self._all_boxes_cache.setdefault(key, {})
+            all_box_dict.clear()
             self._dirty_keys.add(key)
             if (self.selected_concept and self.selected_instance
                     and self.selected_concept.name == action['concept_name']
                     and self.selected_instance.sam3_obj_id == action['obj_id']):
                 self.refinement_points.clear()
+                self.refinement_boxes.clear()
             self.points_label.config(text="Points: 0  Boxes: 0")
             self.display_frame()
             self.status_var.set(
@@ -5059,7 +5118,7 @@ class SAM3VideoUI:
         if os.path.exists(rpath):
             with open(rpath) as f:
                 applied = [r for r in json.load(f).get("refinements", [])
-                           if (r.get("propagated", False) and r.get("frame_idx") not in all_touched_frames)
+                           if r.get("frame_idx") not in all_touched_frames
                            or (not r.get("propagated", False) and r.get("type") == "mask_anchor")]
         from datetime import datetime
         pending = []
@@ -5150,30 +5209,38 @@ class SAM3VideoUI:
         # Gather what exists: pending cache + all-annotations cache (covers historical too)
         pending_snap = dict(self._points_cache.get(key, {}))
         all_snap = dict(self._all_annotations_cache.get(key, {}))
+        box_pending_snap = dict(self._boxes_cache.get(key, {}))
+        box_all_snap = dict(self._all_boxes_cache.get(key, {}))
         current_pts_snap = list(self.refinement_points)
+        current_boxes_snap = list(self.refinement_boxes)
 
-        all_frames = sorted(set(pending_snap) | set(all_snap))
+        all_frames = sorted(set(pending_snap) | set(all_snap) | set(box_pending_snap) | set(box_all_snap))
         total = len(all_frames)
 
         if not messagebox.askyesno(
-            "Clear ALL Annotation Points",
-            f"This will delete all annotation points for '{inst.user_name}' "
+            "Clear ALL Annotations",
+            f"This will delete all annotation points and boxes for '{inst.user_name}' "
             f"across {total} frame(s).\n\n"
-            "The instance itself is kept; only the click-point annotations are removed. "
+            "The instance itself is kept; only the click-point/box annotations are removed. "
             "You can Ctrl+Z to undo within this session.\n\n"
             "Proceed?"
         ):
             return
 
-        # Tombstone every frame in _points_cache so _flush writes empty entries
+        # Tombstone every frame in _points_cache/_boxes_cache so _flush writes empty entries
         # (which supersede historical propagated=True entries on --refine).
         cache_entry = self._points_cache.setdefault(key, {})
+        box_cache_entry = self._boxes_cache.setdefault(key, {})
         for f in all_frames:
             cache_entry[f] = []
-        # Also wipe the current-frame live list and its all-annotations entry.
+            box_cache_entry[f] = []
+        # Also wipe the current-frame live lists and their all-annotations entries.
         self.refinement_points.clear()
+        self.refinement_boxes.clear()
         all_dict = self._all_annotations_cache.setdefault(key, {})
         all_dict.clear()
+        all_box_dict = self._all_boxes_cache.setdefault(key, {})
+        all_box_dict.clear()
         self._dirty_keys.add(key)
 
         self.undo_stack.append({
@@ -5183,7 +5250,10 @@ class SAM3VideoUI:
             'key': key,
             'pending_snap': pending_snap,
             'all_snap': all_snap,
+            'box_pending_snap': box_pending_snap,
+            'box_all_snap': box_all_snap,
             'current_pts_snap': current_pts_snap,
+            'current_boxes_snap': current_boxes_snap,
             'tombstoned_frames': all_frames,
         })
         self.redo_stack.clear()

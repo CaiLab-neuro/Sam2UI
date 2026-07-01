@@ -397,7 +397,6 @@ def _preload_original_masks(
                 points=[[cx, cy]],
                 point_labels=[1],
             )
-            inner_state["feature_cache"].pop(first_frame, None)
             target_states = sam3_model.model._get_tracker_inference_states_by_obj_ids(
                 inner_state, [inst.sam3_obj_id]
             )
@@ -412,6 +411,11 @@ def _preload_original_masks(
             except Exception as e:
                 print(f"  [warn] pre-init failed obj_id={inst.sam3_obj_id} "
                       f"frame={first_frame}: {e}")
+
+        # Do NOT pop feature_cache[first_frame] here: propagate_in_video_preflight later
+        # calls _run_memory_encoder / _get_empty_mask_ptr for each cond frame (including
+        # this one, for sibling objects), which needs the cached features to still be
+        # present. See the identical note in _inject_mask_anchors above.
 
 
 def save_cond_frame_states(sam3_model, session_id: str, concept_dir: str) -> int:
@@ -1259,10 +1263,15 @@ def replay_concept_refinements(
         # loops below visit frames out of order (each instance's own annotated frames,
         # sorted per-instance but not globally), so that eviction never matches and
         # entries pile up — one full backbone feature map per annotated frame, for the
-        # entire replay set, all resident at once. propagate_in_video() recomputes this
-        # cache unconditionally for every frame it visits (sam3_video_inference.py
-        # _prepare_backbone_feats), so nothing here is reused once propagation starts —
-        # evicting immediately after use is free and avoids the pileup.
+        # entire replay set, all resident at once. Do NOT evict these early: unlike
+        # propagate_in_video() (which does recompute the cache unconditionally for every
+        # frame it visits), propagate_in_video_preflight() runs first and calls
+        # _run_memory_encoder / _get_empty_mask_ptr for each cond frame — including these
+        # annotated frames, for sibling objects — which requires the cached features to
+        # still be present. Evicting here raises "Image features for frame N are not
+        # cached" inside preflight, before propagation even starts. The pileup is
+        # tolerated; it's bounded by the replay set size and freed once preflight and
+        # propagate_in_video() run.
         inner_state = sam3_model._all_inference_states[session_id]["state"]
         _keep = _non_cond_keep_window(sam3_model)
 
@@ -1289,7 +1298,6 @@ def replay_concept_refinements(
                     kw["bounding_boxes"] = boxes
                     kw["bounding_box_labels"] = [1] * len(boxes)
                 sam3_model.add_prompt(**kw)
-                inner_state["feature_cache"].pop(frame_idx, None)
             n_frames = len(obj_frame_points[obj_id])
             print(f"  Initialized manually-added instance obj_id={obj_id} "
                   f"via {n_frames} annotated frame(s).")
@@ -1315,7 +1323,6 @@ def replay_concept_refinements(
                     kw["bounding_boxes"] = boxes
                     kw["bounding_box_labels"] = [1] * len(boxes)
                 sam3_model.add_prompt(**kw)
-                inner_state["feature_cache"].pop(frame_idx, None)
 
         # Inject mask-conditioning anchors (from absorb wizard) before propagation.
         _inject_mask_anchors(sam3_model, session_id, concept, project_dir)
@@ -1449,9 +1456,24 @@ def replay_concept_refinements(
             }
             stale = on_disk - set(pixel_counts_by_obj.keys()) - deleted_obj_ids - absorbed_source_ids - manually_added_no_pending
             if stale:
-                print(f"  NOTE: {len(stale)} instance dir(s) on disk not updated by this "
-                      f"refinement run: {sorted(stale)}")
-                print(f"  Their existing masks are preserved. Delete manually if unwanted.")
+                registered_ids = {inst.sam3_obj_id for inst in concept.instances}
+                # Orphan dirs: numeric ID not referenced by any instance in project.json.
+                # These are left-over from a prior detection run and are pure garbage.
+                orphan_ids = stale - registered_ids
+                # Registered but not re-tracked: real instances SAM3 didn't output this run.
+                # Prior masks may still be valid — preserve them.
+                skipped_ids = stale - orphan_ids
+                if orphan_ids:
+                    for oid in sorted(orphan_ids):
+                        orphan_dir = os.path.join(instances_root, str(oid))
+                        shutil.rmtree(orphan_dir, ignore_errors=True)
+                    print(f"  Removed {len(orphan_ids)} orphan instance dir(s) not in "
+                          f"project.json: {sorted(orphan_ids)}")
+                if skipped_ids:
+                    print(f"  NOTE: {len(skipped_ids)} instance dir(s) registered but not "
+                          f"re-tracked by SAM3 this run: {sorted(skipped_ids)}")
+                    print(f"  Their existing masks are preserved (SAM3 may not have detected "
+                          f"them this round).")
 
         # Update cond states for next refinement round (multi-object tensor, all instances).
         if save_cond_states:
