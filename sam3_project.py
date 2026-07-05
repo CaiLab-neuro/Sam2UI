@@ -18,6 +18,14 @@ from enum import Enum
 from pathlib import Path
 
 
+
+# Manually-added instances (created in the UI, never text-detected) get obj_ids from this
+# reserved band, kept far above anything SAM3's own auto-detector could plausibly reach
+# (its ids start at 0 and increment only as new distinct matches for the concept's text
+# prompt are found — realistically never within orders of magnitude of this).
+MANUAL_ID_BASE = 100_000
+
+
 class ProjectStaleError(Exception):
     """Raised when on-disk project/concept files changed since they were loaded.
 
@@ -189,16 +197,30 @@ class SAM3Instance:
 
 @dataclass
 class SAM3Concept:
-    """High-level semantic concept from one text prompt"""
+    """High-level semantic concept from one text prompt (or one example box)"""
     name: str
     text_prompt: str
     color_rgb: Tuple[int, int, int]
     opacity: float = 0.5
     visible: bool = True
     status: ConceptStatus = ConceptStatus.PENDING
+    # ISO timestamp set when status last transitioned to COMPLETED (initial detection or
+    # a full re-detect). None for concepts processed before this field existed, or that
+    # have never completed. Not updated by refine/replay — see each instance's
+    # refinements.json for per-point timestamps instead.
+    completed_at: Optional[str] = None
     instances: List[SAM3Instance] = field(default_factory=list)
     detection_frame: int = 0
     max_instances: int = -1  # -1 = no limit; >0 caps how many instances SAM3 may create
+    # Highest sam3_obj_id ever assigned to any instance of this concept (detected or
+    # manually-added). add_new_instance() (sam3_ui.py) assigns highest_obj_id + 1 to a new
+    # manual instance instead of deriving it from max(existing ids) in `instances` — that
+    # list can shrink after a delete+purge, and re-deriving from it would let the id space
+    # shrink back down too, risking collision with whatever small integer SAM3's own
+    # auto-detector assigns to a genuinely new object in a later refine session.
+    # Only reset (to -1) on a full concept reset/re-detect; otherwise it only grows,
+    # regardless of how many instances are later deleted/consolidated.
+    highest_obj_id: int = -1
 
     def get_visible_instances(self) -> List[SAM3Instance]:
         """Get all non-deleted visible instances"""
@@ -211,6 +233,10 @@ class SAM3Concept:
                 return inst
         return None
 
+    def prompt_label(self) -> str:
+        """Human-readable description of how this concept is defined."""
+        return f"text: '{self.text_prompt}'"
+
     def to_dict(self) -> dict:
         """Serialize to dictionary for JSON export"""
         return {
@@ -220,15 +246,20 @@ class SAM3Concept:
             "opacity": self.opacity,
             "visible": self.visible,
             "status": self.status.value,
+            "completed_at": self.completed_at,
             "instances": [inst.to_dict() for inst in self.instances],
             "detection_frame": self.detection_frame,
             "max_instances": self.max_instances,
+            "highest_obj_id": self.highest_obj_id,
         }
 
     @classmethod
     def from_dict(cls, data: dict) -> 'SAM3Concept':
         """Deserialize from dictionary"""
         instances = [SAM3Instance.from_dict(inst_data) for inst_data in data.get("instances", [])]
+        # Fall back to the current instances' own max for project.json files saved before
+        # highest_obj_id existed, so we never silently regress below ids already in use.
+        default_highest = max((inst.sam3_obj_id for inst in instances), default=-1)
         return cls(
             name=data["name"],
             text_prompt=data["text_prompt"],
@@ -236,9 +267,13 @@ class SAM3Concept:
             opacity=data.get("opacity", 0.5),
             visible=data.get("visible", True),
             status=ConceptStatus(data.get("status", "pending")),
+            completed_at=data.get("completed_at"),
             instances=instances,
             detection_frame=data.get("detection_frame", 0),
             max_instances=data.get("max_instances", -1),
+            # max(...) guards against a stored value that's stale/missing relative to
+            # instances actually on record (e.g. an older project.json) — never regress.
+            highest_obj_id=max(data.get("highest_obj_id", -1), default_highest),
         )
 
 
@@ -264,6 +299,10 @@ class SAM3Project:
     alt_frames_dirs: List[str] = field(default_factory=list)
     # True when the source is a single image (treated as a 1-frame video internally).
     is_image: bool = False
+    # ISO timestamp set every time save() writes project.json. None for projects saved
+    # before this field existed. Reflects the last metadata write, not necessarily the
+    # last completed detection/refine run (a load-only session never sets it).
+    last_saved: Optional[str] = None
     # path -> mtime at last load/save, for detecting external writes (e.g. a concurrent
     # `sam3_process.py --refine` run). Not persisted to project.json.
     _loaded_mtimes: Dict[str, float] = field(default_factory=dict, init=False, repr=False, compare=False)
@@ -326,6 +365,8 @@ class SAM3Project:
                 (parallel processing) so a stale in-memory copy can't clobber a
                 concept another process just finished writing.
         """
+        from datetime import datetime
+        self.last_saved = datetime.now().isoformat()
         project_data = {
             "version": "1.0",
             "video_path": self.video_path,
@@ -337,6 +378,7 @@ class SAM3Project:
             "alt_video_paths": self.alt_video_paths,
             "alt_frames_dirs": self.alt_frames_dirs,
             "is_image": self.is_image,
+            "last_saved": self.last_saved,
             "concepts": [
                 {
                     "name": c.name,
@@ -411,6 +453,7 @@ class SAM3Project:
             alt_video_paths=project_data.get("alt_video_paths", []),
             alt_frames_dirs=project_data.get("alt_frames_dirs", []),
             is_image=project_data.get("is_image", False),
+            last_saved=project_data.get("last_saved"),
             concept_order=project_data.get("concept_order", []),
             device=project_data.get("global_settings", {}).get("device", "cuda:0"),
             default_opacity=project_data.get("global_settings", {}).get("default_opacity", 0.5),

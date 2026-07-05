@@ -1482,6 +1482,7 @@ def _load_masks_metadata(masks_dir: Path, obj_ids=None):
 
 def main():
     """Main processing function"""
+    os.umask(0o002)  # ensure group-writable output for shared results dirs
     parser = argparse.ArgumentParser(
         description="Process SAM2 annotations and generate segmented output",
         formatter_class=argparse.RawDescriptionHelpFormatter,

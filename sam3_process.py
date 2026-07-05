@@ -225,14 +225,16 @@ def _parallel_worker_main(worker_id, device, project_dir, model_name, use_fa3,
         item = task_queue.get()
         if item is None:
             break
-        concept = SAM3Concept.from_dict(item)
-        print(f"{tag} processing concept '{concept.name}' "
-              f"(prompt: '{concept.text_prompt}')")
+        concept_dict, task_idx, task_total = item
+        concept = SAM3Concept.from_dict(concept_dict)
+        print(f"{tag} processing concept '{concept.name}' [{task_idx}/{task_total}] "
+              f"({concept.prompt_label()})")
 
-        def progress_callback(frame_idx, num_frames, _name=concept.name):
+        def progress_callback(frame_idx, num_frames, _name=concept.name,
+                               _ci=task_idx, _n=task_total):
             if frame_idx % 200 == 0:
                 pct = (frame_idx + 1) / num_frames * 100
-                print(f"{tag} [{_name}] {frame_idx+1}/{num_frames} frames ({pct:.1f}%)")
+                print(f"{tag} [{_name}] [{_ci}/{_n}] {frame_idx+1}/{num_frames} frames ({pct:.1f}%)")
 
         try:
             process_concept_detection(
@@ -287,8 +289,9 @@ def process_project_parallel(args, project, concepts_to_process, devices):
     task_queue = ctx.Queue()
     result_queue = ctx.Queue()
 
-    for concept in concepts_to_process:
-        task_queue.put(concept.to_dict())
+    total = len(concepts_to_process)
+    for idx, concept in enumerate(concepts_to_process, start=1):
+        task_queue.put((concept.to_dict(), idx, total))
     for _ in range(n_workers):
         task_queue.put(None)  # one stop sentinel per worker
 
@@ -365,7 +368,8 @@ def process_project_parallel(args, project, concepts_to_process, devices):
 
 def _parallel_refine_worker_main(
     worker_id, device, project_dir, model_name, use_fa3, max_cond_frames_in_attn,
-    restore_cond_states, save_cond_states, cache_size, task_queue, result_queue
+    restore_cond_states, save_cond_states, save_obj_ptr_prior, preload_original_masks,
+    cache_size, new_instance_policy, task_queue, result_queue
 ):
     """
     Worker process for parallel refinement.
@@ -405,16 +409,18 @@ def _parallel_refine_worker_main(
 
         task_type = item["type"]
         cname = item["concept_name"]
+        task_idx = item.get("task_idx")
+        task_total = item.get("task_total")
 
-        def progress_callback(frame_idx, nf, _cname=cname):
+        def progress_callback(frame_idx, nf, _cname=cname, _ci=task_idx, _n=task_total):
             if frame_idx % 200 == 0:
                 pct = (frame_idx + 1) / nf * 100
-                print(f"{tag} [{_cname}] {frame_idx+1}/{nf} frames ({pct:.1f}%)")
+                print(f"{tag} [{_cname}] [{_ci}/{_n}] {frame_idx+1}/{nf} frames ({pct:.1f}%)")
 
         try:
             if task_type == "redetect":
                 concept = SAM3Concept.from_dict(item["concept"])
-                print(f"{tag} re-detecting concept '{concept.name}'")
+                print(f"{tag} re-detecting concept '{concept.name}' [{task_idx}/{task_total}]")
                 process_concept_detection(
                     sam3_model=sam3_model,
                     project=project,
@@ -441,7 +447,7 @@ def _parallel_refine_worker_main(
                     pending = [r for r in refinements if not r.get("propagated", True)]
                     if pending:
                         instances_with_pending.append((inst, pending))
-                print(f"{tag} refining concept '{cname}' "
+                print(f"{tag} refining concept '{cname}' [{task_idx}/{task_total}] "
                       f"({len(instances_with_pending)} instance(s) with pending)")
                 replay_concept_refinements(
                     concept=concept,
@@ -456,8 +462,11 @@ def _parallel_refine_worker_main(
                     device=device,
                     restore_cond_states=restore_cond_states,
                     save_cond_states=save_cond_states,
+                    save_obj_ptr_prior=save_obj_ptr_prior,
                     mask_format=project.mask_format,
                     cache_size=cache_size,
+                    preload_original_masks=preload_original_masks,
+                    new_instance_policy=new_instance_policy,
                 )
                 # Remove absorbed sources from the concept before saving metadata,
                 # mirroring the cleanup done in _refine_project_impl for the serial path.
@@ -506,6 +515,11 @@ def refine_project_parallel(args, project, redetect_concepts, refine_concepts, d
     if not all_tasks:
         return 0, set()
 
+    total_tasks = len(all_tasks)
+    for idx, task in enumerate(all_tasks, start=1):
+        task["task_idx"] = idx
+        task["task_total"] = total_tasks
+
     n_workers = min(args.parallel, len(all_tasks))
     print(f"\nStarting {n_workers} refine worker(s) on device(s): {', '.join(devices)}")
 
@@ -525,8 +539,9 @@ def refine_project_parallel(args, project, redetect_concepts, refine_concepts, d
             target=_parallel_refine_worker_main,
             args=(i, device, project.project_dir, _model_name_for(args),
                   args.use_fa3, args.max_cond_frames_in_attn,
-                  args.restore_cond, args.save_cond_states, args.cache_size,
-                  task_queue, result_queue),
+                  args.restore_cond, args.save_cond_states, args.save_obj_ptr_prior,
+                  args.preload_original_masks, args.cache_size,
+                  args.new_instance_policy, task_queue, result_queue),
             daemon=True,
         )
         p.start()
@@ -641,39 +656,44 @@ def _process_project_impl(args, project, devices):
         if args.concepts.endswith(".json") or os.path.isfile(args.concepts):
             loaded = load_concepts_from_json(args.concepts)
             # Skip concepts the project already completed (resume support).
-            # Use -f to force reprocessing.
+            # Use --reset to discard and redetect a completed concept.
             concepts_to_process = []
             skipped = []
             for c in loaded:
                 existing = project.get_concept_by_name(c.name)
-                if (existing is not None and not args.force
-                        and existing.status.value == "completed"):
+                if existing is not None and existing.status.value == "completed":
                     skipped.append(c.name)
                     continue
                 concepts_to_process.append(existing if existing is not None else c)
             if skipped:
                 print(f"Skipping {len(skipped)} already-completed concept(s): "
-                      f"{', '.join(skipped)}  (use -f to reprocess)")
+                      f"{', '.join(skipped)}  (use --reset to discard and redetect)")
             print(f"Loaded {len(concepts_to_process)} concept(s) to process "
                   f"from {args.concepts}")
         else:
             names = [n.strip() for n in args.concepts.split(",") if n.strip()]
             concepts_to_process = []
+            skipped = []
             for i, name in enumerate(names):
                 existing = next((c for c in project.concepts if c.name == name), None)
-                if existing and (existing.status.value in ("pending", "error") or args.force):
+                if existing and existing.status.value in ("pending", "error"):
                     concepts_to_process.append(existing)
+                elif existing:
+                    skipped.append(name)
                 elif not existing:
                     color = generate_concept_color(len(project.concepts) + i)
                     concepts_to_process.append(SAM3Concept(
                         name=name, text_prompt=name, color_rgb=color, detection_frame=0,
                         max_instances=args.max_instances,
                     ))
+            if skipped:
+                print(f"Skipping {len(skipped)} already-completed concept(s): "
+                      f"{', '.join(skipped)}  (use --reset to discard and redetect)")
             print(f"Using {len(concepts_to_process)} concept(s) from list: {', '.join(names)}")
     else:
         concepts_to_process = [
             c for c in project.concepts
-            if (c.status.value in ("pending", "error") or args.force)
+            if c.status.value in ("pending", "error")
         ]
         print(f"Found {len(concepts_to_process)} concept(s) to process in project")
 
@@ -700,7 +720,7 @@ def _process_project_impl(args, project, devices):
     for i, concept in enumerate(concepts_to_process):
         print(f"\n{'='*60}")
         print(f"Processing concept {i+1}/{len(concepts_to_process)}: '{concept.name}'")
-        print(f"Text prompt: '{concept.text_prompt}'")
+        print(f"Prompt: {concept.prompt_label()}")
         print(f"{'='*60}\n")
 
         existing = project.get_concept_by_name(concept.name)
@@ -709,10 +729,10 @@ def _process_project_impl(args, project, devices):
         else:
             concept = existing
 
-        def progress_callback(frame_idx, num_frames):
+        def progress_callback(frame_idx, num_frames, _name=concept.name, _ci=i, _n=len(concepts_to_process)):
             if frame_idx % 200 == 0:
                 progress = (frame_idx + 1) / num_frames * 100
-                print(f"Progress: {frame_idx+1}/{num_frames} frames ({progress:.1f}%)")
+                print(f"[concept '{_name}' {_ci+1}/{_n}] Progress: {frame_idx+1}/{num_frames} frames ({progress:.1f}%)")
 
         try:
             process_concept_detection(
@@ -1119,6 +1139,49 @@ def handle_reencode(args):
     return 0
 
 
+def reset_project(args):
+    """Handle --reset: flag completed concept(s) for full re-detection, then hand off
+    to refine_project so the existing sentinel-driven redetect pass (deletion summary,
+    confirmation, instance-dir wipe, re-detection) does the actual work. This is the
+    CLI equivalent of the UI's 'Reset & Re-detect' button — unlike plain process mode's
+    old -f behavior, it never runs silently: it always lists what will be lost and
+    always confirms unless -f is given."""
+    project = _load_project(args.project)
+    if project is None:
+        return 1
+
+    reset_filter = None
+    if args.reset:
+        reset_filter = {n.strip() for n in args.reset.split(",") if n.strip()}
+        targets = [c for c in project.concepts if c.name in reset_filter]
+        missing = reset_filter - {c.name for c in targets}
+        if missing:
+            print(f"Warning: concept(s) not found, skipping: {', '.join(sorted(missing))}")
+    else:
+        targets = list(project.concepts)
+
+    written = []
+    for c in targets:
+        instances_dir = os.path.join(project.project_dir, "concepts", c.name, "instances")
+        has_data = os.path.isdir(instances_dir) and any(os.scandir(instances_dir))
+        if not has_data:
+            continue  # nothing on disk to reset; a plain run will detect it fresh anyway
+        sentinel = os.path.join(project.project_dir, "concepts", c.name, "redetect")
+        os.makedirs(os.path.dirname(sentinel), exist_ok=True)
+        open(sentinel, "w").close()
+        written.append(c.name)
+
+    if not written:
+        print("No concept(s) with existing instance data to reset.")
+        return 0
+
+    print(f"Flagged {len(written)} concept(s) for reset: {', '.join(written)}")
+    # Scope the handoff to exactly these concepts, whether --reset was bare or filtered,
+    # so unrelated concepts' pending refinements aren't swept in by this call.
+    args.refine = ",".join(written)
+    return refine_project(args)
+
+
 def refine_project(args):
     """Replay saved refinement annotations, grouped by concept for correct non-overlapping."""
     project = _load_project(args.project)
@@ -1176,12 +1239,19 @@ def _refine_project_impl(args, project):
     # `concepts/<name>/redetect` and clears all instances/masks.  We run
     # process_concept_detection (text-prompt re-detection) for these first,
     # then handle normal pending-annotation refinements below.
+    #
+    # We also pick up brand-new concepts here (status pending/error with zero
+    # instances, e.g. saved via the UI's "Save as pending" box/text dialogs) —
+    # otherwise --refine silently drops them since they have no instances to
+    # scan for pending refinement points and no redetect sentinel either.
     concepts_to_redetect = {}  # concept.name -> concept
     for concept in project.concepts:
         if refine_filter and concept.name not in refine_filter:
             continue
         sentinel = os.path.join(project.project_dir, "concepts", concept.name, "redetect")
         if os.path.exists(sentinel):
+            concepts_to_redetect[concept.name] = concept
+        elif concept.status.value in ("pending", "error") and not concept.instances:
             concepts_to_redetect[concept.name] = concept
 
     # --- Pass 2: concepts with pending point annotations ---------------------
@@ -1311,10 +1381,10 @@ def _refine_project_impl(args, project):
     for i, (cname, concept) in enumerate(concepts_to_redetect.items()):
         print(f"\n[redetect {i+1}/{len(concepts_to_redetect)}] Re-detecting concept '{cname}'...")
 
-        def redetect_progress(frame_idx, nf, _cname=cname):
+        def redetect_progress(frame_idx, nf, _cname=cname, _ci=i, _n=len(concepts_to_redetect)):
             if frame_idx % 200 == 0:
                 pct = (frame_idx + 1) / nf * 100
-                print(f"  {frame_idx+1}/{nf} frames ({pct:.1f}%)")
+                print(f"  [{_ci+1}/{_n}] {frame_idx+1}/{nf} frames ({pct:.1f}%)")
 
         sentinel = os.path.join(project.project_dir, "concepts", cname, "redetect")
 
@@ -1328,7 +1398,8 @@ def _refine_project_impl(args, project):
                 save_cond_states=args.save_cond_states,
                 cache_size=args.cache_size,
             )
-            os.remove(sentinel)
+            if os.path.exists(sentinel):
+                os.remove(sentinel)
             project.save()
             print(f"  Concept '{cname}' re-detected: {len(concept.instances)} instance(s).")
         except Exception as e:
@@ -1342,10 +1413,10 @@ def _refine_project_impl(args, project):
         print(f"\n[refine {i+1}/{len(concepts_to_refine)}] Replaying refinements for concept "
               f"'{cname}' ({len(instances_with_pending)} instance(s))...")
 
-        def progress_callback(frame_idx, nf, _cname=cname):
+        def progress_callback(frame_idx, nf, _cname=cname, _ci=i, _n=len(concepts_to_refine)):
             if frame_idx % 200 == 0:
                 pct = (frame_idx + 1) / nf * 100
-                print(f"  {frame_idx+1}/{nf} frames ({pct:.1f}%)")
+                print(f"  [{_ci+1}/{_n}] {frame_idx+1}/{nf} frames ({pct:.1f}%)")
 
         try:
             replay_concept_refinements(
@@ -1361,8 +1432,11 @@ def _refine_project_impl(args, project):
                 device=devices[0],
                 restore_cond_states=args.restore_cond,
                 save_cond_states=args.save_cond_states,
+                save_obj_ptr_prior=args.save_obj_ptr_prior,
                 mask_format=project.mask_format,
                 cache_size=args.cache_size,
+                preload_original_masks=args.preload_original_masks,
+                new_instance_policy=args.new_instance_policy,
             )
             # Refinement succeeded: absorbed sources have been incorporated into the
             # target's anchor-based propagation and their original mask files have been
@@ -1445,6 +1519,8 @@ def handle_status(args):
     print("PROJECT STATUS")
     print(sep)
     print(f"  Directory  : {os.path.abspath(args.project)}")
+    if getattr(project, 'last_saved', None):
+        print(f"  Last saved : {project.last_saved}")
     print(f"  Video      : {project.video_path}")
     w, h = project.frame_dimensions
     print(f"  Resolution : {w}x{h}  ({project.num_frames} frames @ {project.fps:.2f} fps)")
@@ -1486,8 +1562,10 @@ def handle_status(args):
         total_masks = sum(i.num_frames_with_mask for i in live_instances)
 
         print(f"\n  Concept: '{concept.name}'")
-        print(f"    Text prompt    : {concept.text_prompt}")
+        print(f"    Prompt         : {concept.prompt_label()}")
         print(f"    Status         : {status_val}")
+        if status_val == "completed" and getattr(concept, 'completed_at', None):
+            print(f"    Completed at   : {concept.completed_at}")
         print(f"    Detection frame: {concept.detection_frame}")
         print(f"    Instances (live): {len(live_instances)}")
         if live_instances:
@@ -1614,8 +1692,6 @@ def handle_status(args):
         # Refinement is single-GPU (sequential per concept by design); no --parallel tip
         cmd = f"    {script} {proj_arg} \\\n      {filter_arg} \\\n      {device_arg.split('#')[0].strip()}"
         print(f"\n  Suggested command:\n{cmd}")
-        if n_gpus > 1:
-            print(f"  Note: --refine is sequential per concept; --parallel does not help here.")
 
     if not needs_action:
         print("\n  All concepts completed. No pending refinements.")
@@ -1639,6 +1715,7 @@ def handle_status(args):
 
 
 def main():
+    os.umask(0o002)  # ensure group-writable output for shared results dirs
     parser = argparse.ArgumentParser(
         description="SAM3 batch processing script",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1664,6 +1741,14 @@ def main():
                         help="Replay saved point annotations. "
                              "Bare --refine refines all concepts; "
                              "--refine person,car refines only those concepts.")
+    parser.add_argument("--reset", nargs="?", const="", default=None,
+                        metavar="CONCEPT,...",
+                        help="Discard a completed concept's instances, renames, mask "
+                             "anchors, and refinement points, then fully re-detect it "
+                             "from scratch. Bare --reset targets every completed "
+                             "concept; --reset person,car targets only those. Prints "
+                             "what will be lost and asks for confirmation unless -f is "
+                             "given. Equivalent to the UI's 'Reset & Re-detect' button.")
     parser.add_argument("--delete", default=None,
                         metavar="CONCEPT[:INST,...]",
                         help="Delete a concept or specific instances. "
@@ -1703,9 +1788,14 @@ def main():
                         help="Number of conditioning frames the tracker attends to per "
                              "forward pass (default: -1 = no limit, matching SAM3's "
                              "built-in default).  All user correction anchors are always "
-                             "attended to.  Set to a small positive value (e.g. 4) only "
-                             "if attention compute is a bottleneck with many correction "
-                             "frames.")
+                             "attended to.  Set to a small positive value (e.g. 4-8) to "
+                             "bound attention compute AND GPU memory when a concept has "
+                             "many annotation/mask-anchor frames: cond frames outside the "
+                             "selected window are also offloaded to CPU between propagation "
+                             "steps (see _offload_unselected_cond_frames in sam3_pipeline.py) "
+                             "and transparently reloaded onto GPU only when propagation "
+                             "comes back near them. At -1 this offload is a no-op, since "
+                             "every cond frame is always in the selected window.")
     parser.add_argument("--device", default="cuda:0",
                         help="Device, comma-separated list, or 'all' to use every available GPU "
                              "(e.g. cuda:2, cuda:2,cuda:3, or all). Default: cuda:0")
@@ -1717,18 +1807,51 @@ def main():
                              "the GPU under-utilized (~2 per GPU currently). Each "
                              "worker loads its own model copy (~4 GB GPU memory).")
     parser.add_argument("-f", "--force", action="store_true",
-                        help="Skip confirmation prompts for --delete. "
-                             "In process mode: reprocess concepts even if already completed.")
+                        help="Skip confirmation prompts. Only meaningful alongside "
+                             "--delete, --delete-frames, --refine, or --reset — plain "
+                             "process mode never needs it, since it never touches an "
+                             "already-completed concept's data.")
     parser.add_argument("--restore-cond", action="store_true", dest="restore_cond",
                         help="Restore saved maskmem cond-frame states from the prior refinement "
                              "round before propagating. Off by default: prior states may encode "
                              "stale/wrong segmentation and bias corrections. Enable only when the "
                              "prior round was good and you want continuity across sessions.")
+    parser.add_argument("--preload-original-masks", action="store_true",
+                        dest="preload_original_masks",
+                        help="Reinforce every live instance from its own on-disk mask (saved at "
+                             "the end of the *previous* round) as an extra conditioning frame at "
+                             "its first detection frame. Off by default: only conditioning frames "
+                             "the user actually created (points, boxes, mask anchors) are used, "
+                             "so an instance with no annotation this round and no fresh "
+                             "redetection under its own id is simply left untouched, rather than "
+                             "silently reinforced with stale prior-round content the user never "
+                             "sees.")
+    parser.add_argument("--new-instance-policy", default="allow",
+                        choices=["allow", "latent", "disallow"], dest="new_instance_policy",
+                        help="What to do with an object first detected mid-video during "
+                             "--refine (not present at the initial detection frame, not a "
+                             "known live/deleted/absorbed instance). 'allow' (default): "
+                             "promote it to a new instance under a freshly assigned id. "
+                             "'latent': let it keep tracking/competing for the rest of this "
+                             "run but never persist or promote it. 'disallow': cap SAM3's "
+                             "max_num_objects so it can never be created in the first place.")
     parser.add_argument("--save-cond-states", action="store_true", dest="save_cond_states",
                         help="Save maskmem cond-frame states to concepts/<name>/cond_states/ "
                              "after detection/refinement, for a future --restore-cond round. "
                              "Off by default: these states are only consumed by --restore-cond "
-                             "and can be sizeable (100s of MB per concept).")
+                             "and can be sizeable (100s of MB per concept). "
+                             "Planned to be phased out in favor of scoped flags such as "
+                             "--save-obj-ptr-prior.")
+    parser.add_argument("--save-obj-ptr-prior", action="store_true", dest="save_obj_ptr_prior",
+                        help="After a refinement round only (never at initial detection), save "
+                             "each instance's obj_ptr — a small 256-d object-identity embedding, "
+                             "averaged over that instance's cond frames where the object was "
+                             "judged present — to concepts/<name>/obj_ptr_priors.npz. Overwritten "
+                             "each refinement round (newer, human-corrected anchors supersede "
+                             "older ones). Intended for a future cross-video object/category "
+                             "prior; unlike --save-cond-states this does not save "
+                             "maskmem_features (~650x larger) and has no effect on tracking or "
+                             "detection today.")
     parser.add_argument("--delete-frames", action="store_true", dest="delete_frames",
                         help="Delete the persistent frame cache registered for this project "
                              "(shows path and size, then prompts for confirmation unless -f).")
@@ -1762,6 +1885,16 @@ def main():
 
     args = parser.parse_args()
 
+    if args.refine is not None and args.reset is not None:
+        parser.error("--refine and --reset are mutually exclusive; run them separately.")
+
+    if args.force and not any([
+        args.delete_frames, args.delete is not None,
+        args.refine is not None, args.reset is not None,
+    ]):
+        parser.error("-f/--force has nothing to confirm-skip here: it only applies "
+                     "to --delete, --delete-frames, --refine, or --reset.")
+
     if args.device.strip().lower() == "all":
         import torch
         n = torch.cuda.device_count()
@@ -1788,6 +1921,12 @@ def main():
 
     if args.export_sam2:
         rc = handle_export_sam2(args)
+        if rc == 0 and args.quality_metrics:
+            return handle_quality_metrics(args)
+        return rc
+
+    if args.reset is not None:
+        rc = reset_project(args)
         if rc == 0 and args.quality_metrics:
             return handle_quality_metrics(args)
         return rc

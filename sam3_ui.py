@@ -56,7 +56,7 @@ if project_root not in sys.path:
 from sam3_project import SAM3Project, SAM3Concept, SAM3Instance, ConceptStatus, check_refine_lock
 from sam3_pipeline import (
     load_sam3_model, get_video_info,
-    process_concept_detection, add_refinement_points, online_add_refinement_points,
+    process_concept_detection,
     compute_continuous_periods, online_replay_concept_refinements,
     replay_concept_refinements,
 )
@@ -229,6 +229,9 @@ class SAM3VideoUI:
         self.flash_overlap_computed = None
         self.flash_points_in_progress = False
         self.flash_points_on = False
+        self.flash_custom_in_progress = False
+        self.flash_custom_on = False
+        self.flash_custom_mask = None
 
         # Setup UI
         self._setup_ui()
@@ -256,6 +259,9 @@ class SAM3VideoUI:
         self.root.bind('f', lambda e: self._handle_flash_shortcut())
         self.root.bind('o', lambda e: self._handle_overlap_shortcut())
         self.root.bind('r', lambda e: self._handle_removal_shortcut())
+
+        # 'b': toggle box/point annotation mode (same as the Box Mode button)
+        self.root.bind('b', lambda e: self._toggle_box_mode())
 
         # Clean up live sessions on window close
         self.root.protocol("WM_DELETE_WINDOW", self._on_closing)
@@ -555,21 +561,27 @@ class SAM3VideoUI:
         self._update_speed_button_highlight()
 
         # ── Row 4 (compact): quality colorbars (overlap + background ratio) ────
+        # Uses grid (not pack) so the two canvases split the row's width exactly
+        # 50/50 regardless of window size — pack's expand allocates space
+        # sequentially, so the label sitting between them would otherwise steal
+        # from the second canvas's share when the window is narrow.
         self._nav_row4 = row4 = tk.Frame(parent)
         row4.pack(fill=tk.X, padx=5, pady=(1, 3))
+        row4.columnconfigure(1, weight=1, uniform="qbar")
+        row4.columnconfigure(3, weight=1, uniform="qbar")
 
         tk.Label(row4, text="Overlap:", font=("Arial", 7), fg="gray", width=7,
-                 anchor=tk.W).pack(side=tk.LEFT)
+                 anchor=tk.W).grid(row=0, column=0, sticky="w")
         self.quality_overlap_canvas = tk.Canvas(row4, height=10, bg='#2a2a2a',
                                                 relief=tk.FLAT, bd=0)
-        self.quality_overlap_canvas.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+        self.quality_overlap_canvas.grid(row=0, column=1, sticky="ew", padx=(0, 6))
         self.quality_overlap_canvas.bind('<Button-1>', self._on_quality_bar_click)
 
         tk.Label(row4, text="BG:", font=("Arial", 7), fg="gray", width=3,
-                 anchor=tk.W).pack(side=tk.LEFT)
+                 anchor=tk.W).grid(row=0, column=2, sticky="w")
         self.quality_bg_canvas = tk.Canvas(row4, height=10, bg='#2a2a2a',
                                            relief=tk.FLAT, bd=0)
-        self.quality_bg_canvas.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.quality_bg_canvas.grid(row=0, column=3, sticky="ew")
         self.quality_bg_canvas.bind('<Button-1>', self._on_quality_bar_click)
 
     def _setup_controls_panel(self, parent):
@@ -2132,6 +2144,11 @@ class SAM3VideoUI:
         if not project_dir:
             return
 
+        self._load_project_from_dir(project_dir)
+
+    def _load_project_from_dir(self, project_dir: str):
+        """Load a SAM3 project given its directory path (shared by load_project() and --project CLI arg)"""
+
         # Release any live sessions before loading a different project
         self._release_all_sessions()
 
@@ -2558,10 +2575,24 @@ class SAM3VideoUI:
                         interpolation=cv2.INTER_NEAREST).astype(bool)
                 red_overlay = np.zeros_like(frame_rgb)
                 red_overlay[overlap_mask] = [255, 60, 0]
+
                 frame_rgb = cv2.addWeighted(frame_rgb, 0.4, red_overlay, 0.6, 0)
 
-            # Draw saved/pending refinement points and boxes
-            if self.refinement_points or self.refinement_boxes:
+            # Flash custom mask: cyan overlay for an arbitrary mask array (e.g. a
+            # single union-dialog component the user wants to visually identify)
+            if self.flash_custom_in_progress and self.flash_custom_on and self.flash_custom_mask is not None:
+                cm = self.flash_custom_mask
+                fh, fw = frame_rgb.shape[:2]
+                if cm.shape[0] != fh or cm.shape[1] != fw:
+                    cm = cv2.resize(cm.astype(np.uint8), (fw, fh), interpolation=cv2.INTER_NEAREST)
+                cyan = np.zeros_like(frame_rgb)
+                cyan[cm > 127] = [0, 255, 255]
+                frame_rgb = cv2.addWeighted(frame_rgb, 0.3, cyan, 0.7, 0)
+
+            # Draw saved/pending refinement points and boxes — skipped during playback since
+            # they're tied to the frame the user was working on, not to whatever frame is
+            # currently playing.
+            if not _is_playing and (self.refinement_points or self.refinement_boxes):
                 frame_rgb = frame_rgb.copy()
                 flash_pts = self.flash_points_in_progress and self.flash_points_on
                 radius = 10 if flash_pts else 5
@@ -2978,6 +3009,14 @@ class SAM3VideoUI:
         )
 
         self.project.add_concept(concept)
+        # Persist the new concept (status=PENDING, no instances) to disk immediately —
+        # not just after detection succeeds. Without this, a concept that errors out
+        # (or whose detection is interrupted, e.g. the app is closed mid-run) exists
+        # only in this session's in-memory self.project.concepts and was never written
+        # to project.json/concept_metadata.json, so a separate `sam3_process.py --refine`
+        # run (which loads project.json fresh) has no way to know it exists and can
+        # never pick it up for redetection.
+        self._safe_project_save()
         self.update_concept_tree()
 
         # Process in background with progress dialog
@@ -3099,6 +3138,11 @@ class SAM3VideoUI:
         print(f"{error}")
         print(f"==========================================================\n")
         self.status_var.set(f"Error processing concept '{concept_name}'.")
+        # process_concept_detection already set concept.status = ERROR in-memory before
+        # raising; persist that so the on-disk record matches (and so a later
+        # `sam3_process.py --refine` sees status=error, not a stale pending/completed
+        # state from before this attempt).
+        self._safe_project_save()
         messagebox.showerror("Error", f"Failed to process concept '{concept_name}':\n{error}")
 
     def remove_concept_dialog(self):
@@ -3181,7 +3225,7 @@ class SAM3VideoUI:
             f"This will (when you click 'Save Changes for Refinement'):\n"
             f"  - Delete all {n_inst} instance(s) and their masks from disk\n"
             f"  - Clear all annotation points for this concept\n"
-            f"  - Write a sentinel so --refine re-runs text detection\n\n"
+            f"  - Write a sentinel so --refine re-runs detection ({concept.prompt_label()})\n\n"
             f"Nothing is deleted yet. You can undo this with Ctrl+Z."
         )
         if not confirm:
@@ -3194,10 +3238,14 @@ class SAM3VideoUI:
         # Snapshot current state for undo
         snapshot_instances = copy.deepcopy(concept.instances)
         snapshot_status = concept.status
+        snapshot_highest_obj_id = concept.highest_obj_id
+        snapshot_completed_at = concept.completed_at
 
         # Clear in memory only — disk untouched until save
         concept.instances = []
         concept.status = ConceptStatus.PENDING
+        concept.highest_obj_id = -1
+        concept.completed_at = None
         self._concepts_pending_reset.add(concept.name)
 
         # Discard any unsaved annotation changes for this concept's instances
@@ -3219,6 +3267,8 @@ class SAM3VideoUI:
             'concept_name': concept.name,
             'snapshot_instances': snapshot_instances,
             'snapshot_status': snapshot_status,
+            'snapshot_highest_obj_id': snapshot_highest_obj_id,
+            'snapshot_completed_at': snapshot_completed_at,
         })
         self.redo_stack.clear()
 
@@ -3279,30 +3329,52 @@ class SAM3VideoUI:
         single-letter shortcuts (like 'f' for flash) keep working."""
         if not self.selected_instance:
             return
+        if self._absorb_wizard:
+            # The wizard's own focus_set() (moving focus off the entry to the
+            # canvas) fires this handler as a side effect — not a real user
+            # edit. Ignore it so it doesn't re-trigger rename_instance() and
+            # collide with the wizard already in progress.
+            return
         new_name = self.name_entry.get().strip()
         if not new_name or new_name == self.selected_instance.user_name:
             return
         self.rename_instance()
 
     def rename_instance(self):
-        """Rename selected instance"""
+        """Rename selected instance, via a mask/point confirmation wizard (same UX
+        as absorb's source-confirmation phase) so the rename also locks in a
+        self-anchor for the instance. Falls back to a plain rename if the
+        instance has no masks yet to confirm (e.g. never propagated)."""
 
         if not self.selected_instance:
             messagebox.showwarning("Warning", "Please select an instance first.")
+            return
+        if not self.selected_concept:
+            messagebox.showwarning("Warning", "No concept selected.")
             return
 
         new_name = self.name_entry.get().strip()
         if not new_name:
             messagebox.showwarning("Warning", "Name cannot be empty.")
             return
+        if new_name == self.selected_instance.user_name:
+            return
+        if self._absorb_wizard:
+            messagebox.showwarning("Warning", "Finish or cancel the current wizard first.")
+            return
 
-        old_name = self.selected_instance.user_name
-        self.selected_instance.user_name = new_name
+        self._start_rename_wizard(self.selected_concept, self.selected_instance, new_name)
+
+    def _apply_rename_directly(self, concept, instance, new_name):
+        """Plain rename with no mask/point confirmation (used when there's no
+        mask to confirm yet)."""
+        old_name = instance.user_name
+        instance.user_name = new_name
         self.undo_stack.append({
             'type': 'rename_instance',
-            'instance': self.selected_instance,
-            'concept_name': self.selected_concept.name,
-            'obj_id': self.selected_instance.sam3_obj_id,
+            'instance': instance,
+            'concept_name': concept.name,
+            'obj_id': instance.sam3_obj_id,
             'old_name': old_name,
             'new_name': new_name,
         })
@@ -3311,6 +3383,156 @@ class SAM3VideoUI:
         self.update_concept_tree()
         self.status_var.set(f"Renamed instance to '{new_name}'. Ctrl+Z to undo.")
         self.canvas.focus_set()
+
+    def _start_rename_wizard(self, concept, instance, new_name):
+        """Launch the single-phase confirmation wizard for a rename.
+
+        Reuses the absorb wizard's source-confirmation phase (confirm a mask,
+        or fall back to placing a point) but there is no second (target) phase
+        here since only one instance is involved — the confirmed anchor is
+        written back onto the same instance being renamed, not copied to a
+        separate target.
+
+        If the instance already has a confirmed anchor (mask anchor, absorb
+        anchor, or placed refinement points) — e.g. from a previous rename or
+        absorb — there's nothing new to confirm, so skip straight to a plain
+        rename instead of re-prompting the wizard.
+        """
+        if self._target_already_has_anchor(concept, instance):
+            self._apply_rename_directly(concept, instance, new_name)
+            return
+        info = self._get_first_period_info(concept, instance)
+        if info is None:
+            self._apply_rename_directly(concept, instance, new_name)
+            return
+        best, start, end = info
+
+        self._absorb_wizard = {
+            'kind': 'rename',
+            'concept': concept,
+            'target': instance,
+            'source': instance,
+            'phase': 'source',
+            'source_period': (start, end),
+            'target_period': None,
+            'target_peak_frame': None,
+            'source_result': None,
+            'target_result': None,
+            'mode': 'confirm',
+            'saved_slider_from': int(self.frame_slider.cget('from')),
+            'saved_slider_to': int(self.frame_slider.cget('to')),
+            'saved_zoom': self.slider_zoom_level.get(),
+            'original_concept': self.selected_concept,
+            'original_instance': self.selected_instance,
+            'new_name': new_name,
+            'old_name': instance.user_name,
+        }
+        self._wizard_pending_points = []
+        self._wizard_pending_boxes = []
+        self._wizard_enter_phase('source', best)
+
+    def _complete_rename_wizard(self):
+        """Stage the confirmed self-anchor (mask or points), apply the rename,
+        and push an undo entry."""
+        from datetime import datetime as _dt
+        wiz = self._absorb_wizard
+        if wiz is None:
+            return
+
+        concept = wiz['concept']
+        instance = wiz['target']  # target == source for a rename
+        new_name = wiz['new_name']
+        old_name = wiz['old_name']
+        result = wiz['source_result']
+        copied_paths: List[str] = []
+        staged_point_entries: List[dict] = []
+
+        if result['type'] == 'mask':
+            frame_idx = result['frame_idx']
+            mask_dir = os.path.join(
+                self.project.project_dir, "concepts", concept.name,
+                "instances", str(instance.sam3_obj_id), "masks"
+            )
+            mask_np = load_sam3_mask(mask_dir, frame_idx)
+            if mask_np is None:
+                messagebox.showwarning(
+                    "Warning",
+                    f"Mask not found at frame {frame_idx} for "
+                    f"'{instance.user_name}'. Renaming without an anchor."
+                )
+            else:
+                dst_dir = Path(self.project.project_dir) / "concepts" / concept.name / \
+                          "instances" / str(instance.sam3_obj_id) / "mask_anchors"
+                dst_dir.mkdir(parents=True, exist_ok=True)
+                dst_path = dst_dir / f"{frame_idx:06d}.png"
+                if dst_path.exists():
+                    existing = cv2.imread(str(dst_path), cv2.IMREAD_GRAYSCALE)
+                    if existing is not None and existing.shape == mask_np.shape:
+                        import numpy as np
+                        mask_np = np.maximum(mask_np.astype("uint8"), existing.astype("uint8"))
+                cv2.imwrite(str(dst_path), mask_np)
+                if frame_idx not in instance.mask_anchor_frames:
+                    instance.mask_anchor_frames.append(frame_idx)
+                copied_paths.append(str(dst_path))
+                rel_path = os.path.join(
+                    "concepts", concept.name, "instances", str(instance.sam3_obj_id),
+                    "mask_anchors", f"{frame_idx:06d}.png"
+                )
+                trigger_entry = {
+                    "timestamp": _dt.now().isoformat(),
+                    "type": "mask_anchor",
+                    "frame_idx": frame_idx,
+                    "mask_path": rel_path,
+                    "propagated": False,
+                    "auto_rename_self_anchor": True,
+                }
+                self._stage_anchors_to_cache(concept, instance, [trigger_entry])
+                staged_point_entries.append(trigger_entry)
+        elif result['type'] == 'points':
+            frame_idx = result['frame_idx']
+            pts = result.get('points', [])
+            boxes = result.get('boxes', [])
+            entry = {
+                "timestamp": _dt.now().isoformat(),
+                "frame_idx": frame_idx,
+                "points": [{"x": x, "y": y, "is_positive": p} for x, y, p in pts],
+                "propagated": False,
+                "auto_rename_self_anchor": True,
+            }
+            if boxes:
+                entry["boxes"] = [{"x1": x1, "y1": y1, "x2": x2, "y2": y2}
+                                  for x1, y1, x2, y2 in boxes]
+            self._stage_anchors_to_cache(concept, instance, [entry])
+            staged_point_entries.append(entry)
+
+        instance.user_name = new_name
+
+        self.undo_stack.append({
+            'type': 'rename_wizard',
+            'instance': instance,
+            'concept': concept,
+            'concept_name': concept.name,
+            'obj_id': instance.sam3_obj_id,
+            'old_name': old_name,
+            'new_name': new_name,
+            'copied_mask_paths': copied_paths,
+            'staged_point_entries': staged_point_entries,
+        })
+        self.redo_stack.clear()
+
+        self._wizard_finish()
+
+        self._metadata_dirty = True
+        self.update_concept_tree()
+        self.compositor = DynamicFrameCompositor(self.project)
+        self.display_frame()
+
+        desc = (f"mask at frame {result['frame_idx']}" if result['type'] == 'mask'
+                else f"point(s) at frame {result['frame_idx']}")
+        self.status_var.set(
+            f"Renamed to '{new_name}' (anchor: {desc}). "
+            "Save Changes for Refinement then --refine to apply. Ctrl+Z to undo."
+        )
 
     # ------------------------------------------------------------------
     # Vocabulary
@@ -3583,8 +3805,12 @@ class SAM3VideoUI:
         and runs 'Save Changes for Refinement', then `sam3_process.py --refine` initializes it
         via those points and propagates it alongside all other concept instances.
 
-        Object IDs are assigned starting at 1000 to avoid any collision with
-        text-detected IDs (which SAM3 assigns 0..N-1).
+        Object IDs are assigned as concept.highest_obj_id + 1 rather than
+        max(current instance ids) + 1: the latter would shrink back down after the user
+        deletes/consolidates instances and purges them from the list, risking collision
+        with whatever small integer SAM3's own auto-detector assigns to a genuinely new
+        object in a later refine session. highest_obj_id only grows (or is reset to -1 on
+        a full concept reset/re-detect) — see SAM3Concept.highest_obj_id.
         """
         if not self.selected_concept or not self.project:
             messagebox.showwarning("Warning", "Please select a concept first.")
@@ -3597,8 +3823,8 @@ class SAM3VideoUI:
             return
         name = dlg.result
 
-        existing_ids = {inst.sam3_obj_id for inst in self.selected_concept.instances}
-        new_id = max(existing_ids, default=-1) + 1
+        new_id = self.selected_concept.highest_obj_id + 1
+        self.selected_concept.highest_obj_id = new_id
 
         from sam3_project import SAM3Instance
         new_inst = SAM3Instance(
@@ -3763,6 +3989,30 @@ class SAM3VideoUI:
         concept = self.selected_concept
         self._start_absorb_wizard(concept, target, source)
 
+    def _target_already_has_anchor(self, concept, target) -> bool:
+        """True if the target instance already has a confirmed mask anchor or
+        user-placed annotation (points/boxes) — e.g. from a prior absorb into
+        it, or from confirming a self-anchor via the rename wizard. In that
+        case there's no need to also ask the user to confirm the target's own
+        mask during a later absorb.
+        """
+        if target.received_absorb_anchor or target.mask_anchor_frames:
+            return True
+        if not self.project:
+            return False
+        rpath = os.path.join(
+            self.project.project_dir, "concepts", concept.name,
+            "instances", str(target.sam3_obj_id), "refinements.json"
+        )
+        if os.path.exists(rpath):
+            try:
+                with open(rpath) as f:
+                    if json.load(f).get("refinements", []):
+                        return True
+            except Exception:
+                pass
+        return False
+
     def _start_absorb_wizard(self, concept, target, source):
         """Initialise and enter the absorb wizard (source confirmation phase)."""
         src_info = self._get_first_period_info(concept, source)
@@ -3776,7 +4026,7 @@ class SAM3VideoUI:
         src_best, src_start, src_end = src_info
 
         tgt_info = None
-        if not target.received_absorb_anchor:
+        if not self._target_already_has_anchor(concept, target):
             tgt_info = self._get_first_period_info(concept, target)
 
         self._absorb_wizard = {
@@ -3812,8 +4062,11 @@ class SAM3VideoUI:
         if phase == 'source':
             inst = wiz['source']
             period_start, period_end = wiz['source_period']
-            n_steps = 1 if wiz['target_period'] is None else 2
-            title = f"Wizard (1/{n_steps}): confirm mask for SOURCE '{inst.user_name}'"
+            if wiz.get('kind') == 'rename':
+                title = f"Confirm mask to rename '{inst.user_name}' -> '{wiz['new_name']}'"
+            else:
+                n_steps = 1 if wiz['target_period'] is None else 2
+                title = f"Wizard (1/{n_steps}): confirm mask for SOURCE '{inst.user_name}'"
         else:
             inst = wiz['target']
             period_start, period_end = wiz['target_period']
@@ -3838,6 +4091,9 @@ class SAM3VideoUI:
         self._wizard_title_lbl.config(text=title)
         self._wizard_instr_lbl.config(text=instr)
         self._wizard_update_action_buttons()
+        # Move focus off the name entry so Left/Right arrow keys navigate
+        # frames instead of moving the text cursor within the entry.
+        self.canvas.focus_set()
         if not self._wizard_banner.winfo_ismapped():
             self._wizard_banner.pack(fill=tk.X, padx=5, pady=2, after=self.canvas)
 
@@ -3879,14 +4135,19 @@ class SAM3VideoUI:
         frame_idx = self.current_frame_idx
 
         if wiz['phase'] == 'source':
-            extra_mask, use_annot = self._wizard_check_union_at_frame(wiz, frame_idx)
-            if use_annot:
-                # User wants to annotate instead — discard the accepted mask and
-                # enter point+box mode so they can place their own prompts.
-                self._wizard_switch_to_point_mode()
-                return
-            wiz['source_result'] = {'type': 'mask', 'frame_idx': frame_idx}
-            wiz['source_extra_union_mask'] = extra_mask
+            if wiz.get('kind') == 'rename':
+                # Rename has no separate target to union against — accept directly.
+                wiz['source_result'] = {'type': 'mask', 'frame_idx': frame_idx}
+                wiz['source_extra_union_mask'] = None
+            else:
+                extra_mask, use_annot = self._wizard_check_union_at_frame(wiz, frame_idx)
+                if use_annot:
+                    # User wants to annotate instead — discard the accepted mask and
+                    # enter point+box mode so they can place their own prompts.
+                    self._wizard_switch_to_point_mode()
+                    return
+                wiz['source_result'] = {'type': 'mask', 'frame_idx': frame_idx}
+                wiz['source_extra_union_mask'] = extra_mask
         else:
             wiz[f"{wiz['phase']}_result"] = {'type': 'mask', 'frame_idx': frame_idx}
         self._wizard_advance()
@@ -3942,6 +4203,8 @@ class SAM3VideoUI:
             # Restore slider before entering target phase (so save/restore round-trips cleanly)
             self._wizard_exit_zoom()
             self._wizard_enter_phase('target', wiz['target_peak_frame'])
+        elif wiz.get('kind') == 'rename':
+            self._complete_rename_wizard()
         else:
             self._complete_absorb_wizard()
 
@@ -4033,7 +4296,13 @@ class SAM3VideoUI:
         for label, m in components:
             v = tk.BooleanVar(value=True)
             check_vars.append((v, m))
-            tk.Checkbutton(dlg, text=label, variable=v).pack(anchor=tk.W, padx=24)
+            row = tk.Frame(dlg)
+            row.pack(anchor=tk.W, padx=24, fill=tk.X)
+            tk.Checkbutton(row, text=label, variable=v).pack(side=tk.LEFT)
+            tk.Button(
+                row, text="Flash", width=6,
+                command=lambda m=m: self.flash_mask_array(m),
+            ).pack(side=tk.LEFT, padx=(6, 0))
 
         tk.Label(
             dlg,
@@ -4504,9 +4773,10 @@ class SAM3VideoUI:
         x0c, y0c = self._box_draw_start
         if self._box_draw_canvas_id:
             self.canvas.delete(self._box_draw_canvas_id)
+        preview_color = 'yellow'
         self._box_draw_canvas_id = self.canvas.create_rectangle(
             x0c, y0c, event.x, event.y,
-            outline='yellow', width=2, dash=(4, 2),
+            outline=preview_color, width=2, dash=(4, 2),
         )
 
     def _on_box_drag_end(self, event):
@@ -4869,12 +5139,40 @@ class SAM3VideoUI:
             self.update_concept_tree()
             self.status_var.set(f"Renamed back to '{action['old_name']}'.")
 
+        elif t == 'rename_wizard':
+            action['instance'].user_name = action['old_name']
+            # Remove copied mask anchor file(s)
+            for p in action.get('copied_mask_paths', []):
+                try:
+                    Path(p).unlink(missing_ok=True)
+                    frame_idx = int(Path(p).stem)
+                    if frame_idx in action['instance'].mask_anchor_frames:
+                        action['instance'].mask_anchor_frames.remove(frame_idx)
+                except Exception:
+                    pass
+            if action.get('staged_point_entries'):
+                self._unstage_anchors_from_cache(
+                    action['concept'], action['instance'], action['staged_point_entries'])
+                mask_anchor_entries = [e for e in action['staged_point_entries']
+                                       if e.get('type') == 'mask_anchor']
+                if mask_anchor_entries:
+                    self._remove_mask_anchor_triggers(
+                        action['concept'].name, action['instance'].sam3_obj_id,
+                        [e['frame_idx'] for e in mask_anchor_entries])
+            self._metadata_dirty = True
+            self.update_concept_tree()
+            self.compositor = DynamicFrameCompositor(self.project)
+            self.display_frame()
+            self.status_var.set(f"Renamed back to '{action['old_name']}'.")
+
         elif t == 'reset_concept':
             cname = action['concept_name']
             concept = self.project.get_concept_by_name(cname)
             if concept:
                 concept.instances = action['snapshot_instances']
                 concept.status = action['snapshot_status']
+                concept.highest_obj_id = action['snapshot_highest_obj_id']
+                concept.completed_at = action.get('snapshot_completed_at')
                 self._concepts_pending_reset.discard(cname)
                 self.update_concept_tree()
                 self.compositor = DynamicFrameCompositor(self.project)
@@ -5076,12 +5374,35 @@ class SAM3VideoUI:
             self.update_concept_tree()
             self.status_var.set(f"Renamed to '{action['new_name']}'.")
 
+        elif t == 'rename_wizard':
+            action['instance'].user_name = action['new_name']
+            for p in action.get('copied_mask_paths', []):
+                frame_idx = int(Path(p).stem)
+                if frame_idx not in action['instance'].mask_anchor_frames:
+                    action['instance'].mask_anchor_frames.append(frame_idx)
+            if action.get('staged_point_entries'):
+                self._stage_anchors_to_cache(
+                    action['concept'], action['instance'], action['staged_point_entries'])
+                mask_anchor_entries = [e for e in action['staged_point_entries']
+                                       if e.get('type') == 'mask_anchor']
+                if mask_anchor_entries:
+                    self._write_mask_anchor_triggers(
+                        action['concept'].name, action['instance'].sam3_obj_id,
+                        mask_anchor_entries)
+            self._metadata_dirty = True
+            self.update_concept_tree()
+            self.compositor = DynamicFrameCompositor(self.project)
+            self.display_frame()
+            self.status_var.set(f"Renamed to '{action['new_name']}'.")
+
         elif t == 'reset_concept':
             cname = action['concept_name']
             concept = self.project.get_concept_by_name(cname)
             if concept:
                 concept.instances = []
                 concept.status = ConceptStatus.PENDING
+                concept.highest_obj_id = -1
+                concept.completed_at = None
                 self._concepts_pending_reset.add(cname)
                 keys_to_drop = [k for k in list(self._points_cache) if k[0] == cname]
                 for k in keys_to_drop:
@@ -5584,6 +5905,7 @@ class SAM3VideoUI:
                             project_dir=self.project.project_dir,
                             progress_callback=progress_callback,
                             mask_format=self.project.mask_format,
+                            new_instance_policy="allow",
                         )
                     except Exception as online_err:
                         # Session may have gone stale — fall back to offline path
@@ -5620,6 +5942,8 @@ class SAM3VideoUI:
                         progress_callback=progress_callback,
                         device=self.device,
                         mask_format=self.project.mask_format,
+                        preload_original_masks=False,
+                        new_instance_policy="allow",
                     )
 
                 # Close dialog and refresh display; save + metadata reset happen there
@@ -5673,6 +5997,9 @@ class SAM3VideoUI:
         self.flash_overlap_computed = None
         self.flash_points_in_progress = False
         self.flash_points_on = False
+        self.flash_custom_in_progress = False
+        self.flash_custom_on = False
+        self.flash_custom_mask = None
 
     def _handle_flash_shortcut(self):
         if self._should_ignore_keyboard_shortcut():
@@ -5715,6 +6042,33 @@ class SAM3VideoUI:
             self.flash_mask_on = not self.flash_mask_on
             self.display_frame()
             if not self.flash_mask_on:
+                flash_count[0] += 1
+            self.root.after(300, flash_step)
+
+        flash_step()
+
+    def flash_mask_array(self, mask_np):
+        """Flash an arbitrary mask array (cyan overlay, 3x, 300ms each).
+
+        Used by dialogs that let the user choose among several candidate masks
+        (e.g. the absorb/rename union dialog) so they can visually identify
+        which mask a given checkbox/label refers to before deciding.
+        """
+        if mask_np is None:
+            return
+        self.flash_custom_mask = mask_np
+        self.flash_custom_in_progress = True
+        self.flash_custom_on = False
+        flash_count = [0]
+
+        def flash_step():
+            if flash_count[0] >= 3:
+                self._reset_flash_state()
+                self.display_frame()
+                return
+            self.flash_custom_on = not self.flash_custom_on
+            self.display_frame()
+            if not self.flash_custom_on:
                 flash_count[0] += 1
             self.root.after(300, flash_step)
 
@@ -7369,8 +7723,26 @@ class VocabularyEditorDialog:
 
 
 def main():
+    import argparse
+
+    parser = argparse.ArgumentParser(description="SAM3 text-prompt annotation UI")
+    parser.add_argument(
+        "project", nargs="?", default=None,
+        help="Path to a SAM3 project directory to load on startup",
+    )
+    parser.add_argument(
+        "--project", dest="project_opt", default=None,
+        help="Path to a SAM3 project directory to load on startup (alternative to positional arg)",
+    )
+    args = parser.parse_args()
+    project_dir = args.project_opt or args.project
+
+    os.umask(0o002)  # ensure group-writable output for shared results dirs
     root = tk.Tk()
     app = SAM3VideoUI(root)
+    if project_dir:
+        root.update()  # ensure window is realized before loading (status bar, etc.)
+        app._load_project_from_dir(project_dir)
     root.mainloop()
 
 
