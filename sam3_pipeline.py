@@ -145,53 +145,103 @@ def _non_cond_keep_window(sam3_model, extra: int = 1) -> int:
         return 7 + extra  # SAM3 default num_maskmem=7
 
 
+
+def _keep_nearest_cond_frames(frame_idx: int, cond_keys, max_cond: int, keep_first: bool) -> set:
+    """Return the frame indices to keep GPU-resident, computed directly rather than via
+    select_closest_cond_frames.
+
+    Mirrors that function's own before/after/nearest-fill algorithm, but deliberately
+    WITHOUT its "if len(cond_frame_outputs) <= max_cond_frame_num: keep everything"
+    shortcut. That shortcut exists because select_closest_cond_frames' real job is
+    deciding what to feed into *this step's* attention — correctly "just use all of it"
+    when under budget — not deciding long-term GPU residency. Reused verbatim for
+    eviction, it meant a bucket that individually never accumulates more than max_cond
+    entries (common under SAM3's per-object/bucket tracker_inference_states split, even
+    though the *total* committed entries across all buckets keeps growing) never gets
+    evicted from at all — confirmed empirically: cond_counts stayed under max_cond=7 in
+    every bucket for an entire 176-frame replay while allocated GPU memory grew ~0.3 GiB
+    on every single add_prompt call, tracking output_dict_per_obj's ever-growing count
+    of committed cond-frame entries almost exactly. Applying the same proximity-based
+    selection unconditionally (regardless of total count) evicts the earliest entries
+    that this step doesn't need, resident or not.
+    """
+    if not cond_keys:
+        return set()
+    keep = set()
+    if keep_first:
+        idx_first = min((t for t in cond_keys if t < frame_idx), default=None)
+        if idx_first is None:
+            idx_first = max((t for t in cond_keys if t > frame_idx), default=None)
+        if idx_first is not None:
+            keep.add(idx_first)
+    idx_before = max((t for t in cond_keys if t < frame_idx), default=None)
+    if idx_before is not None:
+        keep.add(idx_before)
+    idx_after = min((t for t in cond_keys if t >= frame_idx), default=None)
+    if idx_after is not None:
+        keep.add(idx_after)
+    remaining = sorted(
+        (t for t in cond_keys if t not in keep), key=lambda x: abs(x - frame_idx)
+    )
+    keep.update(remaining[: max(0, max_cond - len(keep))])
+    return keep
+
+
 def _offload_unselected_cond_frames(inner_state: dict, frame_idx: int, tracker) -> None:
-    """Move cond-frame maskmem tensors to CPU once select_closest_cond_frames stops
-    picking them for this frame's attention step, freeing GPU memory for concepts with
+    """Move cond-frame maskmem tensors to CPU for every cond frame not among the
+    max_cond_frames_in_attn nearest to frame_idx, freeing GPU memory for concepts with
     many annotation/mask-anchor frames (each becomes a permanent cond frame that
     _prune_non_cond_outputs deliberately never evicts, since any of them could be the
     closest anchor thousands of frames later).
 
+    Uses _keep_nearest_cond_frames (see its docstring for why this can't delegate to
+    select_closest_cond_frames directly) so eviction actually happens even when a given
+    tracker-state bucket's own cond-frame count never exceeds max_cond.
+
     No-op whenever tracker.max_cond_frames_in_attn == -1 (the default): in that mode
-    select_closest_cond_frames always selects every cond frame, so nothing is ever
-    "unselected" and there would be nothing to offload.  Only worth enabling together
-    with a finite --max-cond-frames-in-attn.
+    every cond frame is always "nearest" (nothing to prune against). Only worth
+    enabling together with a finite --max-cond-frames-in-attn.
 
     Reload is NOT handled here. Sam3TrackerBase._prepare_memory_conditioned_features
     (patched in utils.py's _patch_sam3_tracker_base to use .to(device) instead of a
     hardcoded .cuda()) already reloads a cond frame's maskmem_features/maskmem_pos_enc
-    onto the correct GPU the moment select_closest_cond_frames selects it again — so
-    the exact same selection function used here for eviction is what drives reload on
-    the read side too, just already wired up. This function only needs to run the
-    complementary half: evict what it does NOT select.
+    onto the correct GPU the moment select_closest_cond_frames selects it again for real
+    attention use — so a frame evicted here by our own (slightly different, always-on)
+    proximity policy still reloads correctly the next time SAM3's own selection picks it.
     """
     max_cond = getattr(tracker, "max_cond_frames_in_attn", -1)
     if max_cond is None or max_cond == -1:
         return
-    from sam3.model.sam3_tracker_utils import select_closest_cond_frames
     keep_first = getattr(tracker, "keep_first_cond_frame", False)
 
-    tracker_states = (inner_state.get("tracker_inference_states", [])
-                      + inner_state.get("sam2_inference_states", []))
+    # Deliberately excludes inner_state["sam2_inference_states"] (SAM3.1 multiplex).
+    # Its own _prepare_memory_conditioned_features (video_tracking_multiplex.py) still
+    # hardcodes bare .cuda() for the reload side (never patched in utils.py, unlike the
+    # regular Sam3TrackerBase version which uses .to(device)). A bare .cuda() only
+    # happens to land on the right GPU because this codebase calls
+    # torch.cuda.set_device(device) once per process at model load — true under today's
+    # one-GPU-per-process usage, but would silently misroute a CPU-offloaded tensor to
+    # the wrong GPU under multi-GPU sharding within one process. Skip multiplex sessions
+    # here until that reload path is patched the same way.
+    def _to_cpu(entry: dict) -> None:
+        feats = entry.get("maskmem_features")
+        if torch.is_tensor(feats) and feats.is_cuda:
+            entry["maskmem_features"] = feats.cpu()
+        pos_enc = entry.get("maskmem_pos_enc")
+        if pos_enc is not None:
+            entry["maskmem_pos_enc"] = [
+                p.cpu() if torch.is_tensor(p) and p.is_cuda else p for p in pos_enc
+            ]
+
+    tracker_states = inner_state.get("tracker_inference_states", [])
     for ts in tracker_states:
         cond = ts.get("output_dict", {}).get("cond_frame_outputs", {})
-        if len(cond) <= max_cond:
-            continue  # select_closest_cond_frames would keep all of them anyway
-        _, unselected = select_closest_cond_frames(
-            frame_idx, cond, max_cond, keep_first_cond_frame=keep_first
-        )
+        if not cond:
+            continue
+        keep = _keep_nearest_cond_frames(frame_idx, cond.keys(), max_cond, keep_first)
+        unselected = [f for f in cond if f not in keep]
         if not unselected:
             continue
-
-        def _to_cpu(entry: dict) -> None:
-            feats = entry.get("maskmem_features")
-            if torch.is_tensor(feats) and feats.is_cuda:
-                entry["maskmem_features"] = feats.cpu()
-            pos_enc = entry.get("maskmem_pos_enc")
-            if pos_enc is not None:
-                entry["maskmem_pos_enc"] = [
-                    p.cpu() if torch.is_tensor(p) and p.is_cuda else p for p in pos_enc
-                ]
 
         for f in unselected:
             entry = cond.get(f)
@@ -205,6 +255,84 @@ def _offload_unselected_cond_frames(inner_state: dict, frame_idx: int, tracker) 
                 obj_entry = obj_dict.get("cond_frame_outputs", {}).get(f)
                 if obj_entry is not None:
                     _to_cpu(obj_entry)
+
+
+def _consolidate_and_evict_feature_cache(
+    inner_state: dict, sam3_model, frame_indices,
+) -> None:
+    """Consolidate pending temp outputs and evict feature_cache for the given frames.
+
+    Companion to the frame_idx-descending conditioning pass in replay_concept_refinements
+    (and any other loop that calls add_prompt/add_new_mask for many out-of-order frames
+    before propagation starts). Each such call populates inner_state["feature_cache"]
+    with a full per-frame backbone+FPN feature set (sam3_video_base.py's
+    run_backbone_and_detection), keyed by frame_idx. SAM3's own eviction there —
+    `feature_cache.pop(frame_idx - 1, None)` — only ever drops the *immediately
+    adjacent* frame, which assumes dense sequential propagation; visiting arbitrary,
+    non-adjacent annotated frames means that eviction essentially never fires, so
+    every touched frame's feature set piles up simultaneously (documented, previously
+    tolerated pileup — see the comment above the frame_tasks loop in
+    replay_concept_refinements). For a concept with hundreds of annotated frames this
+    dwarfs the (already-bounded, see _offload_unselected_cond_frames) cond_frame_outputs
+    memory and was the actual cause of the OOMs seen even with --max-cond-frames set.
+
+    A raw frame's feature_cache entry can only be safely dropped once its conditioning
+    is consolidated out of temp_output_dict_per_obj and into output_dict — otherwise
+    propagate_in_video_preflight's own (eventual, automatic) consolidation pass would
+    hit "Image features for frame N are not cached" (the tracker submodule has no
+    backbone of its own to recompute a miss). propagate_in_video_preflight() only
+    processes frames with PENDING temp outputs (it clears temp_output_dict_per_obj as it
+    goes), so calling it here early and repeatedly — once per batch of `frame_indices`
+    instead of once for the whole replay set — is safe and merely does in several smaller
+    passes what would otherwise happen once at the end automatically inside
+    sam3_model.propagate_in_video(). Once consolidated, this batch's frames no longer
+    depend on feature_cache and can be evicted immediately, bounding feature_cache to
+    roughly one batch's worth of frames instead of the entire annotated set.
+
+    Restricted to inner_state["tracker_inference_states"] (not the SAM3.1 multiplex
+    "sam2_inference_states") to match _offload_unselected_cond_frames — feature_cache
+    eviction itself is a plain dict pop with no device transfer, so it would be safe for
+    multiplex too, but propagate_in_video_preflight's consolidation path has not been
+    audited there and this fix hasn't been exercised on that code path.
+    """
+    if not frame_indices:
+        return
+    for ts in inner_state.get("tracker_inference_states", []):
+        sam3_model.model.tracker.propagate_in_video_preflight(ts, run_mem_encoder=True)
+    feature_cache = inner_state.get("feature_cache", {})
+    for f in frame_indices:
+        feature_cache.pop(f, None)
+    _clear_multigpu_buffer(inner_state)
+
+
+def _clear_multigpu_buffer(inner_state: dict) -> None:
+    """Drop every entry in feature_cache["multigpu_buffer"] — the VG detector's own
+    chunk cache (sam3_image.py's forward_video_grounding_multigpu), nested inside the
+    same feature_cache dict under a string key our frame-indexed feature_cache.pop(f)
+    calls never reach.
+
+    That detector caches BOTH the current frame's chunk and proactively prefetches the
+    NEXT sequential chunk (frame_idx + world_size) for compute/transfer overlap, evicting
+    only the chunk immediately behind it (frame_idx - world_size). With world_size=1
+    (single-GPU, the only case audited here) that means every call strands at least the
+    prefetched next-frame entry — our conditioning loop visits sparse, arbitrary
+    annotated frames, never the true next/previous sequential frame, so neither the
+    eviction nor a same/adjacent-frame cache hit ever actually happens. Confirmed via
+    targeted memory instrumentation as the actual source of a steady ~0.3 GiB-per-call
+    growth previously misattributed to cond_frame_outputs (which turned out to already
+    be tiny and CPU-resident).
+
+    Clearing it outright is safe for our access pattern specifically: this cache exists
+    purely to let a later call for a NEARBY frame_idx skip recomputation, and we never
+    revisit a frame or its immediate neighbor during this conditioning pass. It is NOT
+    safe to clear during propagate_in_video()'s own real (sequential) propagation loop,
+    where consecutive frames genuinely reuse adjacent chunks — this function must only be
+    called from the pre-propagation conditioning passes, not the propagation loops.
+    """
+    feature_cache = inner_state.get("feature_cache", {})
+    buf = feature_cache.get("multigpu_buffer")
+    if buf:
+        buf.clear()
 
 
 def compute_period_peaks(periods: List[Tuple[int, int]],
@@ -1551,18 +1679,18 @@ def replay_concept_refinements(
         # Raw per-frame backbone features (image + FPN) live in feature_cache, keyed by
         # frame_idx. run_backbone_and_detection() only evicts the *adjacent* frame_idx
         # (sam3_video_base.py), which assumes sequential propagation order. The replay
-        # loops below visit frames out of order (each instance's own annotated frames,
-        # sorted per-instance but not globally), so that eviction never matches and
-        # entries pile up — one full backbone feature map per annotated frame, for the
-        # entire replay set, all resident at once. Do NOT evict these early: unlike
-        # propagate_in_video() (which does recompute the cache unconditionally for every
-        # frame it visits), propagate_in_video_preflight() runs first and calls
-        # _run_memory_encoder / _get_empty_mask_ptr for each cond frame — including these
-        # annotated frames, for sibling objects — which requires the cached features to
-        # still be present. Evicting here raises "Image features for frame N are not
-        # cached" inside preflight, before propagation even starts. The pileup is
-        # tolerated; it's bounded by the replay set size and freed once preflight and
-        # propagate_in_video() run.
+        # loop below visits frames out of order (whatever frames were actually annotated,
+        # globally descending — not consecutive integers), so that eviction never matches
+        # and entries would otherwise pile up: one full backbone feature map per annotated
+        # frame, for the entire replay set, all resident at once. This used to be tolerated
+        # as "bounded by the replay set size," but for concepts with hundreds of annotated
+        # frames (e.g. 177 for one project's 'body' concept) that bound alone was enough to
+        # OOM. _consolidate_and_evict_feature_cache (called in batches inside the loop
+        # below) fixes this properly: it forces early, incremental
+        # propagate_in_video_preflight passes so each batch's frames get consolidated into
+        # output_dict — no longer dependent on feature_cache — and are evicted immediately,
+        # instead of deferring everything to the single automatic preflight call inside
+        # propagate_in_video() at the end.
         inner_state = sam3_model._all_inference_states[session_id]["state"]
         _keep = _non_cond_keep_window(sam3_model)
 
@@ -1607,6 +1735,16 @@ def replay_concept_refinements(
             for frame_idx in inst.mask_anchor_frames:
                 frame_tasks[frame_idx].append(("mask_anchor", inst))
 
+        # Batch size for _consolidate_and_evict_feature_cache below: how many annotated
+        # frames' worth of raw backbone features (image + FPN, much larger per-entry than
+        # a cond frame's maskmem_features) are allowed to pile up in feature_cache before
+        # we force an early consolidation + eviction. Smaller bounds memory tighter at the
+        # cost of more propagate_in_video_preflight calls (each one a real, if small,
+        # compute pass); this is an internal memory/overhead tradeoff, not something worth
+        # exposing as a CLI flag yet.
+        _FEATURE_CACHE_BATCH = 8
+        _batch_frames: List[int] = []
+
         for frame_idx in sorted(frame_tasks, reverse=True):
             for kind, payload in frame_tasks[frame_idx]:
                 if kind == "mask_anchor":
@@ -1641,6 +1779,23 @@ def replay_concept_refinements(
             # around wherever we currently are in this descending pass get moved to CPU
             # immediately instead of accumulating for the remainder of the loop.
             _offload_unselected_cond_frames(inner_state, frame_idx, sam3_model.model.tracker)
+
+            # Clear every frame — cheaper than the feature_cache batch below (no
+            # propagate_in_video_preflight pass, just dropping dict entries) and each
+            # individual add_prompt/add_new_mask call can strand up to 2 entries here
+            # (see _clear_multigpu_buffer's docstring), so waiting a full batch would
+            # still let ~16 stranded entries accumulate between flushes.
+            _clear_multigpu_buffer(inner_state)
+
+            # Bound feature_cache (raw per-frame backbone+FPN features) the same way,
+            # batched rather than per-frame since each flush costs a real (if small)
+            # propagate_in_video_preflight pass — see _consolidate_and_evict_feature_cache.
+            _batch_frames.append(frame_idx)
+            if len(_batch_frames) >= _FEATURE_CACHE_BATCH:
+                _consolidate_and_evict_feature_cache(inner_state, sam3_model, _batch_frames)
+                _batch_frames = []
+
+        _consolidate_and_evict_feature_cache(inner_state, sam3_model, _batch_frames)
 
         for obj_id in manually_added_ids:
             if obj_id not in obj_frame_points and obj_id not in obj_frame_boxes:
