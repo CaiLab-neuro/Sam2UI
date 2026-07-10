@@ -265,7 +265,6 @@ def process_project_parallel(args, project, concepts_to_process, devices):
     workers on one GPU (utilization packing) and multiple GPUs both work.
     """
     import multiprocessing as mp
-    from sam3_utils import extract_frames_from_video
     from sam3_project import ConceptStatus
 
     # Register all concepts and persist BEFORE spawning so workers see them.
@@ -275,12 +274,10 @@ def process_project_parallel(args, project, concepts_to_process, devices):
     project.save()
 
     # Pre-extract frames once — eliminates the extraction race between workers.
-    frames_dir = project.get_frames_dir()
-    if not os.path.isdir(frames_dir):
-        print(f"Pre-extracting frames to {frames_dir}...")
-        extract_frames_from_video(project.video_path, frames_dir)
-    else:
-        print(f"Reusing existing frames in {frames_dir}")
+    # Completeness-checked: resumes if a previous extraction was killed midway.
+    from sam3_utils import ensure_frames_extracted
+    frames_dir = ensure_frames_extracted(
+        project.video_path, project.get_frames_dir(), project.num_frames)
 
     n_workers = min(args.parallel, len(concepts_to_process))
     print(f"\nStarting {n_workers} worker(s) on device(s): {', '.join(devices)}")
@@ -309,10 +306,22 @@ def process_project_parallel(args, project, concepts_to_process, devices):
         workers.append(p)
 
     # Merge results as they arrive — parent is the only writer of project.json.
+    import queue as _queue_mod
     remaining = len(concepts_to_process)
     errors = []
     while remaining > 0:
-        kind, worker_id, payload = result_queue.get()
+        try:
+            # Timeout so the parent re-checks worker liveness periodically: a
+            # blocking get() can hang forever if the last worker emits "fatal"
+            # while still marginally alive (is_alive() below races process
+            # teardown) and then no message ever arrives again.
+            kind, worker_id, payload = result_queue.get(timeout=15)
+        except _queue_mod.Empty:
+            if not any(p.is_alive() for p in workers):
+                print("All workers died with tasks unfinished — aborting.")
+                errors.append(("workers", "all workers died before finishing"))
+                break
+            continue
         if kind == "ready":
             print(f"[worker {worker_id}] model loaded, ready")
             continue
@@ -322,6 +331,8 @@ def process_project_parallel(args, project, concepts_to_process, devices):
             errors.append((f"worker {worker_id}", payload))
             print(f"[worker {worker_id}] FATAL: {payload}")
             # If ALL workers died, the remaining tasks will never finish.
+            # (If the last one is still mid-teardown here, the get() timeout
+            # above catches it on the next iteration.)
             if not any(p.is_alive() for p in workers):
                 print("All workers died — aborting.")
                 break
@@ -346,9 +357,25 @@ def process_project_parallel(args, project, concepts_to_process, devices):
         else:  # "error"
             cname, err = payload
             errors.append((cname, err))
+            # Re-read the concept's on-disk metadata first (the worker may have
+            # written partial state before failing), then persist ERROR into its
+            # concept_metadata.json — load() reads status from there, not from
+            # the project.json summary, so without this the failure is invisible
+            # on reload. Safe: the worker that owned this concept has moved on.
+            updated = project._load_concept_metadata(cname)
+            if updated is not None:
+                for idx, pc in enumerate(project.concepts):
+                    if pc.name == cname:
+                        project.concepts[idx] = updated
+                        break
             c = project.get_concept_by_name(cname)
             if c is not None:
                 c.status = ConceptStatus.ERROR
+                try:
+                    project._save_concept_metadata(c)
+                except Exception as save_err:
+                    print(f"WARNING: could not persist error status for "
+                          f"'{cname}': {save_err}")
             project.save(write_concept_metadata=False)
             print(f"\nConcept '{cname}' FAILED: {err} ({remaining} remaining)\n")
 
@@ -717,6 +744,7 @@ def _process_project_impl(args, project, devices):
                                  use_fa3=args.use_fa3,
                                  max_cond_frames_in_attn=args.max_cond_frames_in_attn)
 
+    failed_concepts = []
     for i, concept in enumerate(concepts_to_process):
         print(f"\n{'='*60}")
         print(f"Processing concept {i+1}/{len(concepts_to_process)}: '{concept.name}'")
@@ -751,13 +779,24 @@ def _process_project_impl(args, project, devices):
             print(f"\nError processing concept '{concept.name}': {e}")
             import traceback
             traceback.print_exc()
+            # Persist the ERROR status set by process_concept_detection so the
+            # failure is visible to --status and the concept is re-selected
+            # (pending/error) on the next run.
+            failed_concepts.append(concept.name)
+            try:
+                project.save()
+            except Exception as save_err:
+                print(f"WARNING: could not persist error status: {save_err}")
             continue
 
     print(f"\n{'='*60}")
-    print("All concepts processed!")
+    if failed_concepts:
+        print(f"Finished with {len(failed_concepts)} FAILED concept(s): {failed_concepts}")
+    else:
+        print("All concepts processed!")
     print(f"{'='*60}")
     cleanup_frames_dir(project)
-    return 0
+    return 1 if failed_concepts else 0
 
 
 def handle_delete_frames(args):
@@ -1182,6 +1221,168 @@ def reset_project(args):
     return refine_project(args)
 
 
+def _iter_refinement_files(project, concept):
+    """Yield (instance, refinements.json path, loaded dict) for every non-deleted
+    instance of `concept` that has a refinements.json on disk. Skips unreadable files."""
+    for inst in concept.instances:
+        if inst.deleted:
+            continue
+        rpath = os.path.join(project.project_dir, "concepts", concept.name,
+                             "instances", str(inst.sam3_obj_id), "refinements.json")
+        if not os.path.exists(rpath):
+            continue
+        try:
+            with open(rpath) as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            continue
+        yield inst, rpath, data
+
+
+def _concept_refinement_count(project, concept) -> int:
+    """Total saved refinement entries across all non-deleted instances of a concept."""
+    return sum(len(data.get("refinements", []))
+               for _inst, _rpath, data in _iter_refinement_files(project, concept))
+
+
+def _mark_all_refinements_pending(project, concept) -> int:
+    """Flip every saved refinement entry to propagated=False so the refine replay path
+    re-applies ALL of them (not only newly-added ones) on top of fresh detection.
+    Returns the number of entries re-flagged."""
+    total = 0
+    for _inst, rpath, data in _iter_refinement_files(project, concept):
+        entries = data.get("refinements", [])
+        if not entries:
+            continue
+        for r in entries:
+            r["propagated"] = False
+        with open(rpath, "w") as f:
+            json.dump(data, f, indent=2)
+        total += len(entries)
+    return total
+
+
+def _delete_concept_masks_keep_refinements(project, concept) -> None:
+    """Remove regenerable outputs (per-instance masks/, concept-level cond_states/ and
+    obj_ptr_priors.npz) but KEEP each instance's refinements.json and metadata, so the
+    refine replay can regenerate masks while re-applying the saved refinement points."""
+    concept_dir = os.path.join(project.project_dir, "concepts", concept.name)
+    instances_dir = os.path.join(concept_dir, "instances")
+    if os.path.isdir(instances_dir):
+        for entry in os.scandir(instances_dir):
+            if not entry.is_dir():
+                continue
+            masks_dir = os.path.join(entry.path, "masks")
+            if os.path.isdir(masks_dir):
+                shutil.rmtree(masks_dir)
+    stale_cond = os.path.join(concept_dir, "cond_states")
+    if os.path.isdir(stale_cond):
+        shutil.rmtree(stale_cond)
+    stale_prior = os.path.join(concept_dir, "obj_ptr_priors.npz")
+    if os.path.exists(stale_prior):
+        os.remove(stale_prior)
+
+
+def _redo_choice(force: bool) -> str:
+    """Ask how to handle existing refinements for a --redo run.
+    Returns 'reapply', 'fresh', or 'cancel'. -f/--force auto-picks 'reapply'."""
+    if force:
+        return "reapply"
+    print("\nThis will re-run detection. How should the saved refinement points be handled?")
+    print("  [1] Reapply  — fresh detection, then replay ALL saved refinements on top (default)")
+    print("  [2] Fresh    — fresh detection only; keep refinement files on disk but ignore")
+    print("                 them this run (still viewable in sam3_ui.py)")
+    print("  [3] Cancel")
+    answer = input("Choose [1/2/3] (default 1): ").strip().lower()
+    if answer in ("", "1", "reapply"):
+        return "reapply"
+    if answer in ("2", "fresh"):
+        return "fresh"
+    print("Aborted.")
+    return "cancel"
+
+
+def redo_project(args):
+    """Handle --redo: re-run text-prompt detection like --reset, but respect existing
+    refinement points and mask anchors instead of discarding them. Delegates the heavy
+    lifting (frame extraction, model load, re-detection, replay, parallel dispatch) to
+    the shared refine path; this function only sets up which concepts redetect fresh vs.
+    redetect-and-reapply, and performs the destructive wipe after confirmation."""
+    project = _load_project(args.project)
+    if project is None:
+        return 1
+
+    # Resolve targets (bare --redo = every concept; --redo a,b = those).
+    if args.redo:
+        wanted = {n.strip() for n in args.redo.split(",") if n.strip()}
+        targets = [c for c in project.concepts if c.name in wanted]
+        missing = wanted - {c.name for c in targets}
+        if missing:
+            print(f"Warning: concept(s) not found, skipping: {', '.join(sorted(missing))}")
+    else:
+        targets = list(project.concepts)
+
+    if not targets:
+        print("No concept(s) to redo.")
+        return 0
+
+    ref_counts = {c.name: _concept_refinement_count(project, c) for c in targets}
+    with_ref = [c for c in targets if ref_counts[c.name] > 0]
+    without_ref = [c for c in targets if ref_counts[c.name] == 0]
+
+    # Summarize and confirm.
+    print(f"\n{'='*60}")
+    print(f"--redo: re-detecting {len(targets)} concept(s); existing masks will be "
+          f"regenerated.")
+    for c in targets:
+        n = ref_counts[c.name]
+        note = f"{n} refinement point(s) will be reapplied" if n else "no refinements"
+        print(f"  {c.name}  ({note})")
+    print(f"{'='*60}")
+
+    if with_ref:
+        choice = _redo_choice(args.force)
+        if choice == "cancel":
+            return 0
+    else:
+        if not _confirm("Delete existing masks and re-detect these concept(s)?", args.force):
+            return 0
+        choice = "fresh"
+
+    # Route each concept through the shared refine path:
+    #   - reapply: mark refinements pending + wipe masks (keep refinements.json) so the
+    #     concept lands in the refine pass (fresh text detection + replay of all points).
+    #   - fresh (or no refinements): write the redetect sentinel so the concept lands in
+    #     the redetect pass. --redo's fresh mode preserves refinements.json across the
+    #     wipe; --reset does not.
+    for c in without_ref:
+        sentinel = os.path.join(project.project_dir, "concepts", c.name, "redetect")
+        os.makedirs(os.path.dirname(sentinel), exist_ok=True)
+        open(sentinel, "w").close()
+
+    if choice == "reapply":
+        for c in with_ref:
+            n = _mark_all_refinements_pending(project, c)
+            _delete_concept_masks_keep_refinements(project, c)
+            print(f"  '{c.name}': flagged {n} refinement point(s) for replay, "
+                  f"cleared old masks.")
+    else:  # fresh
+        for c in with_ref:
+            sentinel = os.path.join(project.project_dir, "concepts", c.name, "redetect")
+            os.makedirs(os.path.dirname(sentinel), exist_ok=True)
+            open(sentinel, "w").close()
+        # Tell the shared redetect wipe to preserve refinements.json (see
+        # _refine_project_impl). Old obj_ids usually recur (deterministic detection),
+        # so kept refinements stay viewable in sam3_ui.py.
+        args._redo_keep_refinements = True
+
+    # Scope the delegated run to exactly these concepts. We already confirmed above, so
+    # suppress the inner deletion prompt.
+    args.refine = ",".join(c.name for c in targets)
+    args.force = True
+    return refine_project(args)
+
+
 def refine_project(args):
     """Replay saved refinement annotations, grouped by concept for correct non-overlapping."""
     project = _load_project(args.project)
@@ -1285,13 +1486,9 @@ def _refine_project_impl(args, project):
         print("No pending annotations found. Add points in sam3_ui.py using 'Save for Batch'.")
         return 0
 
-    resource_path = project.get_frames_dir()
-    if not os.path.isdir(resource_path):
-        print(f"Extracting frames to {resource_path}...")
-        from sam3_utils import extract_frames_from_video
-        extract_frames_from_video(project.video_path, resource_path)
-    else:
-        print(f"Reusing existing frames in {resource_path}")
+    from sam3_utils import ensure_frames_extracted
+    resource_path = ensure_frames_extracted(
+        project.video_path, project.get_frames_dir(), project.num_frames)
 
     if concepts_to_redetect:
         print(f"\nFound {len(concepts_to_redetect)} concept(s) flagged for full re-detection:")
@@ -1339,14 +1536,28 @@ def _refine_project_impl(args, project):
     devices = [d.strip() for d in args.device.split(",") if d.strip()]
 
     # Delete stale instance dirs for redetect concepts before dispatching workers
-    # (user already confirmed above when deletion_summary was shown)
+    # (user already confirmed above when deletion_summary was shown).
+    # --redo's "fresh" mode sets _redo_keep_refinements: wipe regenerable outputs
+    # (masks/) but preserve each instance's refinements.json so it stays viewable in
+    # sam3_ui.py — old obj_ids usually recur on deterministic re-detection.
+    keep_refinements = getattr(args, "_redo_keep_refinements", False)
     for cname in concepts_to_redetect:
         instances_dir = os.path.join(project.project_dir, "concepts", cname, "instances")
         if os.path.isdir(instances_dir):
             inst_dirs = [e.name for e in os.scandir(instances_dir) if e.is_dir()]
             if inst_dirs:
-                print(f"  Deleting {len(inst_dirs)} stale instance dir(s) for '{cname}'...")
-                shutil.rmtree(instances_dir)
+                if keep_refinements:
+                    print(f"  Clearing masks for {len(inst_dirs)} instance(s) of '{cname}' "
+                          f"(keeping refinement files)...")
+                    for e in os.scandir(instances_dir):
+                        if not e.is_dir():
+                            continue
+                        masks_dir = os.path.join(e.path, "masks")
+                        if os.path.isdir(masks_dir):
+                            shutil.rmtree(masks_dir)
+                else:
+                    print(f"  Deleting {len(inst_dirs)} stale instance dir(s) for '{cname}'...")
+                    shutil.rmtree(instances_dir)
 
     total_tasks = len(concepts_to_redetect) + len(concepts_to_refine)
     if args.parallel > 1 and total_tasks > 1:
@@ -1749,6 +1960,17 @@ def main():
                              "concept; --reset person,car targets only those. Prints "
                              "what will be lost and asks for confirmation unless -f is "
                              "given. Equivalent to the UI's 'Reset & Re-detect' button.")
+    parser.add_argument("--redo", nargs="?", const="", default=None,
+                        metavar="CONCEPT,...",
+                        help="Re-run text-prompt detection like --reset, but respect "
+                             "existing refinement points and mask anchors instead of "
+                             "discarding them. Bare --redo targets every concept; "
+                             "--redo person,car targets only those. When refinements "
+                             "exist it offers a choice: (1) redo + reapply all saved "
+                             "refinements on top of fresh detection, or (2) redo fresh "
+                             "while keeping the refinement files on disk (ignored this "
+                             "run, still viewable in sam3_ui.py). Prompts for "
+                             "confirmation unless -f is given (-f picks 'reapply').")
     parser.add_argument("--delete", default=None,
                         metavar="CONCEPT[:INST,...]",
                         help="Delete a concept or specific instances. "
@@ -1808,9 +2030,9 @@ def main():
                              "worker loads its own model copy (~4 GB GPU memory).")
     parser.add_argument("-f", "--force", action="store_true",
                         help="Skip confirmation prompts. Only meaningful alongside "
-                             "--delete, --delete-frames, --refine, or --reset — plain "
-                             "process mode never needs it, since it never touches an "
-                             "already-completed concept's data.")
+                             "--delete, --delete-frames, --refine, --reset, or --redo "
+                             "— plain process mode never needs it, since it never "
+                             "touches an already-completed concept's data.")
     parser.add_argument("--restore-cond", action="store_true", dest="restore_cond",
                         help="Restore saved maskmem cond-frame states from the prior refinement "
                              "round before propagating. Off by default: prior states may encode "
@@ -1885,15 +2107,19 @@ def main():
 
     args = parser.parse_args()
 
-    if args.refine is not None and args.reset is not None:
-        parser.error("--refine and --reset are mutually exclusive; run them separately.")
+    _exclusive = [n for n, v in (("--refine", args.refine),
+                                 ("--reset", args.reset),
+                                 ("--redo", args.redo)) if v is not None]
+    if len(_exclusive) > 1:
+        parser.error(f"{' and '.join(_exclusive)} are mutually exclusive; "
+                     "run them separately.")
 
     if args.force and not any([
         args.delete_frames, args.delete is not None,
-        args.refine is not None, args.reset is not None,
+        args.refine is not None, args.reset is not None, args.redo is not None,
     ]):
         parser.error("-f/--force has nothing to confirm-skip here: it only applies "
-                     "to --delete, --delete-frames, --refine, or --reset.")
+                     "to --delete, --delete-frames, --refine, --reset, or --redo.")
 
     if args.device.strip().lower() == "all":
         import torch
@@ -1921,6 +2147,12 @@ def main():
 
     if args.export_sam2:
         rc = handle_export_sam2(args)
+        if rc == 0 and args.quality_metrics:
+            return handle_quality_metrics(args)
+        return rc
+
+    if args.redo is not None:
+        rc = redo_project(args)
         if rc == 0 and args.quality_metrics:
             return handle_quality_metrics(args)
         return rc

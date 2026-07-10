@@ -20,21 +20,124 @@ import colorsys
 from sam3_project import SAM3Concept, SAM3Instance, SAM3Project
 
 
-def extract_frames_from_video(video_path: str, output_dir: str, max_frames: Optional[int] = None):
+def _existing_frame_indices(output_dir: str) -> set:
+    """Return the set of frame indices already extracted as NNNNNN.jpg in output_dir."""
+    indices = set()
+    if not os.path.isdir(output_dir):
+        return indices
+    for name in os.listdir(output_dir):
+        stem, ext = os.path.splitext(name)
+        if ext == ".jpg" and len(stem) == 6 and stem.isdigit():
+            indices.add(int(stem))
+    return indices
+
+
+def frames_dir_is_complete(frames_dir: str, expected_frames: int) -> bool:
+    """
+    True if frames_dir holds (approximately) expected_frames extracted JPEGs.
+
+    A killed extraction leaves a shorter (usually contiguous) prefix, so a plain
+    os.path.isdir() check would wrongly reuse a partial directory.
+
+    expected_frames comes from cv2.CAP_PROP_FRAME_COUNT, a container-metadata
+    estimate that can over-report the frames cap.read() actually decodes (VFR,
+    some codecs). A strict >= would then re-extract forever, so allow the same
+    max(2, 1%) tolerance used by _verify_frames_dir_count in sam3_ui.py.
+    """
+    if not expected_frames or expected_frames <= 0:
+        # Without a trusted expected count we can't judge completeness; treat
+        # any non-empty directory as complete (legacy behavior).
+        return bool(_existing_frame_indices(frames_dir))
+    tolerance = max(2, int(expected_frames * 0.01))
+    return len(_existing_frame_indices(frames_dir)) >= expected_frames - tolerance
+
+
+def extract_frames_from_video(video_path: str, output_dir: str,
+                              max_frames: Optional[int] = None,
+                              overwrite: bool = False):
     """
     Extract frames from video to JPG images.
     Reuses SAM2 frame naming convention: 000000.jpg, 000001.jpg, etc.
+
+    Resume-safe: if a previous extraction was killed midway, already-extracted
+    frames are kept and only the missing ones are written. The highest existing
+    index is always rewritten, since a kill mid-cv2.imwrite can leave that one
+    file truncated. When the existing frames form a contiguous prefix 0..N-1
+    (the normal interrupted case), the capture seeks directly to N-1 instead of
+    decoding the whole prefix again; the seek is validated by comparing the
+    decoded frame against the JPEG on disk, falling back to a full decode from
+    frame 0 if they disagree (imprecise-seek codecs).
 
     Args:
         video_path: Path to video file
         output_dir: Directory to save frames
         max_frames: Optional limit on number of frames to extract
+        overwrite: If True, delete existing frame files and re-extract everything
     """
     os.makedirs(output_dir, exist_ok=True)
+
+    if overwrite:
+        # Remove ALL existing frame files, not just the indices we are about to
+        # rewrite: a previously longer video would otherwise leave stale
+        # higher-index frames that mix into (and pass the completeness count of)
+        # the new extraction.
+        stale = _existing_frame_indices(output_dir)
+        for idx in stale:
+            try:
+                os.remove(os.path.join(output_dir, f"{idx:06d}.jpg"))
+            except OSError:
+                pass
+        if stale:
+            print(f"Overwrite: removed {len(stale)} existing frames from {output_dir}")
+        have = set()
+    else:
+        have = _existing_frame_indices(output_dir)
+    last_have = max(have) if have else -1
+    # Holes in 0..last_have. have is a subset of {0..last_have} by construction,
+    # so the count alone determines contiguity.
+    n_holes = (last_have + 1) - len(have)
 
     cap = cv2.VideoCapture(video_path)
     frame_idx = 0
 
+    # Fast path: contiguous prefix with no holes — seek straight to the last
+    # existing frame instead of decoding the prefix. CAP_PROP_POS_FRAMES after
+    # a set() just echoes the requested value, so it cannot detect an imprecise
+    # seek; instead decode the frame at the seek target and compare it against
+    # the JPEG already on disk. On mismatch (or unreadable file) fall back to
+    # decoding from frame 0.
+    if last_have > 0 and n_holes == 0:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, last_have)
+        ret, probe = cap.read()
+        existing = cv2.imread(os.path.join(output_dir, f"{last_have:06d}.jpg"))
+        seek_ok = False
+        if ret and existing is not None and probe.shape == existing.shape:
+            # JPEG quality-95 round-trip stays within a few gray levels (MAD
+            # ~1-3 on real footage); a different frame of a moving video
+            # differs far more. A false reject here only costs a full decode
+            # from frame 0 (the safe path), so err toward rejecting.
+            mad = float(np.mean(np.abs(probe.astype(np.int16) - existing.astype(np.int16))))
+            seek_ok = mad < 6.0
+        if seek_ok:
+            # probe was frame last_have; the read advanced the capture, so the
+            # loop below continues at last_have + 1. Rewrite last_have from the
+            # probe first (truncation guard for a kill mid-imwrite).
+            cv2.imwrite(os.path.join(output_dir, f"{last_have:06d}.jpg"),
+                        probe, [cv2.IMWRITE_JPEG_QUALITY, 95])
+            frame_idx = last_have + 1
+        else:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            # Some backends need a reopen to reliably rewind after a failed seek
+            if int(cap.get(cv2.CAP_PROP_POS_FRAMES)) != 0:
+                cap.release()
+                cap = cv2.VideoCapture(video_path)
+
+    if have:
+        print(f"Resuming extraction in {output_dir}: {len(have)} frames present, "
+              f"continuing from frame {frame_idx}"
+              + (f" ({n_holes} hole(s) to repair)" if n_holes else ""))
+
+    written = 0
     while True:
         ret, frame = cap.read()
         if not ret:
@@ -43,12 +146,37 @@ def extract_frames_from_video(video_path: str, output_dir: str, max_frames: Opti
         if max_frames is not None and frame_idx >= max_frames:
             break
 
-        frame_path = os.path.join(output_dir, f"{frame_idx:06d}.jpg")
-        cv2.imwrite(frame_path, frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
+        if frame_idx not in have or frame_idx == last_have:
+            frame_path = os.path.join(output_dir, f"{frame_idx:06d}.jpg")
+            cv2.imwrite(frame_path, frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
+            written += 1
         frame_idx += 1
 
     cap.release()
-    print(f"Extracted {frame_idx} frames to {output_dir}")
+    total = len(_existing_frame_indices(output_dir))
+    print(f"Extracted {written} frames to {output_dir} ({total} total)")
+
+
+def ensure_frames_extracted(video_path: str, frames_dir: str,
+                            expected_frames: Optional[int] = None) -> str:
+    """
+    Make sure frames_dir holds a complete extraction of video_path, resuming a
+    previously interrupted extraction if needed. Returns frames_dir.
+
+    Drop-in replacement for the `if not os.path.isdir(frames_dir): extract`
+    pattern at call sites, which silently reused partial directories.
+    """
+    if frames_dir_is_complete(frames_dir, expected_frames or 0):
+        print(f"Reusing existing frames in {frames_dir}")
+    else:
+        n_have = len(_existing_frame_indices(frames_dir))
+        if n_have:
+            print(f"Frame cache {frames_dir} is incomplete "
+                  f"({n_have}/{expected_frames or '?'} frames) — resuming extraction...")
+        else:
+            print(f"Extracting frames to {frames_dir}...")
+        extract_frames_from_video(video_path, frames_dir)
+    return frames_dir
 
 
 def sam3_mask_path(output_dir: str, frame_idx: int, mask_format: str = "png") -> str:

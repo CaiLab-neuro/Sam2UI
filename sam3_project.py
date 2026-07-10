@@ -38,6 +38,28 @@ class ProjectStaleError(Exception):
         super().__init__(f"{len(changed_files)} file(s) changed on disk since load: {changed_files}")
 
 
+def _atomic_json_dump(data, path: str, indent: int = 2) -> None:
+    """Write JSON to path atomically (temp file + os.replace).
+
+    A plain open(path, 'w') truncates immediately, so a kill mid-json.dump
+    (OOM-killer, Ctrl-C, power loss) leaves truncated JSON and the next
+    json.load raises — for project.json that makes the whole project
+    unopenable. os.replace is atomic on the same filesystem.
+    """
+    dir_name = os.path.dirname(path) or "."
+    fd, tmp_path = tempfile.mkstemp(dir=dir_name, suffix=".tmp")
+    try:
+        with os.fdopen(fd, 'w') as f:
+            json.dump(data, f, indent=indent)
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
 def _refine_lock_path(project_dir: str) -> str:
     return os.path.join(project_dir, ".refine.lock")
 
@@ -397,10 +419,9 @@ class SAM3Project:
             }
         }
 
-        # Save main project.json
+        # Save main project.json (atomic: a kill mid-write must not corrupt it)
         project_json_path = os.path.join(self.project_dir, "project.json")
-        with open(project_json_path, 'w') as f:
-            json.dump(project_data, f, indent=2)
+        _atomic_json_dump(project_data, project_json_path)
         self._loaded_mtimes[project_json_path] = os.path.getmtime(project_json_path)
 
         # Save per-concept metadata
@@ -414,8 +435,7 @@ class SAM3Project:
         os.makedirs(concept_dir, exist_ok=True)
 
         metadata_path = os.path.join(concept_dir, "concept_metadata.json")
-        with open(metadata_path, 'w') as f:
-            json.dump(concept.to_dict(), f, indent=2)
+        _atomic_json_dump(concept.to_dict(), metadata_path)
         self._loaded_mtimes[metadata_path] = os.path.getmtime(metadata_path)
 
     def check_staleness(self) -> List[str]:
@@ -510,8 +530,7 @@ class SAM3Project:
             "fps": fps,
         }
         video_info_path = os.path.join(project_dir, "video_info.json")
-        with open(video_info_path, 'w') as f:
-            json.dump(video_info, f, indent=2)
+        _atomic_json_dump(video_info, video_info_path)
 
         project.save()
         return project
@@ -561,12 +580,12 @@ class SerializableInferenceState:
             session_id: UUID string for the new session
         """
         import uuid
-        from sam3_utils import extract_frames_from_video
+        from sam3_utils import ensure_frames_extracted
 
-        # Re-extract frames if tmp dir was cleared (e.g. after system reboot)
-        if not os.path.exists(self.resource_path):
-            print(f"Tmp frames not found at {self.resource_path}, re-extracting...")
-            extract_frames_from_video(video_path, self.resource_path)
+        # Re-extract frames if tmp dir was cleared (e.g. after system reboot).
+        # Completeness-checked: an existence-only test would silently reuse a
+        # partial directory left by a killed extraction.
+        ensure_frames_extracted(video_path, self.resource_path, self.num_frames)
 
         session_id = str(uuid.uuid4())
         sam3_model.start_session(resource_path=self.resource_path, session_id=session_id)

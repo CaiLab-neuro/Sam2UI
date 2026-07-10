@@ -1063,6 +1063,22 @@ def load_all_masks_for_frame(
         if mask is not None:
             results[obj_id] = (obj_name, mask)
 
+    # --- Per-object NPZ files (SAM3 link / covered-union path; array key 'mask') ---
+    _perobj_npz_pat = re.compile(r"^mask_f(\d{6})_(.+)_id(\d+)\.npz$")
+    for mask_file in sorted(mask_dir_path.glob(f"mask_f{frame_idx:06d}_*.npz")):
+        m = _perobj_npz_pat.match(mask_file.name)
+        if m is None:
+            continue
+        obj_name, obj_id = m.group(2), int(m.group(3))
+        if obj_id in results:
+            continue  # PNG already loaded — PNG wins
+        try:
+            data = np.load(str(mask_file))
+            if 'mask' in data.files:
+                results[obj_id] = (obj_name, (data['mask'] > 0).astype(np.uint8) * 255)
+        except Exception:
+            pass
+
     # --- NPZ bundle (adds objects not found as PNG) ---
     npz_path = mask_dir_path / f"masks_f{frame_idx:06d}.npz"
     if npz_path.exists():
@@ -2316,6 +2332,10 @@ def export_video_from_dict(
                 try:
                     npz_data = np.load(str(mask_path))
                     npz_key = mask_data.get('npz_key', '')
+                    if npz_key not in npz_data.files and 'mask' in npz_data.files:
+                        # Per-object NPZ (SAM3 link / covered-union path) stores its
+                        # single array under 'mask'; only bundle files carry npz_key.
+                        npz_key = 'mask'
                     mask = (npz_data[npz_key] > 0).astype(np.uint8) * 255 if npz_key in npz_data.files else None
                 except Exception:
                     mask = None

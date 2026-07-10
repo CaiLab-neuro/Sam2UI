@@ -829,7 +829,17 @@ class SAM3VideoUI:
             self.status_var.set(f"No active session for '{name}'.")
 
     def _update_session_status(self):
-        """Refresh the session status label for the currently selected concept."""
+        """Refresh the session status label for the currently selected concept.
+
+        Thread-safe: callers like _release_session run on background worker
+        threads (e.g. process_thread releasing another concept's session), and
+        Tk widget calls off the main thread crash or corrupt Tk state — so
+        marshal onto the main loop when needed.
+        """
+        import threading
+        if threading.current_thread() is not threading.main_thread():
+            self.root.after(0, self._update_session_status)
+            return
         if not self.selected_concept:
             self.session_label.config(text="Session: none", fg="gray")
             return
@@ -2243,13 +2253,26 @@ class SAM3VideoUI:
         or if its files changed on disk since this copy was loaded (a job finished in the
         background). Either case means an unconditional save would clobber that job's
         results. Returns True if the save happened, False if it was refused.
+
+        Thread-safe: worker threads (e.g. merge_thread) call this too, and Tk
+        dialogs must not be created off the main thread — marshal the warning
+        via root.after in that case and just return False.
         """
         if not self.project:
             return False
 
+        import threading
+        _on_main = threading.current_thread() is threading.main_thread()
+
+        def _warn(title, msg):
+            if _on_main:
+                messagebox.showwarning(title, msg)
+            else:
+                self.root.after(0, lambda: messagebox.showwarning(title, msg))
+
         lock = check_refine_lock(self.project.project_dir)
         if lock is not None:
-            messagebox.showwarning(
+            _warn(
                 "Project Locked",
                 "A batch refinement/re-detection job (sam3_process.py --refine) is "
                 "currently running for this project. Saving now would risk overwriting "
@@ -2259,7 +2282,7 @@ class SAM3VideoUI:
 
         stale = self.project.check_staleness()
         if stale:
-            messagebox.showwarning(
+            _warn(
                 "Project Changed On Disk",
                 "This project was modified on disk since it was loaded here — likely by "
                 "a batch refinement job that finished while this window was open. Saving "
@@ -5844,7 +5867,9 @@ class SAM3VideoUI:
         # This preserves project.frames_dir (which may point to another host) in metadata.
         video_for_extraction = self.project.video_path
         if not self.active_sessions.get(concept_snap.name):
-            if (not os.path.isdir(self.project.get_frames_dir())
+            from sam3_utils import frames_dir_is_complete
+            if (not frames_dir_is_complete(self.project.get_frames_dir(),
+                                           self.project.num_frames)
                     and not os.path.exists(self.project.video_path)):
                 from tkinter import filedialog
                 video_for_extraction = filedialog.askopenfilename(
@@ -5919,13 +5944,15 @@ class SAM3VideoUI:
                 if not live_session_id:
                     # Offline path: re-detect + restore prior cond states, apply all instances jointly
                     print(f"Offline refinement path — {n_pending_instances} instance(s), re-detecting...")
+                    from sam3_utils import frames_dir_is_complete
                     resource_path = self.project.get_frames_dir()
-                    if not os.path.isdir(resource_path):
+                    if not frames_dir_is_complete(resource_path, self.project.num_frames):
                         self.root.after(0, progress_dialog.update_progress, 0, 1, "Extracting frames...")
                         # video_for_extraction may differ from project.video_path when the user
                         # located a video on this machine for cross-machine use; we intentionally
                         # do NOT write it back to project.video_path or project.frames_dir so
                         # that the originating host's paths are preserved in project.json.
+                        # Resume-safe: keeps frames from a previously interrupted extraction.
                         extract_frames_from_video(video_for_extraction, resource_path)
 
                     self.root.after(0, progress_dialog.update_progress, 0, self.num_frames,
@@ -6271,7 +6298,9 @@ class SAM3VideoUI:
         def extract_thread():
             try:
                 from sam3_utils import extract_frames_from_video
-                extract_frames_from_video(self.project.video_path, frames_dir)
+                # Explicit user-requested re-extract: overwrite existing files
+                extract_frames_from_video(self.project.video_path, frames_dir,
+                                          overwrite=True)
                 self.project.frames_dir = frames_dir
                 self._safe_project_save()
                 self.compositor = DynamicFrameCompositor(self.project)

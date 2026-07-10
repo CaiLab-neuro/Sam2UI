@@ -22,7 +22,7 @@ from sam3_project import (
     SAM3Project, SAM3Concept, SAM3Instance, ConceptStatus,
     save_concept_state, load_concept_state
 )
-from sam3_utils import extract_frames_from_video
+from sam3_utils import ensure_frames_extracted
 
 
 def _prune_non_cond_outputs(
@@ -1163,14 +1163,9 @@ def process_concept_detection(
     print("Enabling lazy loading for SAM3...")
     enable_lazy_loading(cache_size=cache_size, enable_sam3=True)
 
-    # 2. Extract frames (reuse if already present)
-    frames_dir = project.get_frames_dir()
-
-    if not os.path.exists(frames_dir):
-        print(f"Extracting frames to {frames_dir}...")
-        extract_frames_from_video(project.video_path, frames_dir)
-    else:
-        print(f"Reusing existing frames in {frames_dir}")
+    # 2. Extract frames (reuse if already complete; resume if a prior extraction was killed)
+    frames_dir = ensure_frames_extracted(
+        project.video_path, project.get_frames_dir(), project.num_frames)
 
     # 3. Start SAM3 session (SAM3 uses session-based API)
     print(f"Starting SAM3 session for concept '{concept.name}'...")
@@ -1189,21 +1184,25 @@ def process_concept_detection(
     if _cap > 0:
         print(f"Instance cap for '{concept.name}': {_cap}")
 
-    # offload_state_to_cpu: moves maskmem_features to CPU after each frame so GPU doesn't
-    # accumulate the full video's worth of 648 KB/frame/instance tensors.
-    sam3_model.start_session(
-        resource_path=frames_dir,
-        session_id=session_id,
-        offload_state_to_cpu=True,
-    )
-    print(f"Session started: {session_id}")
-
     # Encode/write masks in a background thread so the GPU propagation loop
     # is not stalled on PNG/NPZ encoding and disk I/O each frame.
     from sam3_utils import AsyncMaskWriter
     mask_writer = AsyncMaskWriter(mask_format=project.mask_format)
 
+    # start_session must be INSIDE the try: a failure here (bad frames dir, OOM
+    # allocating state) must still set ConceptStatus.ERROR and restore
+    # max_num_objects in the finally, or the concept is left stuck at PROCESSING
+    # and the instance cap silently leaks to every subsequent concept.
     try:
+        # offload_state_to_cpu: moves maskmem_features to CPU after each frame so GPU
+        # doesn't accumulate the full video's worth of 648 KB/frame/instance tensors.
+        sam3_model.start_session(
+            resource_path=frames_dir,
+            session_id=session_id,
+            offload_state_to_cpu=True,
+        )
+        print(f"Session started: {session_id}")
+
         # 4. Add text prompt.
         # The frame_idx here is just for showing initial results on that frame.
         # Text prompts apply to all frames, and propagation will scan the entire video.
@@ -2236,6 +2235,33 @@ def online_replay_concept_refinements(
     total_pixels = orig_width * orig_height
     instances_root = os.path.join(project_dir, "concepts", concept.name, "instances")
     output_dirs: dict = {}  # obj_id_int -> output_dir (cached per unique object)
+
+    # Record which frames already have mask data for each live instance, so we know
+    # which stale files to delete (via _clear_stale_mask) when refinement produces no
+    # mask at a frame this round (rather than leaving the old file in place). Mirrors
+    # the offline replay_concept_refinements.
+    original_mask_frames: dict = {}
+    for _obj_id_int in live_obj_ids:
+        _mask_dir = os.path.join(instances_root, str(_obj_id_int), "masks")
+        if not os.path.isdir(_mask_dir):
+            continue
+        _frames = set()
+        for _fname in os.listdir(_mask_dir):
+            _stem, _fext = os.path.splitext(_fname)
+            if _fext in (".npz", ".png"):
+                try:
+                    _frames.add(int(_stem))
+                except ValueError:
+                    pass
+        if _frames:
+            original_mask_frames[_obj_id_int] = _frames
+
+    # Frames each instance actually appeared in this round's propagation output —
+    # used below to mark ONLY reachable refinement entries as propagated (an entry
+    # whose frame the sub-state never reached must stay pending; see the matching
+    # comment in replay_concept_refinements).
+    seen_frames_by_obj: dict = defaultdict(set)
+
     # In the live session, deleted instances' sub-states are still present (remove_object
     # is not called from the UI on delete to preserve undo — unlike the offline CLI replay,
     # this session stays alive across UI interactions, so removing a sub-state here would
@@ -2268,7 +2294,9 @@ def online_replay_concept_refinements(
             out_frame_idx = out["frame_index"]
             outputs = out["outputs"]
             if outputs is None:
+                inner_state["cached_frame_outputs"].pop(out_frame_idx, None)
                 continue
+            present_targets_this_frame = set()
             for obj_id, mask in zip(outputs.get("out_obj_ids", []), outputs.get("out_binary_masks", [])):
                 obj_id_int = int(obj_id)
 
@@ -2287,19 +2315,44 @@ def online_replay_concept_refinements(
                     target_id = obj_id_int
 
                 mask_np = mask.cpu().numpy() if torch.is_tensor(mask) else np.asarray(mask)
+                if mask_np.ndim == 3 and mask_np.shape[0] == 1:
+                    mask_np = mask_np[0]
+                present_targets_this_frame.add(target_id)
+                seen_frames_by_obj[target_id].add(out_frame_idx)
                 if target_id not in output_dirs:
                     output_dirs[target_id] = os.path.join(
                         instances_root, str(target_id), "masks"
                     )
+                pixel_count = int((mask_np > 0).sum())
+                if pixel_count == 0:
+                    # Refinement removed this instance from the frame: delete any
+                    # previous round's mask file instead of leaving a stale ghost.
+                    if out_frame_idx in original_mask_frames.get(target_id, set()):
+                        _clear_stale_mask(output_dirs[target_id], out_frame_idx)
+                    continue
                 mask_writer.submit(mask_np, output_dirs[target_id], out_frame_idx)
-                pixel_counts_by_obj[target_id][out_frame_idx] = int((mask_np > 0).sum())
-            _prune_non_cond_outputs(
-                sam3_model._all_inference_states[session_id]["state"], out_frame_idx,
-                keep=_keep,
-            )
+                pixel_counts_by_obj[target_id][out_frame_idx] = pixel_count
+
+            # Instances with an active sub-state at propagation start that are entirely
+            # absent from this frame's output (e.g. removed by hotstart mid-propagation)
+            # also need their stale masks cleared — see replay_concept_refinements.
+            for obj_id_int in live_obj_ids & pre_propagation_ids:
+                if obj_id_int in present_targets_this_frame:
+                    continue
+                if out_frame_idx in original_mask_frames.get(obj_id_int, set()):
+                    if obj_id_int not in output_dirs:
+                        output_dirs[obj_id_int] = os.path.join(
+                            instances_root, str(obj_id_int), "masks"
+                        )
+                    _clear_stale_mask(output_dirs[obj_id_int], out_frame_idx)
+
+            # Evict after saving — forward propagation never revisits past frames.
+            # Without this the session accumulates full-resolution masks for every
+            # propagated frame (OOM on long videos).
+            inner_state["cached_frame_outputs"].pop(out_frame_idx, None)
+            _prune_non_cond_outputs(inner_state, out_frame_idx, keep=_keep)
             _offload_unselected_cond_frames(
-                sam3_model._all_inference_states[session_id]["state"], out_frame_idx,
-                sam3_model.model.tracker,
+                inner_state, out_frame_idx, sam3_model.model.tracker,
             )
             if progress_callback:
                 progress_callback(out_frame_idx, num_frames)
@@ -2345,7 +2398,12 @@ def online_replay_concept_refinements(
             inst.first_detection_frame = periods[0][0]
             inst.last_detection_frame = periods[-1][1]
 
-    # Mark all pending entries as propagated
+    # Mark pending entries as propagated ONLY for frames this round's propagation
+    # actually reached for that instance. An entry whose frame the sub-state never
+    # reached (e.g. removed by hotstart before getting there) had no chance to apply
+    # and must stay pending, or it is silently and permanently discarded on the next
+    # refinement round — same gating as the offline replay_concept_refinements.
+    stuck_entries = []  # (user_name, obj_id, frame_idx) left pending for a future retry
     for instance, _ in instances_with_pending:
         refinements_path = os.path.join(
             project_dir, "concepts", concept.name,
@@ -2355,12 +2413,27 @@ def online_replay_concept_refinements(
             continue
         with open(refinements_path) as f:
             data = json.load(f)
+        entries_seen = seen_frames_by_obj.get(instance.sam3_obj_id, set())
+        changed = False
         for r in data.get("refinements", []):
-            if not r.get("propagated", True):
+            if r.get("propagated", True):
+                continue
+            if r.get("frame_idx") in entries_seen:
                 r["propagated"] = True
                 r["online"] = True
-        with open(refinements_path, "w") as f:
-            json.dump(data, f, indent=2)
+                changed = True
+            else:
+                stuck_entries.append(
+                    (instance.user_name, instance.sam3_obj_id, r.get("frame_idx")))
+        if changed:
+            with open(refinements_path, "w") as f:
+                json.dump(data, f, indent=2)
+
+    if stuck_entries:
+        print(f"  WARNING: {len(stuck_entries)} correction(s) left PENDING — the instance's "
+              f"sub-state never reached that frame in this round's output (likely removed/"
+              f"lost track earlier in propagation). Will retry on the next refinement: "
+              f"{stuck_entries}")
 
     print(f"Online concept-level refinement complete for '{concept.name}'.")
 

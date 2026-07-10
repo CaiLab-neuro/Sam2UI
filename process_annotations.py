@@ -1909,6 +1909,9 @@ Examples:
                         try:
                             d = np.load(str(mask_path))
                             k = obj_data.get('npz_key', '')
+                            if k not in d.files and 'mask' in d.files:
+                                # Per-object NPZ (SAM3 link / covered-union) uses key 'mask'
+                                k = 'mask'
                             return (d[k] > 0).astype(np.uint8) * 255 if k in d.files else None
                         except Exception:
                             return None
