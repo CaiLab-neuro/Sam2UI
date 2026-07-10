@@ -1052,7 +1052,7 @@ def export_to_sam2_format(
 
             npz_key = f"mask_f{frame_idx:06d}_{obj_name}_id{sam2_obj_id}"
             if source_is_npz:
-                # Write into a per-frame NPZ bundle (compatible with process_annotations.py --mask-format npz)
+                # Write into a per-frame NPZ bundle (compatible with sam2_process.py --mask-format npz)
                 npz_path = masks_dir / f"masks_f{frame_idx:06d}.npz"
                 existing: dict = {}
                 if npz_path.exists():
@@ -1072,7 +1072,7 @@ def export_to_sam2_format(
         for assignment in group:
             assignment["instance"].sam2_object_id = sam2_obj_id
 
-    # Write metadata compatible with process_annotations.py / sam2_ui.py import
+    # Write metadata compatible with sam2_process.py / sam2_ui.py import
     metadata = {
         "processing_info": {
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),

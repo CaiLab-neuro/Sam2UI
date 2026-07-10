@@ -710,7 +710,7 @@ class SAM3VideoUI:
                  command=self.clear_frame_annotations).pack(fill=tk.X, pady=2)
 
         self.remove_mode_button = tk.Button(
-            refine_frame, text="Remove Annotation Mode",
+            refine_frame, text="Removal Mode: OFF",
             command=self.toggle_point_removal_mode,
             bg='#404040', fg='white', activebackground='#505050'
         )
@@ -4676,11 +4676,13 @@ class SAM3VideoUI:
         mask anchor removes it."""
         self.point_removal_mode = not self.point_removal_mode
         if self.point_removal_mode:
-            self.remove_mode_button.config(bg='#DC143C', activebackground='#FF6347')
-            self.status_var.set("Remove Annotation Mode: click near a point or box to delete it.")
+            self.remove_mode_button.config(text="Removal Mode: ON",
+                                           bg='#DC143C', activebackground='#FF6347')
+            self.status_var.set("Removal Mode: click near a point or box to delete it.")
         else:
-            self.remove_mode_button.config(bg='#404040', activebackground='#505050')
-            self.status_var.set("Remove Annotation Mode off.")
+            self.remove_mode_button.config(text="Removal Mode: OFF",
+                                           bg='#404040', activebackground='#505050')
+            self.status_var.set("Removal Mode off.")
 
     def remove_point_at_location(self, x: float, y: float) -> bool:
         """Remove the closest refinement point within 20px of (x, y). Returns True if removed."""

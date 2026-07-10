@@ -6,7 +6,7 @@ Shared video segmentation functionality for both UI and CLI usage.
 Provides a unified VideoSegmenter class that wraps SAM2/SAM3 models.
 
 This module extracts common segmentation logic from sam2_ui.py and
-process_annotations.py to reduce code duplication and provide a
+sam2_process.py to reduce code duplication and provide a
 consistent interface for video segmentation.
 """
 

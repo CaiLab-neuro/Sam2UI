@@ -1,367 +1,125 @@
-# SAM2 Graphic User Interface and Gaze-Target Annotation (Gaze Target Annotator)
+# Gaze Target Annotator — Video Segmentation with SAM3 / SAM2
 
-Gaze Target Annotator, as a part of GazeBehavior Annotation Toolkit (GBAT), provides a generic-purpose graphical user interface to annotate objects in a video with a few points, and utilize SAM2 or SAM3 to segment objects in the video. 
-For eye-tracking research, it further includes utility to map eye-gaze coordinate in the scene video of head-mounted eye-tracker to categories of gaze target.
+Gaze Target Annotator is part of the [GazeBehavior Annotation Toolkit (GBAT)](https://github.com/CaiLab-neuro/GazeBehaviorAnnotationToolkit).
 
-The toolkit includes three main components: an interactive segmentation UI, an offline processing script, and a script for using segmentation outputs and eye-tracker gaze coordiate data to generate time series of gaze target. For gaze coordinate data, we follow the format of Pupil Labs output.
+It is a video object segmentation tool built on Meta's [SAM3](https://github.com/facebookresearch/sam3) and [SAM2](https://github.com/facebookresearch/sam2). It was originally designed for segmenting object instances in scene videos acquired from head-mounted eye-trackers in eye-tracking studies, but it is equally suitable as a general-purpose tool for video and image instance segmentation.
 
+For eye-tracking research, it additionally maps gaze coordinates from the eye-tracker onto the segmented objects, producing a **time course of gaze targets** (which object the participant looks at, moment by moment).
 
-## Prerequisites
+## Key Advantages
 
-**IMPORTANT**: Before running setup, create and activate a dedicated conda environment or virtualenv. This prevents dependency conflicts and ensures proper package installation.
+- **Long-video support** — we have optimized GPU and CPU memory footprint to allow you to process long videos (we tested on 30,000+ frames, but it should work on even longer videos) on a machine with modest GPU (> 16 GB VRAM).
+- **Fully local computing** — all models run on your own machine/server. No video ever goes to a third-party cloud unless you send by yourself, which matters for sensitive research recordings that contain faces of participants and others.
+- **Friendly graphical interface** — annotate with text prompts, clicks, or boxes in a point-and-click UI; no coding required for the core workflow.
+- **Gaze-target time course** — combine segmentation masks with eye-tracker gaze coordinates (Pupil Labs format) to label the gazed object for every gaze sample, with confidence scores and diagnostic figures.
+- **Text-prompt detection (SAM3)** — describe objects in plain language ("person", "toy", "table") and detect every instance across the whole video automatically.
+- **Interactive refinement** — correct any mistake with positive/negative clicks or boxes and run SAM3/2 again to refine segmentation; corrections from all rounds are preserved as feedback to the SAM model.
+- **Headless batch processing** — as the processing time is long for long videos, the processing jobs can run on a remote GPU server, while you provide feedback or add annotation for the next video to process.
+- **Resumable projects** — annotations, refinements, and masks are stored on disk in a project directory; you can stop and resume at any stage.
 
-### Recommended: Conda Environment
+## Two Pipelines: SAM3 and SAM2
+
+The toolkit contains two parallel pipelines that share the same installation and output conventions:
+
+| | SAM3 pipeline (recommended) | SAM2 pipeline |
+|---|---|---|
+| Prompting | Text prompt per concept (+ click/box refinement) | Click points per object |
+| Detection | Finds **all** instances of a concept automatically | You annotate each object yourself in a few frames |
+| UI | `sam3_ui.py` | `sam2_ui.py` |
+| Batch CLI | `sam3_process.py` | `sam2_process.py` |
+| Guide | **[SAM3 Guide](docs/sam3_guide.md)** | **[SAM2 Guide](docs/sam2_guide.md)** |
+
+**SAM3 is likely the pipeline you want to start with.** The SAM2 pipeline remains useful in two situations:
+
+1. **Concepts that are hard to prompt by text** — if SAM3 cannot reliably detect an object from a text description, a few manual clicks in the SAM2 UI can segment it directly.
+2. **Many instances, few of interest** — SAM3 tracks *every* instance of a concept, which may increase GPU memory usage and processing time when a scene contains many (e.g., hundreds of toys) but you only need a few. With SAM2 you can click only the instances you care about.
+
+The two pipelines interoperate: SAM3 results can be **exported into the SAM2 workflow** (`sam3_process.py --export-sam2`), so you can let SAM3 handle the easy concepts and pick up the remainder with SAM2 point annotation — without re-segmenting what SAM3 already covered. See the [SAM3 guide](docs/sam3_guide.md#exporting-to-the-sam2-pipeline) for details. SAM2-to-SAM3 porting is not yet supported.
+
+After segmentation (from either pipeline), the **[Gaze-Target Alignment guide](docs/gaze_alignment.md)** describes how to generate the gaze-target time course from the masks and eye-tracker data.
+
+## Installation
+
+**IMPORTANT**: Before running setup, create and activate a dedicated conda environment or virtualenv.
 
 ```bash
-# Create conda environment with Python 3.10+ (3.12+ for SAM3)
+# Recommended: conda environment with Python 3.12 (SAM3 requires 3.12+; SAM2 alone needs 3.10+)
 conda create -n sam python=3.12 -y
 conda activate sam
-```
 
-### Alternative: Virtual Environment (venv)
-
-```bash
-# Create virtual environment
-python3 -m venv sam_env
-# Activate it
-source sam_env/bin/activate  # Linux/Mac
-# OR
-sam_env\Scripts\activate  # Windows
-```
-
-## 1. Setup Script (`install.py`)
-
-**Purpose**: Automatically install SAM2, dependencies, and model checkpoints
-
-**Usage** (activate your environment first, then run):
-```bash
-conda activate sam  # or: source sam_env/bin/activate
+# Run the installer
 python install.py
 ```
 
-**What it does**:
-- Checks Python version (requires 3.10+ for SAM2, 3.12+ for SAM3)
-- Installs Python packages (torch, opencv, numpy, etc.)
-- **Clones and installs SAM2** into `sam_models/sam2/`
-- **Interactive model selection** - choose which checkpoints to download
-- Optionally installs SAM3 for text-based prompting (into `sam_models/sam3/`)
-- Installs additional dependencies (`einops` for SAM3)
-- Creates launcher scripts (run.bat/run.sh)
-- Verifies installation
+The installer:
+- Checks the Python version (3.10+ for SAM2, 3.12+ for SAM3)
+- Installs Python dependencies (torch, opencv, numpy, ...)
+- Clones and installs **SAM2** into `sam_models/sam2/` with interactive checkpoint selection
+- Optionally clones and installs **SAM3** into `sam_models/sam3/` (requires PyTorch 2.7+, CUDA 12.6+, and HuggingFace access approval — see the [SAM3 guide](docs/sam3_guide.md#installation))
+- Creates launcher scripts (`run.sh` / `run.bat`) and verifies the installation
+- SAM3 checkpoint needs to be downloaded by yourself as it requires approval from Huggingface.
 
-**Checkpoint Download**:
-During setup, you'll be prompted to choose which model checkpoints to download:
-- **Option B**: SAM2.1 Small + Base+ (~500 MB, lower memory usage)
-- **Option A**: All SAM2.1 models (~1.5 GB)
-- **Option C**: Custom selection — enter individual model numbers or a range (e.g., `2`, `2-4`, `2,4`)
-
-Only models whose checkpoints are downloaded will be available at runtime.
-
-## 2. Using the SAM2 Video UI (`sam2_ui.py`)
-
-### Launch the App
-```bash
-python sam2_ui.py
-```
-
-### Initial Setup
-1. Load a video file
-2. Create an object list — add each object you want to track and give it a name
-
-### Annotation
-1. Navigate to a frame where the object is clearly visible
-2. Add annotation points on the object (positive and negative clicks)
-3. Repeat for additional objects or frames as needed
-4. Export annotations as a JSON file
-
-### Segmentation
-Select a model from the dropdown (larger models such as Base+ or Large generally produce better masks but are slower; only downloaded checkpoints appear), then either segment within the UI or use the processing script (more details in the next section):
-```bash
-python process_annotations.py annotations.json video.mp4
-```
-For videos longer than a few hundred frames, using the processing script is recommended as the UI can be slow on long videos.
-
-### Refinement
-1. Import segmentation results (this also imports the original annotations)
-2. Use quality metrics to identify segments in video where segmentation is poor
-3. Add or adjust annotation points and re-segment the frame to verify
-4. Re-export the updated annotations and re-run the processing script, or run segmentation in refinement mode for a range of frames within UI
-
-## 3. Processing Script (`process_annotations.py`)
-
-**Purpose**: Process annotation JSON from SAM2 Video UI to generate segmented video and masks
-
-**Usage**:
-```bash
-# Basic usage (uses SAM2.1 Base+ by default)
-python process_annotations.py annotations.json video.mp4
-
-# Use SAM2.1 Large model
-python process_annotations.py annotations.json video.mp4 --model sam2.1-large
-
-# With custom output directory
-python process_annotations.py annotations.json video.mp4 --output-dir results/
-
-# With custom settings
-python process_annotations.py annotations.json video.mp4 \
-  --output-dir results/ \
-  --fps 30 --opacity 0.4
-
-# Re-render output video from existing masks (no re-segmentation)
-python process_annotations.py annotations.json video.mp4 \
-  --output-dir results/ --video-only --opacity 0.6
-
-# Re-segment only objects that were updated in the annotation file
-python process_annotations.py annotations.json video.mp4 \
-  --output-dir results/ --only-updated
-```
-
-### `process_annotations.py` Options
-
-| Option | Description | Default |
-|--------|-------------|---------|
-| `--output-dir` | Output directory | `sam2_output` |
-| `--model` | SAM2 model to use | auto (best for GPU) |
-| `--fps` | Output video FPS | 30.0 |
-| `--opacity` | Mask overlay opacity (0.0-1.0) | 0.4 |
-| `--video-only` | Re-render video from existing masks, skip segmentation | — |
-| `--only-updated` | Re-segment only objects marked as updated; reuse other masks | — |
-| `--prev-results` | Directory with previous masks to reuse (with `--only-updated`) | output dir |
-| `--offload-to-cpu` | Offload video frames to CPU to reduce GPU memory usage | — |
-| `--frame-dir` | Persistent directory for extracted frames (avoids re-extraction) | temp dir |
-
-## 4. Gaze-Target Annotation with Segmented Results (`process_gaze_mask_alignment.py`)
-
-**Purpose**: Use exported segmentation masks together with gaze and world-camera timestamps to assign each gaze sample to the most likely object.
-
-This component is intended for a workflow where segmentation is completed first in Sam2UI, and the resulting masks are then matched against gaze coordinates frame by frame. For each gaze point, the script compares the gaze location to the available object masks in the corresponding frame and outputs the most likely gazed object together with a confidence score. Multiple subjects and cameras can be processed in a single run, or auto-discovered from the filenames in the gaze directory.
-
-**Required inputs**:
-- **Gaze/world-camera directory** containing files named like `{subject_id}_{camera}_gaze.csv` and `{subject_id}_{camera}_world_timestamps.csv`
-- **Segmentation mask directory** containing folders named like `{subject_id}/{camera}/masks/` (or legacy `{subject_id}_{camera}/masks/`)
-- **Output directory** for gaze-target annotation results
-
-**Optional inputs**:
-- **Blink directory** containing `{subject_id}_{camera}_blinks.csv` files if you want to label or remove gaze points during blinks
-
-**Expected CSV structure**:
-- **`{subject_id}_{camera}_gaze.csv`**: one row per gaze sample, ordered by time. Required columns are `timestamp [ns]`, `gaze x [px]`, and `gaze y [px]`. Additional columns are allowed and are preserved in the merged/output tables.
-- **`{subject_id}_{camera}_world_timestamps.csv`**: one row per world-camera frame, ordered by time. Required column is `timestamp [ns]`. Additional columns are allowed, but the script rebuilds `frame_idx` and `frame_timestamp` from this file during alignment.
-- **`{subject_id}_{camera}_blinks.csv`**: used only with `--blink-dir`. The code expects `start timestamp [ns]`, `end timestamp [ns]`, and `blink id`, because those columns are used to mark whether a gaze sample falls inside a blink interval.
-
-**Minimum column examples**:
-```csv
-# {subject_id}_{camera}_gaze.csv
-timestamp [ns],gaze x [px],gaze y [px]
-1000000000,640.5,360.2
-1000033333,642.1,361.0
-```
-
-```csv
-# {subject_id}_{camera}_world_timestamps.csv
-timestamp [ns]
-999999000
-1000030000
-1000063000
-```
-
-```csv
-# {subject_id}_{camera}_blinks.csv
-blink id,start timestamp [ns],end timestamp [ns]
-0,1000200000,1000400000
-1,1001000000,1001200000
-```
-
-**Usage**:
-```bash
-# Process one subject/camera pair
-python process_gaze_mask_alignment.py \
-  /path/to/gaze_world_data \
-  /path/to/segmentation_masks \
-  /path/to/output_dir \
-  --subject-id 27 \
-  --camera-id child
-
-# Process multiple subjects and cameras in one run
-python process_gaze_mask_alignment.py \
-  /path/to/gaze_world_data \
-  /path/to/segmentation_masks \
-  /path/to/output_dir \
-  --subject-id 27,28 \
-  --camera-id child,parent
-
-# Auto-discover all subjects and cameras from CSV filenames
-python process_gaze_mask_alignment.py \
-  /path/to/gaze_world_data \
-  /path/to/segmentation_masks \
-  /path/to/output_dir
-
-# Remove gaze points during blinks
-python process_gaze_mask_alignment.py \
-  /path/to/gaze_world_data \
-  /path/to/segmentation_masks \
-  /path/to/output_dir \
-  --subject-id 27 \
-  --camera-id child \
-  --blink-dir /path/to/blink_data
-
-# Restrict method-figure plots to a time window
-python process_gaze_mask_alignment.py \
-  /path/to/gaze_world_data \
-  /path/to/segmentation_masks \
-  /path/to/output_dir \
-  --subject-id 27 --camera-id child \
-  --start-plot-time 10.0 --end-plot-time 60.0
-```
-
-### `process_gaze_mask_alignment.py` Options
-
-| Option | Description |
-|--------|-------------|
-| `gaze_world_dir` | Directory with `{subject}_{camera}_gaze.csv` and `{subject}_{camera}_world_timestamps.csv` |
-| `mask_dir` | Directory with `{subject}/{camera}/masks/` or `{subject}_{camera}/masks/` subfolders |
-| `output_dir` | Directory to save output files |
-| `--subject-id` | Subject ID(s), e.g. `27` or `27,28`. Auto-discovered if omitted. |
-| `--camera-id` | Camera ID(s), e.g. `child` or `child,parent`. Auto-discovered if omitted. |
-| `--blink-dir` | Directory with `{subject}_{camera}_blinks.csv` files for blink labeling/removal |
-| `--log-path` | Path for the log file (default: `{output_dir}/gaze_object.log`) |
-| `--start-plot-time` | Start time in seconds for method-figure plots (optional) |
-| `--end-plot-time` | End time in seconds for method-figure plots (optional) |
-
-**Output files**:
-- **`output_dir/{subject_id}_gazed_object/{subject_id}_{camera}_gazed_object.csv`** - Gaze samples with assigned object labels and confidence
-- **`output_dir/{subject_id}_gazed_object/{subject_id}_{camera}_gaze_object_probabilities.pkl`** - Per-gaze probabilities for all available masks
-- **`output_dir/{subject_id}_gazed_object/{subject_id}_{camera}_gaze_blink_labeled.csv`** - Blink-labeled gaze data when `--blink-dir` is used
-- **`output_dir/{subject_id}_gazed_object/{subject_id}_{camera}_gaze_blink_removed.csv`** - Blink-removed gaze data when `--blink-dir` is used
-- **`output_dir/{subject_id}_gazed_object/figures/`** - Trajectory plots and confidence heatmaps (PNG and PDF)
-- **`output_dir/gaze_object.log`** - Processing log (or path set by `--log-path`)
-
-The main output CSV keeps the original gaze columns and any extra gaze metadata, then adds the alignment/object-assignment fields below:
-- `frame_idx`: world-camera frame index matched to the gaze sample
-- `frame_timestamp`: timestamp of the matched world-camera frame
-- `in_blink`: added only when `--blink-dir` is used
-- `blink id`: added only when `--blink-dir` is used
-- `gazed_object_id`: mask/object ID parsed from the exported mask filename
-- `gazed_object`: object label parsed from the exported mask filename
-- `gazed_object_confidence`: fraction of pixels inside the 20 px gaze-radius circle that overlap the winning object mask
-
-## Output Files
-
-After processing, you'll get:
-
-- **`output_dir/masks/`** - Individual mask images (PNG files)
-- **`output_dir/segmented_video.mp4`** - Video with colored mask overlays
-- **`output_dir/processing_metadata.json`** - Processing statistics
-- **`output_dir/{subject_id}_gazed_object/`** - Gaze-target annotation outputs generated from segmentation masks
-
-## SAM3 Support (Optional)
-
-SAM3 adds text-based prompting capabilities for object segmentation. So far, we have not integreated this feature. But users can still use the point-based prompt for SAM3. Empirically we found it may perform worse than SAM2 in this usage.
-
-### Requirements
-
-**System Requirements**:
-- Python 3.12+
-- PyTorch 2.7+
-- **CUDA 12.6+** (for GPU acceleration)
-- HuggingFace account with SAM3 access
-
-**Note**: SAM3 has stricter requirements than SAM2. Consider creating a separate Python 3.12 environment if needed.
-
-### Installation Steps
-
-#### 1. During Setup
-When running `install.py`, answer 'y' when prompted for SAM3 installation.
-
-The installer will:
-- Check Python version (≥3.12)
-- Check PyTorch version (≥2.7)
-- Check CUDA version (≥12.6)
-- Clone SAM3 repository
-- Install SAM3 package
-
-#### 2. Request Checkpoint Access
-Before you can download SAM3 checkpoints:
-
-1. Visit https://huggingface.co/facebook/sam3
-2. Click "Request Access"
-3. Wait for approval (usually within 24-48 hours)
-
-#### 3. Authenticate with HuggingFace
-
-After access is granted:
+Alternative with venv:
 
 ```bash
-# Install HuggingFace CLI (if not already installed)
-pip install huggingface-hub
-
-# Generate access token at: https://huggingface.co/settings/tokens
-# Then authenticate
-huggingface-cli login
-# Paste your token when prompted
+python3 -m venv sam_env
+source sam_env/bin/activate   # Linux/Mac
+# sam_env\Scripts\activate    # Windows
+python install.py
 ```
 
-#### 4. Download Checkpoints
+### Troubleshooting Setup
 
-After authentication, download SAM3 checkpoints from HuggingFace and place them in the `sam_models/sam3/checkpoints/` directory:
+- **Python version**: requires 3.10+ for SAM2, 3.12+ for SAM3 (`python --version`)
+- **Git not installed**: download from https://git-scm.com/downloads
+- **Failed to install some packages**: try downgrading Python from the newest version, then rerun `install.py`. If it still fails, install the failed package with conda or pip, then rerun `install.py`. You can report to us such cases in github issue.
+- **Failed to load pytorch_python dll**: remove torch and torchvision, then let `install.py` reinstall them
+- **Model not found at runtime**: run `install.py` again and download the missing checkpoint
+
+## Documentation
+
+- **[SAM3 Guide](docs/sam3_guide.md)** — text-prompt segmentation: concepts, instances, refinement, batch CLI, SAM3 installation, export to SAM2
+- **[SAM2 Guide](docs/sam2_guide.md)** — point-based segmentation: annotation UI, batch processing, refinement
+- **[Gaze-Target Alignment](docs/gaze_alignment.md)** — from segmentation masks + gaze data to a gaze-target time course
+
+## Citation
+
+If you use this toolkit in your research, please cite our paper:
+
+> Iba Baig, Kevin Li, Yanbin Xu, Seiji Cattelain, Marie Hallo, Hayato Ono, Sho Tsuji, and Ming Bo Cai (2026). *GazeBehavior Annotation Toolkit (GBAT): AI-powered toolkit for automatic annotation of egocentric eye-tracking and video data of child-caregiver interaction.* arXiv:2605.22962. https://arxiv.org/abs/2605.22962
+
+```bibtex
+@article{baig2026gazebehavior,
+  title   = {GazeBehavior Annotation Toolkit (GBAT): AI-powered toolkit for
+             automatic annotation of egocentric eye-tracking and video data
+             of child-caregiver interaction},
+  author  = {Baig, Iba and Li, Kevin and Xu, Yanbin and Cattelain, Seiji and
+             Hallo, Marie and Ono, Hayato and Tsuji, Sho and Cai, Ming Bo},
+  journal = {arXiv preprint arXiv:2605.22962},
+  year    = {2026},
+  url     = {https://arxiv.org/abs/2605.22962}
+}
+```
+
+## Staying Up to Date
+
+We keep improving the toolkit — check this repository for new versions from time to time. If you installed by cloning the repository (the normal route), updating takes a single command from the `SegmentVideo4Gaze` directory:
 
 ```bash
-# Create checkpoints directory
-mkdir -p sam_models/sam3/checkpoints
-
-# Download using Python (after huggingface-cli login)
-python -c "
-from huggingface_hub import hf_hub_download
-hf_hub_download(
-    repo_id='facebook/sam3',
-    filename='sam3_hiera_l.pt',
-    local_dir='sam_models/sam3/checkpoints'
-)
-"
+git pull
 ```
 
 
-**Expected checkpoint location**: `Sam2UI/sam_models/sam3/checkpoints/`
+## Update Timeline
 
-#### 5. Verify Installation
+- **2025-09** — Initial development: SAM2 point-based annotation UI (`sam2_ui.py`) and batch processing script
+- **2025-10 – 2026-01** — Memory optimizations that make long videos (30,000+ frames) feasible on ordinary hardware; segmentation quality metrics to help spot frames that need correction
+- **2026-02** — Gaze-target alignment: turn segmentation masks + eye-tracker data into a gaze-target time course; improved in-UI refinement
+- **2026-05** — GBAT preprint posted on arXiv ([arXiv:2605.22962](https://arxiv.org/abs/2605.22962)) and this repository made public.
+- **2026-07** — SAM3 pipline becomes available. Documentation restructure; scripts renamed for consistency (`process_annotations.py` → `sam2_process.py`, `sync_annotations_sam3.py` → `sam3_sync.py`; the old names still work but please consider calling new script names)
 
-```bash
-python -c "from sam3.model_builder import build_sam3_video_predictor; print('SAM3 OK')"
-```
+## Feedback and Contributing
 
-### Current Features
+We would love to hear from you! If you run into a problem, find the documentation unclear, or have an idea for a feature, please open an issue on the [Issues tab](../../issues) — reports from real research workflows are the most valuable guide for where to improve the toolkit.
 
-- Point-based prompts (compatible with SAM2 workflow)
-- Model selection via UI (when SAM3 is detected)
-
-### Coming Soon
-
-- Combined text + point prompts for refinement
-
-## Troubleshooting
-
-### Setup Issues
-- **Python version**: Requires Python 3.10+ for SAM2, 3.12+ for SAM3
-- **Git not installed**: Download from https://git-scm.com/downloads
-- **Failed to install some packages**: Try downgrading Python from the newest version, then rerun install.py. If it still fails, install the failed package with conda, then rerun install.py.
-- **Failed to load pytorch_python dll**: Remove torch and torchvision, then let install.py reinstall them
-
-### Processing Issues
-- **Model not found**: Run `install.py` first to download models
-- **Memory errors**: Use smaller model (tiny or small) or reduce video resolution
-- **Path errors**: Ensure you're running from the Sam2UI directory
-
-### SAM3 Issues
-- **CUDA version too old**: SAM3 requires CUDA 12.6+. Check with `nvidia-smi` or upgrade CUDA toolkit
-- **PyTorch too old**: Upgrade PyTorch: `pip install torch==2.7.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126`
-- **Access not granted**: Request access at https://huggingface.co/facebook/sam3 and wait for approval
-- **Checkpoint not found**: Ensure checkpoints are in `sam_models/sam3/checkpoints/` after download
-- **Import error**: Verify installation: `pip list | grep -i sam3`
-
-### Common Solutions
-1. **Re-run setup**: `python install.py`
-2. **Check SAM2 installation**: Verify `sam_models/sam2/` directory exists with subdirectories
-3. **Verify Python version**: `python --version` (must be 3.10+)
-4. **Check file paths**: Ensure annotation and video files exist
-
-
+Code and documentation contributions are also very welcome, from a one-line fix to a new feature. See the [Contribution Guide](CONTRIBUTING.md) for how to set up a development environment, our coding conventions, and the pull-request workflow.

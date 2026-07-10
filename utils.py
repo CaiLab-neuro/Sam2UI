@@ -2293,7 +2293,7 @@ def export_video_from_dict(
     Export segmented video from masks_by_frame dictionary (CLI usage).
 
     This is a convenience wrapper around export_segmented_video() for use
-    with process_annotations.py workflow.
+    with sam2_process.py workflow.
 
     Args:
         video_path: Path to the original video file

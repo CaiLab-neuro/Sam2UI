@@ -1799,7 +1799,7 @@ class SAM2VideoUI:
             self.object_colors = _AutoColorDict({int(k): v for k, v in object_colors_raw.items()})
 
             # Load covered IDs — SAM2 objects declared done by SAM3 (read-only, no masks here;
-            # their masks are the union of sam3_sub_ids computed at process_annotations time).
+            # their masks are the union of sam3_sub_ids computed at sam2_process time).
             covered_raw = handoff.get("sam2_covered_ids", {})
             self.sam2_covered_ids = {int(k): v for k, v in covered_raw.items()}
             for cid, info in self.sam2_covered_ids.items():
@@ -5747,7 +5747,7 @@ class SAM2VideoUI:
 
                     # Export segmented video and metadata
                     try:
-                        # Prepare annotations data (matching process_annotations.py format)
+                        # Prepare annotations data (matching sam2_process.py format)
                         annotations_data = {
                             "video_path": self.video_path,
                             "total_frames": len(self.frames),
@@ -5770,7 +5770,7 @@ class SAM2VideoUI:
                         self.root.update()
                         video_exported = self._export_segmented_video(output_base_dir, masks_output_dir, source_video_path=source_video, overlay_opacity=self.mask_opacity_var.get())
 
-                        # Save processing metadata (matching process_annotations.py format)
+                        # Save processing metadata (matching sam2_process.py format)
                         metadata_path = os.path.join(output_base_dir, "processing_metadata.json")
                         with open(metadata_path, 'w') as f:
                             json.dump({

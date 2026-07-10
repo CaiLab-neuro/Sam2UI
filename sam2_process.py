@@ -7,17 +7,17 @@ Takes annotation JSON from SAM2 Video UI and video file,
 then exports segmented video and masks.
 
 Usage:
-    python process_annotations.py <annotation_file> <video_file> [options]
+    python sam2_process.py <annotation_file> <video_file> [options]
 
 Examples:
     # Use default model (sam2 base+)
-    python process_annotations.py annotations.json video.mp4
+    python sam2_process.py annotations.json video.mp4
     
     # Use SAM2.1 large model
-    python process_annotations.py annotations.json video.mp4 --model sam2.1-large
+    python sam2_process.py annotations.json video.mp4 --model sam2.1-large
     
     # Use custom config and checkpoint
-    python process_annotations.py annotations.json video.mp4 --config configs/sam2/sam2_hiera_l.yaml --checkpoint checkpoints/sam2_hiera_large.pt
+    python sam2_process.py annotations.json video.mp4 --config configs/sam2/sam2_hiera_l.yaml --checkpoint checkpoints/sam2_hiera_large.pt
     
 """
 
@@ -1492,22 +1492,22 @@ Available preset models:
 
 Examples:
   # Use default model (sam2-base+)
-  python process_annotations.py annotations.json video.mp4
+  python sam2_process.py annotations.json video.mp4
 
   # Use SAM2.1 large model
-  python process_annotations.py annotations.json video.mp4 --model sam2.1-large
+  python sam2_process.py annotations.json video.mp4 --model sam2.1-large
 
   # Use CPU offloading for memory optimization
-  python process_annotations.py annotations.json video.mp4 --offload-to-cpu
+  python sam2_process.py annotations.json video.mp4 --offload-to-cpu
 
   # Use a specific GPU (e.g., cuda:1)
-  python process_annotations.py annotations.json video.mp4 --device cuda:1
+  python sam2_process.py annotations.json video.mp4 --device cuda:1
 
   # Use CPU explicitly
-  python process_annotations.py annotations.json video.mp4 --device cpu
+  python sam2_process.py annotations.json video.mp4 --device cpu
 
   # Use custom config and checkpoint
-  python process_annotations.py annotations.json video.mp4 \\
+  python sam2_process.py annotations.json video.mp4 \\
     --config configs/sam2/sam2_hiera_l.yaml \\
     --checkpoint checkpoints/sam2_hiera_large.pt
         """
