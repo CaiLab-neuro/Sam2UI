@@ -103,6 +103,7 @@ def install_packages():
         "torchvision>=0.20.1",
         "opencv-python>=4.5.0",
         "numpy>=1.24.4",
+        "pandas>=1.3.0",
         "Pillow>=9.4.0",
         "omegaconf>=2.1.0",
         "hydra-core>=1.3.2",
@@ -225,19 +226,28 @@ def install_sam2_package():
         print("ERROR: SAM2 directory not found")
         return False
 
-    try:
-        # Install SAM2 in editable mode (verbose so CUDA build errors are visible)
-        result = subprocess.run([
-            sys.executable, "-m", "pip", "install", "-v", "-e", "./sam_models/sam2"
-        ], capture_output=True, text=True)
-        if result.returncode != 0:
+    # Check if already importable — skip pip install if so
+    already_installed = subprocess.run(
+        [sys.executable, "-c", "from sam2.build_sam import build_sam2_video_predictor"],
+        capture_output=True, text=True
+    ).returncode == 0
+
+    if already_installed:
+        print("OK: SAM2 package already installed (skipping pip install)")
+    else:
+        try:
+            # Install SAM2 in editable mode (verbose so CUDA build errors are visible)
+            result = subprocess.run([
+                sys.executable, "-m", "pip", "install", "-v", "-e", "./sam_models/sam2"
+            ], capture_output=True, text=True)
+            if result.returncode != 0:
+                print(f"FAILED: Could not install SAM2 package")
+                print(result.stderr[-2000:] if len(result.stderr) > 2000 else result.stderr)
+                return False
+            print("OK: SAM2 package installed")
+        except subprocess.CalledProcessError:
             print(f"FAILED: Could not install SAM2 package")
-            print(result.stderr[-2000:] if len(result.stderr) > 2000 else result.stderr)
             return False
-        print("OK: SAM2 package installed")
-    except subprocess.CalledProcessError:
-        print(f"FAILED: Could not install SAM2 package")
-        return False
 
     # Verify that the CUDA extension (_C) was compiled
     check = subprocess.run([
@@ -477,9 +487,9 @@ def detect_environment_info():
 
     return env_info
 
-def create_launcher():
+def create_launcher(script_name="sam2_ui.py", output_basename="run", ui_label="SAM2 Video UI"):
     """Create launcher script that activates the detected environment"""
-    print("\nCreating launcher...")
+    print(f"\nCreating launcher for {script_name}...")
 
     # Detect current environment
     env_info = detect_environment_info()
@@ -494,7 +504,7 @@ def create_launcher():
         # Generate Windows batch file
         if env_info['type'] == 'conda':
             launcher_content = f"""@echo off
-echo Starting SAM2 Video UI...
+echo Starting {ui_label}...
 echo.
 
 :: Activate conda environment (detected during setup)
@@ -504,7 +514,7 @@ set CONDA_ENV={env_info['conda_env_name'] or 'sam'}
 if exist "%CONDA_BASE%\\Scripts\\activate.bat" (
     echo Activating conda environment '%CONDA_ENV%' from %CONDA_BASE%...
     call "%CONDA_BASE%\\Scripts\\activate.bat" %CONDA_ENV%
-    python sam2_ui.py
+    python {script_name}
     pause
     exit /b
 )
@@ -513,7 +523,7 @@ if exist "%CONDA_BASE%\\Scripts\\activate.bat" (
 where conda >nul 2>&1
 if %ERRORLEVEL% EQU 0 (
     echo Using 'conda run' to launch with environment '%CONDA_ENV%'...
-    conda run -n %CONDA_ENV% python sam2_ui.py
+    conda run -n %CONDA_ENV% python {script_name}
     pause
     exit /b
 )
@@ -524,13 +534,13 @@ echo WARNING: Could not activate conda environment '%CONDA_ENV%'
 echo Please activate manually with: conda activate %CONDA_ENV%
 echo.
 pause
-python sam2_ui.py
+python {script_name}
 pause
 """
         elif env_info['type'] in ['venv', 'uv']:
             venv_activate = f"{env_info['venv_path']}\\Scripts\\activate.bat"
             launcher_content = f"""@echo off
-echo Starting SAM2 Video UI...
+echo Starting {ui_label}...
 echo.
 
 :: Activate virtual environment (detected during setup)
@@ -539,36 +549,37 @@ set VENV_PATH={env_info['venv_path']}
 if exist "%VENV_PATH%\\Scripts\\activate.bat" (
     echo Activating virtual environment from %VENV_PATH%...
     call "%VENV_PATH%\\Scripts\\activate.bat"
-    python sam2_ui.py
+    python {script_name}
     pause
     exit /b
 )
 
 :: Fallback: use absolute python path
 echo Using detected Python: {env_info['python_path']}
-"{env_info['python_path']}" sam2_ui.py
+"{env_info['python_path']}" {script_name}
 pause
 """
         else:
             # System Python
             launcher_content = f"""@echo off
-echo Starting SAM2 Video UI...
+echo Starting {ui_label}...
 echo.
 echo Using system Python: {env_info['python_path']}
-"{env_info['python_path']}" sam2_ui.py
+"{env_info['python_path']}" {script_name}
 pause
 """
 
-        with open("run.bat", "w") as f:
+        bat_path = f"{output_basename}.bat"
+        with open(bat_path, "w") as f:
             f.write(launcher_content)
-        print("OK: run.bat created")
+        print(f"OK: {bat_path} created")
 
     else:  # Linux/Mac
         if env_info['type'] == 'conda':
             conda_base = env_info['conda_path'] or '/opt/miniconda3'
             conda_env = env_info['conda_env_name'] or 'sam'
             launcher_content = f"""#!/bin/bash
-echo "Starting SAM2 Video UI..."
+echo "Starting {ui_label}..."
 echo ""
 
 # Activate conda environment (detected during setup)
@@ -579,14 +590,14 @@ if [ -f "$CONDA_BASE/etc/profile.d/conda.sh" ]; then
     echo "Activating conda environment '$CONDA_ENV' from $CONDA_BASE..."
     source "$CONDA_BASE/etc/profile.d/conda.sh"
     conda activate "$CONDA_ENV"
-    python3 sam2_ui.py
+    python3 {script_name}
     exit $?
 fi
 
 # Fallback: try conda run if conda is in PATH
 if command -v conda &> /dev/null; then
     echo "Using 'conda run' to launch with environment '$CONDA_ENV'..."
-    conda run -n "$CONDA_ENV" python3 sam2_ui.py
+    conda run -n "$CONDA_ENV" python3 {script_name}
     exit $?
 fi
 
@@ -596,12 +607,12 @@ echo "WARNING: Could not activate conda environment '$CONDA_ENV'"
 echo "Please activate manually with: conda activate $CONDA_ENV"
 echo ""
 read -p "Press Enter to try anyway..."
-python3 sam2_ui.py
+python3 {script_name}
 """
         elif env_info['type'] in ['venv', 'uv']:
             venv_activate = f"{env_info['venv_path']}/bin/activate"
             launcher_content = f"""#!/bin/bash
-echo "Starting SAM2 Video UI..."
+echo "Starting {ui_label}..."
 echo ""
 
 # Activate virtual environment (detected during setup)
@@ -610,27 +621,28 @@ VENV_PATH="{env_info['venv_path']}"
 if [ -f "$VENV_PATH/bin/activate" ]; then
     echo "Activating virtual environment from $VENV_PATH..."
     source "$VENV_PATH/bin/activate"
-    python3 sam2_ui.py
+    python3 {script_name}
     exit $?
 fi
 
 # Fallback: use absolute python path
 echo "Using detected Python: {env_info['python_path']}"
-"{env_info['python_path']}" sam2_ui.py
+"{env_info['python_path']}" {script_name}
 """
         else:
             # System Python
             launcher_content = f"""#!/bin/bash
-echo "Starting SAM2 Video UI..."
+echo "Starting {ui_label}..."
 echo ""
 echo "Using system Python: {env_info['python_path']}"
-"{env_info['python_path']}" sam2_ui.py
+"{env_info['python_path']}" {script_name}
 """
 
-        with open("run.sh", "w") as f:
+        sh_path = f"{output_basename}.sh"
+        with open(sh_path, "w") as f:
             f.write(launcher_content)
-        os.chmod("run.sh", 0o755)
-        print("OK: run.sh created")
+        os.chmod(sh_path, 0o755)
+        print(f"OK: {sh_path} created")
 
 def prompt_sam3_installation():
     """Ask user if they want to install SAM3 (optional)"""
@@ -641,145 +653,165 @@ def prompt_sam3_installation():
     print("Requirements:")
     print("  - Python 3.12+")
     print("  - PyTorch 2.7+")
-    print("  - HuggingFace account with SAM3 access")
+    print("  - HuggingFace account with model access")
     print("  - ~848M parameter model")
+    print("\nNote: SAM3 and SAM3.1 share the same codebase — only the checkpoint differs.")
+    print("  SAM3   checkpoint: facebook/sam3 on HuggingFace")
+    print("  SAM3.1 checkpoint: facebook/sam3.1 on HuggingFace")
 
     choice = input("\nInstall SAM3? (y/n) [default: n]: ").strip().lower()
     if choice != 'y':
         print("Skipping SAM3 installation")
         return True
 
-    return install_sam3()
+    print("\nWhich checkpoint(s) do you want instructions for?")
+    print("  1. SAM3   - Original release")
+    print("  2. SAM3.1 - Latest release")
+    print("  3. Both")
+    ckpt_choice = input("Choice (1/2/3) [default: 2]: ").strip()
+    if ckpt_choice == '1':
+        versions = ["3"]
+    elif ckpt_choice == '3':
+        versions = ["3", "3.1"]
+    else:
+        versions = ["3.1"]
 
-def _display_sam3_checkpoint_instructions():
-    """Display SAM3 checkpoint download instructions"""
+    return install_sam3(versions=versions)
+
+def _display_sam3_checkpoint_instructions(version="3"):
+    """Display SAM3/SAM3.1 checkpoint download instructions"""
+    hf_repo = f"facebook/sam3.1" if version == "3.1" else "facebook/sam3"
+    checkpoint_file = "sam3.1_multiplex.pt" if version == "3.1" else "sam3.pt"
+    label = f"SAM{version}"
+
     print("\n" + "=" * 50)
-    print("SAM3 Checkpoint Download Instructions")
+    print(f"{label} Checkpoint Download Instructions")
     print("=" * 50)
-    print("\n1. REQUEST ACCESS TO CHECKPOINTS:")
-    print("   Visit: https://huggingface.co/facebook/sam3")
-    print("   Click 'Request Access' and wait for approval")
-    print("\n2. AUTHENTICATE WITH HUGGINGFACE:")
-    print("   a. Generate token at: https://huggingface.co/settings/tokens")
-    print("   b. Run: huggingface-cli login")
-    print("   c. Paste your token when prompted")
-    print("\n3. DOWNLOAD CHECKPOINT:")
-    print("   After authentication, download the checkpoint:")
-    print("   ")
-    print("   Method 1 - Using Python:")
-    print("   python -c \"from huggingface_hub import snapshot_download; \\")
-    print("       snapshot_download(repo_id='facebook/sam3', local_dir='sam_models/sam3/checkpoints')\"")
-    print("   ")
-    print("   Method 2 - Manual download:")
-    print("   - Download sam3.pt (3.45 GB) from https://huggingface.co/facebook/sam3")
-    print("   - Place in: sam_models/sam3/checkpoints/sam3.pt")
-    print("\n4. VERIFY INSTALLATION:")
-    print("   Run: python -c 'from sam3.model_builder import build_sam3_video_predictor; print(\"SAM3 OK\")'")
-    print("\nNote: SAM3 will not work until checkpoint is downloaded")
+    print(f"\n1. REQUEST ACCESS TO CHECKPOINTS:")
+    print(f"   Visit: https://huggingface.co/{hf_repo}")
+    print(f"   Click 'Request Access' and wait for approval")
+    print(f"\n2. AUTHENTICATE WITH HUGGINGFACE:")
+    print(f"   a. Generate token at: https://huggingface.co/settings/tokens")
+    print(f"   b. Run: huggingface-cli login")
+    print(f"   c. Paste your token when prompted")
+    print(f"\n3. DOWNLOAD CHECKPOINT (choose one method):")
+    print(f"   ")
+    print(f"   Method 1 - huggingface-cli (recommended):")
+    print(f"   huggingface-cli download {hf_repo} --local-dir sam_models/sam3/checkpoints")
+    print(f"   ")
+    print(f"   Method 2 - Python snapshot_download:")
+    print(f"   python -c \"from huggingface_hub import snapshot_download; \\")
+    print(f"       snapshot_download(repo_id='{hf_repo}', local_dir='sam_models/sam3/checkpoints')\"")
+    print(f"   ")
+    print(f"   Method 3 - Single file:")
+    print(f"   huggingface-cli download {hf_repo} {checkpoint_file} \\")
+    print(f"       --local-dir sam_models/sam3/checkpoints")
+    print(f"\n4. VERIFY INSTALLATION:")
+    print(f"   Run: python -c 'from sam3.model_builder import build_sam3_video_predictor; print(\"{label} OK\")'")
+    print(f"\nNote: {label} will not work until checkpoint is downloaded")
+    print(f"      Checkpoint will be saved to: sam_models/sam3/checkpoints/")
 
-def install_sam3():
-    """Clone and install SAM3 repository"""
-    print("\nCloning SAM3 repository...")
+def install_sam3(versions=None):
+    """Clone and install SAM3 repository, then show checkpoint instructions for requested versions."""
+    if versions is None:
+        versions = ["3.1"]
 
     sam3_dir = Path("sam_models/sam3")
-    sam3_checkpoint = sam3_dir / "checkpoints" / "sam3.pt"
+    package_installed = False
 
-    # Check if already exists
     if sam3_dir.exists():
-        if sam3_checkpoint.exists():
-            print("SAM3 already installed (package and checkpoint found)")
-            return True
-        else:
-            print("SAM3 package exists, but checkpoint missing")
-            print("Skipping package installation...")
-            # Skip to checkpoint instructions
-            _display_sam3_checkpoint_instructions()
-            return True
-
-    try:
-        # Check Python version
-        if sys.version_info < (3, 12):
-            print("ERROR: SAM3 requires Python 3.12+")
-            print(f"Current version: {sys.version_info.major}.{sys.version_info.minor}")
-            print("Please create a Python 3.12+ environment for SAM3")
-            return False
-
-        # Check PyTorch version
+        print("\nSAM3 repository already present — skipping clone/install")
+        package_installed = True
+    else:
+        print("\nCloning SAM3 repository...")
         try:
-            import torch
-            torch_version = torch.__version__.split('+')[0]
-            major, minor = map(int, torch_version.split('.')[:2])
-            if major < 2 or (major == 2 and minor < 7):
-                print(f"ERROR: SAM3 requires PyTorch 2.7+")
-                print(f"Current version: {torch_version}")
-                print("Please upgrade PyTorch:")
-                print("  pip install torch==2.7.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126")
+            # Check Python version
+            if sys.version_info < (3, 12):
+                print("ERROR: SAM3 requires Python 3.12+")
+                print(f"Current version: {sys.version_info.major}.{sys.version_info.minor}")
+                print("Please create a Python 3.12+ environment for SAM3")
                 return False
 
-            # Check CUDA version
-            if torch.cuda.is_available():
-                cuda_version = torch.version.cuda
-                if cuda_version:
-                    cuda_major = int(cuda_version.split('.')[0])
-                    cuda_minor = int(cuda_version.split('.')[1])
-                    if cuda_major < 12 or (cuda_major == 12 and cuda_minor < 6):
-                        print(f"WARNING: SAM3 requires CUDA 12.6+")
-                        print(f"Current version: {cuda_version}")
-                        print("SAM3 may not work correctly with older CUDA versions")
-                        print("Consider upgrading CUDA or using CPU mode")
-            else:
-                print("WARNING: CUDA not available. SAM3 requires CUDA 12.6+ for optimal performance")
-        except ImportError:
-            print("WARNING: PyTorch not installed. Please install PyTorch 2.7+ first")
+            # Check PyTorch version
+            try:
+                import torch
+                torch_version = torch.__version__.split('+')[0]
+                major, minor = map(int, torch_version.split('.')[:2])
+                if major < 2 or (major == 2 and minor < 7):
+                    print("ERROR: SAM3 requires PyTorch 2.7+")
+                    print(f"Current version: {torch_version}")
+                    print("Please upgrade PyTorch:")
+                    print("  pip install torch==2.7.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126")
+                    return False
+
+                if torch.cuda.is_available():
+                    cuda_version = torch.version.cuda
+                    if cuda_version:
+                        cuda_major = int(cuda_version.split('.')[0])
+                        cuda_minor = int(cuda_version.split('.')[1])
+                        if cuda_major < 12 or (cuda_major == 12 and cuda_minor < 6):
+                            print(f"WARNING: SAM3 requires CUDA 12.6+ (current: {cuda_version})")
+                            print("SAM3 may not work correctly with older CUDA versions")
+                else:
+                    print("WARNING: CUDA not available. SAM3 requires CUDA 12.6+ for optimal performance")
+            except ImportError:
+                print("WARNING: PyTorch not installed. Please install PyTorch 2.7+ first")
+                return False
+
+            Path("sam_models").mkdir(parents=True, exist_ok=True)
+            subprocess.run([
+                "git", "clone",
+                "https://github.com/facebookresearch/sam3.git",
+                "sam_models/sam3"
+            ], check=True, capture_output=True)
+            print("OK: SAM3 repository cloned")
+
+            subprocess.run([
+                sys.executable, "-m", "pip", "install", "-e", "./sam_models/sam3"
+            ], check=True, capture_output=True)
+            print("OK: SAM3 package installed")
+            package_installed = True
+
+        except subprocess.CalledProcessError:
+            print("FAILED: Could not clone/install SAM3")
             return False
 
-        # Create sam_models directory if it doesn't exist
-        Path("sam_models").mkdir(parents=True, exist_ok=True)
+    # Always ensure additional dependencies are installed
+    print("\nInstalling/verifying SAM3 dependencies...")
+    additional_deps = [
+        "einops",
+        "huggingface-hub",
+        "decord",
+        "scikit-learn",
+        "ftfy==6.1.1",
+        "regex",
+        "iopath>=0.1.10",
+        "timm>=1.0.17",
+    ]
+    for dep in additional_deps:
+        try:
+            subprocess.run([
+                sys.executable, "-m", "pip", "install", dep
+            ], check=True, capture_output=True)
+            print(f"OK: {dep}")
+        except subprocess.CalledProcessError:
+            print(f"WARNING: Failed to install {dep} — install manually: pip install {dep}")
 
-        # Clone SAM3
-        subprocess.run([
-            "git", "clone",
-            "https://github.com/facebookresearch/sam3.git",
-            "sam_models/sam3"
-        ], check=True, capture_output=True)
-        print("OK: SAM3 repository cloned")
+    # Create checkpoint directory
+    checkpoint_dir = Path("sam_models/sam3/checkpoints")
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    print(f"OK: Checkpoint directory: {checkpoint_dir}")
 
-        # Install SAM3
-        subprocess.run([
-            sys.executable, "-m", "pip", "install", "-e", "./sam_models/sam3"
-        ], check=True, capture_output=True)
-        print("OK: SAM3 package installed")
+    # Show instructions for each requested checkpoint version
+    for version in versions:
+        checkpoint_file = "sam3.1_multiplex.pt" if version == "3.1" else "sam3.pt"
+        sam3_checkpoint = checkpoint_dir / checkpoint_file
+        if sam3_checkpoint.exists():
+            print(f"\nOK: SAM{version} checkpoint already present ({checkpoint_file})")
+        else:
+            _display_sam3_checkpoint_instructions(version=version)
 
-        # Install additional dependencies needed for SAM3
-        print("Installing additional SAM3 dependencies...")
-        additional_deps = [
-            "einops",            # Required for model loading
-            "huggingface-hub",   # Required for checkpoint download
-            "decord"             # Required for video loading
-        ]
-        for dep in additional_deps:
-            try:
-                subprocess.run([
-                    sys.executable, "-m", "pip", "install", dep
-                ], check=True, capture_output=True)
-                print(f"OK: {dep} installed")
-            except subprocess.CalledProcessError:
-                print(f"WARNING: Failed to install {dep}")
-                print(f"You may need to manually install it: pip install {dep}")
-
-        # Create checkpoint directory
-        checkpoint_dir = Path("sam_models/sam3/checkpoints")
-        checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        print(f"OK: Created checkpoint directory: {checkpoint_dir}")
-
-        # Display checkpoint download instructions
-        _display_sam3_checkpoint_instructions()
-
-        return True
-
-    except subprocess.CalledProcessError:
-        print(f"FAILED: Could not install SAM3")
-        return False
+    return True
 
 def verify_setup():
     """Verify installation"""
@@ -848,14 +880,23 @@ def verify_setup():
         if Path("sam_models/sam3").exists():
             print("OK: SAM3 installed (optional)")
             # Check SAM3 dependencies (subprocess for same reason as SAM2 above)
-            einops_check = subprocess.run([
-                sys.executable, "-c", "import einops; print('OK')"
-            ], capture_output=True, text=True, timeout=10)
-            if einops_check.returncode == 0:
-                print("OK: SAM3 dependencies (einops) available")
-            else:
-                print("WARNING: einops not found - SAM3 may not work")
-                print("  Install with: pip install einops")
+            sam3_dep_checks = [
+                ("einops", "import einops"),
+                ("scikit-learn", "import sklearn"),
+                ("timm", "import timm"),
+                ("ftfy", "import ftfy"),
+                ("iopath", "import iopath"),
+                ("decord", "import decord"),
+            ]
+            for dep_name, import_stmt in sam3_dep_checks:
+                dep_check = subprocess.run([
+                    sys.executable, "-c", f"{import_stmt}; print('OK')"
+                ], capture_output=True, text=True, timeout=10)
+                if dep_check.returncode == 0:
+                    print(f"OK: SAM3 dependency ({dep_name}) available")
+                else:
+                    print(f"WARNING: {dep_name} not found - SAM3 may not work")
+                    print(f"  Install with: pip install {dep_name}")
 
         return True
 
@@ -899,8 +940,10 @@ def main():
     if not prompt_sam3_installation():
         print("\nWARNING: SAM3 installation failed (continuing anyway)")
 
-    # Step 8: Create launcher
-    create_launcher()
+    # Step 8: Create launcher(s)
+    create_launcher(script_name="sam2_ui.py", output_basename="run", ui_label="SAM2 Video UI")
+    if Path("sam_models/sam3").exists():
+        create_launcher(script_name="sam3_ui.py", output_basename="run_sam3", ui_label="SAM3 Video UI")
 
     # Step 9: Verify setup
     if not verify_setup():
@@ -917,7 +960,17 @@ def main():
     else:
         print("  1. Double-click or run: ./run.sh (environment auto-activates)")
         print("  2. OR manually: conda activate sam && python3 sam2_ui.py")
-    print("\nThe launcher script will automatically activate your Python environment.")
+
+    if Path("sam_models/sam3").exists():
+        print("\nTo run the SAM3 Video UI:")
+        if platform.system() == "Windows":
+            print("  1. Double-click run_sam3.bat (environment auto-activates)")
+            print("  2. OR manually: conda activate sam && python sam3_ui.py")
+        else:
+            print("  1. Double-click or run: ./run_sam3.sh (environment auto-activates)")
+            print("  2. OR manually: conda activate sam && python3 sam3_ui.py")
+
+    print("\nThe launcher script(s) will automatically activate your Python environment.")
     print()
 
     return True

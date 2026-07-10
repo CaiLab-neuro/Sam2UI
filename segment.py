@@ -6,7 +6,7 @@ Shared video segmentation functionality for both UI and CLI usage.
 Provides a unified VideoSegmenter class that wraps SAM2/SAM3 models.
 
 This module extracts common segmentation logic from sam2_ui.py and
-process_annotations.py to reduce code duplication and provide a
+sam2_process.py to reduce code duplication and provide a
 consistent interface for video segmentation.
 """
 
@@ -132,6 +132,7 @@ class SegmentationConfig:
     cleanup_temp_frames: bool = True
     frame_format: str = "jpg"  # "jpg" (default, smaller) or "png" (lossless)
     exclusive_masks: bool = False  # Winner-takes-all per pixel: highest-logit object wins (incompatible with --only-updated)
+    mask_format: str = "png"  # "png" (one file per object) or "npz" (one bundle per frame)
 
     @property
     def masks_output_dir(self) -> str:
@@ -272,18 +273,31 @@ class VideoSegmenter:
 
         # Detect if this is a SAM3 model
         self._is_sam3 = self._detect_sam3()
+        self._is_sam3_multiplex = self._detect_sam3_multiplex()
 
     def _detect_sam3(self) -> bool:
-        """Detect if the predictor is a SAM3 model."""
+        """Detect if the predictor is a SAM3 or SAM3.1 model."""
         if hasattr(self.predictor, '__class__'):
             class_name = self.predictor.__class__.__name__
-            return 'Sam3' in class_name or 'SAM3' in class_name
+            return 'Sam3' in class_name or 'SAM3' in class_name or 'VideoTrackingDynamic' in class_name
+        return False
+
+    def _detect_sam3_multiplex(self) -> bool:
+        """Detect if the predictor is the SAM3 Object Multiplex demo model (direct API)."""
+        if hasattr(self.predictor, '__class__'):
+            class_name = self.predictor.__class__.__name__
+            return 'VideoTrackingDynamic' in class_name
         return False
 
     @property
     def is_sam3(self) -> bool:
-        """Whether the predictor is a SAM3 model."""
+        """Whether the predictor is a SAM3 or SAM3.1 model."""
         return self._is_sam3
+
+    @property
+    def is_sam3_multiplex(self) -> bool:
+        """Whether the predictor is the SAM3 Object Multiplex demo model."""
+        return self._is_sam3_multiplex
 
     @property
     def inference_state(self) -> Optional[Any]:
@@ -402,13 +416,6 @@ class VideoSegmenter:
         Returns:
             SAM inference state object
         """
-        init_params = {'video_path': frame_dir}
-
-        if offload_video_to_cpu:
-            init_params['offload_video_to_cpu'] = True
-        if offload_state_to_cpu:
-            init_params['offload_state_to_cpu'] = True
-
         # Set CUDA device if using specific GPU
         original_device = None
         if self.device.startswith("cuda:") and torch.cuda.is_available():
@@ -417,7 +424,32 @@ class VideoSegmenter:
             torch.cuda.set_device(gpu_id)
 
         try:
-            self._inference_state = self.predictor.init_state(**init_params)
+            if self._is_sam3_multiplex:
+                # Sam3VideoTrackingMultiplexDemo.init_state (what the builder returns)
+                # does not accept video_path — it's designed for pre-computed features.
+                # VideoTrackingMultiplexDemo.init_state (the parent) accepts video_path
+                # and loads frames, so we call it explicitly.
+                from sam3.model.video_tracking_multiplex_demo import VideoTrackingMultiplexDemo
+                inference_state = VideoTrackingMultiplexDemo.init_state(
+                    self.predictor,
+                    frame_dir,
+                    offload_video_to_cpu,
+                    offload_state_to_cpu,
+                )
+                # Fix the hardcoded torch.device("cuda") set by init_state
+                target = torch.device(self.device)
+                inference_state["device"] = target
+                inference_state["storage_device"] = (
+                    torch.device("cpu") if offload_state_to_cpu else target
+                )
+                self._inference_state = inference_state
+            else:
+                init_params = {'video_path': frame_dir}
+                if offload_video_to_cpu:
+                    init_params['offload_video_to_cpu'] = True
+                if offload_state_to_cpu:
+                    init_params['offload_state_to_cpu'] = True
+                self._inference_state = self.predictor.init_state(**init_params)
         finally:
             # Restore original CUDA device
             if original_device is not None:
@@ -619,7 +651,8 @@ class VideoSegmenter:
         frames_to_keep: int,
         enable_backward: bool,
         frame_offset: int = 0,
-        exclusive_masks: bool = False
+        exclusive_masks: bool = False,
+        mask_format: str = "png"
     ) -> Dict[int, Dict[int, Any]]:
         """
         Propagate masks through the video in forward and backward directions.
@@ -655,7 +688,8 @@ class VideoSegmenter:
             reverse=False,
             masks_metadata=masks_metadata,
             frame_offset=frame_offset,
-            exclusive_masks=exclusive_masks
+            exclusive_masks=exclusive_masks,
+            mask_format=mask_format
         )
 
         # Backward propagation (optional)
@@ -672,7 +706,8 @@ class VideoSegmenter:
                 reverse=True,
                 masks_metadata=masks_metadata,
                 frame_offset=frame_offset,
-                exclusive_masks=exclusive_masks
+                exclusive_masks=exclusive_masks,
+                mask_format=mask_format
             )
 
         return masks_metadata
@@ -690,7 +725,8 @@ class VideoSegmenter:
         reverse: bool,
         masks_metadata: Dict[int, Dict[int, Any]],
         frame_offset: int = 0,
-        exclusive_masks: bool = False
+        exclusive_masks: bool = False,
+        mask_format: str = "png"
     ) -> Dict[int, Dict[int, Any]]:
         """
         Propagate masks in a single direction (forward or backward).
@@ -722,24 +758,47 @@ class VideoSegmenter:
         )
 
         with autocast_context:
-            # Construct propagation call based on model type
+            # ---- SAM2 / SAM3 model paths ----
             if self.is_sam3:
-                if reverse:
-                    propagate_iterator = self.predictor.propagate_in_video(
-                        inference_state,
-                        start_frame_idx=num_frames - 1,
-                        max_frame_num_to_track=num_frames,
-                        reverse=True,
-                        propagate_preflight=True
-                    )
+                if self._is_sam3_multiplex:
+                    # Use VideoTrackingMultiplexDemo.propagate_in_video explicitly:
+                    # - Sam3VideoTrackingMultiplexDemo.propagate_in_video doesn't call
+                    #   preflight internally and yields 5 values (incompatible).
+                    # - The parent class method calls preflight separately and yields 4 values.
+                    from sam3.model.video_tracking_multiplex_demo import VideoTrackingMultiplexDemo
+                    self.predictor.propagate_in_video_preflight(inference_state)
+                    if reverse:
+                        propagate_iterator = VideoTrackingMultiplexDemo.propagate_in_video(
+                            self.predictor, inference_state,
+                            start_frame_idx=num_frames - 1,
+                            max_frame_num_to_track=num_frames,
+                            reverse=True,
+                        )
+                    else:
+                        propagate_iterator = VideoTrackingMultiplexDemo.propagate_in_video(
+                            self.predictor, inference_state,
+                            start_frame_idx=0,
+                            max_frame_num_to_track=num_frames,
+                            reverse=False,
+                        )
                 else:
-                    propagate_iterator = self.predictor.propagate_in_video(
-                        inference_state,
-                        start_frame_idx=0,
-                        max_frame_num_to_track=num_frames,
-                        reverse=False,
-                        propagate_preflight=True
-                    )
+                    # Standard SAM3 — preflight is handled inside via propagate_preflight=True
+                    if reverse:
+                        propagate_iterator = self.predictor.propagate_in_video(
+                            inference_state,
+                            start_frame_idx=num_frames - 1,
+                            max_frame_num_to_track=num_frames,
+                            reverse=True,
+                            propagate_preflight=True,
+                        )
+                    else:
+                        propagate_iterator = self.predictor.propagate_in_video(
+                            inference_state,
+                            start_frame_idx=0,
+                            max_frame_num_to_track=num_frames,
+                            reverse=False,
+                            propagate_preflight=True,
+                        )
             else:
                 # SAM2 propagation
                 if reverse:
@@ -760,10 +819,15 @@ class VideoSegmenter:
             processed = 0
             for result in propagate_iterator:
                 # Unpack based on model type
-                if self.is_sam3:
+                # SAM3.1 multiplex yields 4 values (no obj_scores); SAM3 yields 5
+                if self._is_sam3_multiplex:
+                    out_frame_idx, out_obj_ids, out_low_res_masks, out_mask_logits = result
+                    out_obj_scores = None
+                elif self.is_sam3:
                     out_frame_idx, out_obj_ids, out_low_res_masks, out_mask_logits, out_obj_scores = result
                 else:
                     out_frame_idx, out_obj_ids, out_mask_logits = result
+                    out_obj_scores = None
 
                 frame_masks: Dict[int, Any] = {}
                 frame_masks_for_quality: Dict[int, np.ndarray] = {}
@@ -781,6 +845,9 @@ class VideoSegmenter:
                 else:
                     winners = None
 
+                output_frame_idx = out_frame_idx + frame_offset
+                npz_arrays: Dict[str, np.ndarray] = {}  # only used when mask_format=="npz"
+
                 for i, obj_id in enumerate(out_obj_ids):
                     # Only process annotated objects
                     if obj_id not in annotated_objects:
@@ -796,28 +863,40 @@ class VideoSegmenter:
                     obj_name = object_names.get(obj_id, object_names.get(str(obj_id), f"Object_{obj_id}"))
                     obj_color = object_colors.get(obj_id, object_colors.get(str(obj_id), (255, 0, 0)))
 
-                    # Apply frame offset for output filename
-                    output_frame_idx = out_frame_idx + frame_offset
-
-                    # Export mask to disk
-                    mask_filename = f"mask_f{output_frame_idx:06d}_{obj_name}_id{obj_id}.png"
-                    mask_path = os.path.join(masks_dir, mask_filename)
                     mask_uint8 = (mask * 255).astype(np.uint8)
-                    cv2.imwrite(mask_path, mask_uint8)
+                    score = float(out_obj_scores[i]) if (self.is_sam3 and out_obj_scores is not None) else 1.0
 
-                    # Store metadata
-                    score = float(out_obj_scores[i]) if self.is_sam3 else 1.0
-                    frame_masks[obj_id] = {
-                        'filename': mask_filename,
-                        'score': score,
-                        'name': obj_name,
-                        'color': obj_color
-                    }
+                    if mask_format == "npz":
+                        npz_key = f"mask_f{output_frame_idx:06d}_{obj_name}_id{obj_id}"
+                        npz_arrays[npz_key] = mask_uint8
+                        mask_filename = f"masks_f{output_frame_idx:06d}.npz"
+                        frame_masks[obj_id] = {
+                            'filename': mask_filename,
+                            'npz_key': npz_key,
+                            'score': score,
+                            'name': obj_name,
+                            'color': obj_color
+                        }
+                    else:
+                        mask_filename = f"mask_f{output_frame_idx:06d}_{obj_name}_id{obj_id}.png"
+                        mask_path = os.path.join(masks_dir, mask_filename)
+                        cv2.imwrite(mask_path, mask_uint8)
+                        frame_masks[obj_id] = {
+                            'filename': mask_filename,
+                            'score': score,
+                            'name': obj_name,
+                            'color': obj_color
+                        }
 
                     # Store for quality metrics
                     frame_masks_for_quality[obj_id] = mask_uint8
 
                     del mask
+
+                # Write NPZ bundle after collecting all objects for this frame
+                if mask_format == "npz" and npz_arrays:
+                    npz_path = os.path.join(masks_dir, f"masks_f{output_frame_idx:06d}.npz")
+                    np.savez_compressed(npz_path, **npz_arrays)
 
                 masks_metadata[out_frame_idx] = frame_masks
 
@@ -836,7 +915,8 @@ class VideoSegmenter:
                 del out_mask_logits
                 if self.is_sam3:
                     del out_low_res_masks
-                    del out_obj_scores
+                    if out_obj_scores is not None:
+                        del out_obj_scores
                 del result
 
                 # Clean up old frames from inference state
@@ -995,7 +1075,8 @@ class VideoSegmenter:
                 frames_to_keep=config.frames_to_keep,
                 enable_backward=config.enable_backward_propagation,
                 frame_offset=config.frame_offset,
-                exclusive_masks=config.exclusive_masks
+                exclusive_masks=config.exclusive_masks,
+                mask_format=config.mask_format
             )
 
             # Get quality metrics
