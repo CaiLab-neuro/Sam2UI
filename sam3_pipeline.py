@@ -1880,20 +1880,20 @@ def replay_concept_refinements(
         )
         new_id_remap: dict = {}  # raw session id -> persistent id (assigned first time seen)
 
-        # Frames each LIVE instance actually appeared in this round's propagation output —
-        # present with ANY pixel count, including zero (SAM3 already filters a fully-empty
-        # mask out of out_obj_ids before we see it, so "present with pixel_count==0" only
-        # happens when the object competed for pixels but lost them all to a rival via the
-        # non-overlapping constraint — a different case from being entirely absent). Used
-        # below to (a) clear stale on-disk masks for frames where a once-live instance's
-        # sub-state was removed/never a candidate at all this round (e.g. hotstart removal
-        # mid-propagation) — otherwise that ghost mask from an earlier round just sits there
-        # forever, silently overlapping whatever object legitimately claims the region now —
-        # and (b) gate which pending refinement entries get marked "propagated" at the end of
-        # this function: an entry whose frame the instance's sub-state never reached this
-        # round had no chance to apply, and must not be marked done or it is silently and
-        # permanently lost.
-        seen_frames_by_obj: dict = defaultdict(set)  # obj_id_int -> {frame_idx, ...}
+        # present_targets_this_frame (built per-frame below) drives stale on-disk mask
+        # clearing: when a once-live instance's sub-state is absent from a frame's output
+        # (e.g. hotstart removal mid-propagation, or simply predicted empty), any mask
+        # file left over from a prior round at that frame is deleted so a ghost mask
+        # doesn't linger and overlap whatever object legitimately claims the region now.
+        #
+        # frames_iterated tracks every frame_idx propagation actually walked through,
+        # independent of which objects appear in that frame's output. A pending
+        # refinement entry is "reached" once its frame is in this set — an object being
+        # absent from out_obj_ids at a frame usually just means the correction succeeded
+        # (e.g. a negative point drove its mask to zero, which SAM3 omits from
+        # out_obj_ids entirely), not that the frame was never visited, so per-object
+        # presence is the wrong signal to gate "propagated" on.
+        frames_iterated: set = set()
 
         _inner_model = getattr(sam3_model, "model", sam3_model)
         _prev_max_num_objects = getattr(_inner_model, "max_num_objects", 10000)
@@ -1913,6 +1913,7 @@ def replay_concept_refinements(
                 if outputs is None:
                     inner_state["cached_frame_outputs"].pop(out_frame_idx, None)
                     continue
+                frames_iterated.add(out_frame_idx)
 
                 out_obj_ids = outputs.get("out_obj_ids", [])
                 out_binary_masks = outputs.get("out_binary_masks", [])
@@ -1940,7 +1941,6 @@ def replay_concept_refinements(
                         target_id = obj_id_int
 
                     present_targets_this_frame.add(target_id)
-                    seen_frames_by_obj[target_id].add(out_frame_idx)
                     if target_id not in output_dirs:
                         output_dirs[target_id] = os.path.join(
                             instances_root, str(target_id), "masks"
@@ -2097,23 +2097,21 @@ def replay_concept_refinements(
         except Exception:
             pass
 
-    # Mark pending entries as propagated ONLY for frames this round's propagation actually
-    # reached for that instance (seen_frames_by_obj — populated above for every frame the
-    # instance appeared in the output, zero-pixel or not). An entry whose frame the
-    # instance's sub-state never reached (e.g. it was removed by hotstart before getting
-    # there) had no chance to apply and must stay pending, or it is silently and
-    # permanently discarded on the next --refine (this is the bug the child_left_hand
-    # investigation traced: negative corrections at frames the tracker had already dropped
-    # the object before reaching were marked done despite never taking effect).
+    # Mark pending entries as propagated for every frame this round's propagation actually
+    # walked through (frames_iterated), regardless of whether the object appears in that
+    # frame's output — absence from out_obj_ids usually just means the correction
+    # succeeded (e.g. a negative point drove the mask to zero, which SAM3 omits from
+    # out_obj_ids entirely), not that the frame was never reached. An entry only stays
+    # pending if propagation never got as far as its frame at all (e.g. an error cut the
+    # run short), in which case it's silently retried on the next --refine.
     stuck_entries = []  # (user_name, obj_id, frame_idx) left pending for a future retry
     for obj_id, (rpath, all_entries, inst) in refinements_by_instance.items():
-        entries_seen = seen_frames_by_obj.get(obj_id, set())
         changed = False
         for r in all_entries:
             if r.get("propagated", True):
                 continue
             frame_idx = r.get("frame_idx")
-            if frame_idx in entries_seen:
+            if frame_idx in frames_iterated:
                 r["propagated"] = True
                 changed = True
             else:
@@ -2257,10 +2255,15 @@ def online_replay_concept_refinements(
             original_mask_frames[_obj_id_int] = _frames
 
     # Frames each instance actually appeared in this round's propagation output —
-    # used below to mark ONLY reachable refinement entries as propagated (an entry
-    # whose frame the sub-state never reached must stay pending; see the matching
-    # comment in replay_concept_refinements).
-    seen_frames_by_obj: dict = defaultdict(set)
+    # used below for stale-mask clearing (see original_mask_frames above; done via
+    # present_targets_this_frame, populated per-frame below).
+    #
+    # frames_iterated tracks every frame_idx propagation actually walked through,
+    # independent of which objects appear in that frame's output. Used below to mark
+    # reachable refinement entries as propagated — see the matching comment in
+    # replay_concept_refinements for why per-object absence from out_obj_ids is the
+    # wrong signal for that: it usually just means the correction succeeded.
+    frames_iterated: set = set()
 
     # In the live session, deleted instances' sub-states are still present (remove_object
     # is not called from the UI on delete to preserve undo — unlike the offline CLI replay,
@@ -2296,6 +2299,7 @@ def online_replay_concept_refinements(
             if outputs is None:
                 inner_state["cached_frame_outputs"].pop(out_frame_idx, None)
                 continue
+            frames_iterated.add(out_frame_idx)
             present_targets_this_frame = set()
             for obj_id, mask in zip(outputs.get("out_obj_ids", []), outputs.get("out_binary_masks", [])):
                 obj_id_int = int(obj_id)
@@ -2318,7 +2322,6 @@ def online_replay_concept_refinements(
                 if mask_np.ndim == 3 and mask_np.shape[0] == 1:
                     mask_np = mask_np[0]
                 present_targets_this_frame.add(target_id)
-                seen_frames_by_obj[target_id].add(out_frame_idx)
                 if target_id not in output_dirs:
                     output_dirs[target_id] = os.path.join(
                         instances_root, str(target_id), "masks"
@@ -2398,11 +2401,11 @@ def online_replay_concept_refinements(
             inst.first_detection_frame = periods[0][0]
             inst.last_detection_frame = periods[-1][1]
 
-    # Mark pending entries as propagated ONLY for frames this round's propagation
-    # actually reached for that instance. An entry whose frame the sub-state never
-    # reached (e.g. removed by hotstart before getting there) had no chance to apply
-    # and must stay pending, or it is silently and permanently discarded on the next
-    # refinement round — same gating as the offline replay_concept_refinements.
+    # Mark pending entries as propagated for every frame this round's propagation
+    # actually walked through (frames_iterated), regardless of whether the object
+    # appears in that frame's output — see the matching comment in
+    # replay_concept_refinements for why per-object absence is the wrong signal here.
+    # An entry only stays pending if propagation never reached its frame at all.
     stuck_entries = []  # (user_name, obj_id, frame_idx) left pending for a future retry
     for instance, _ in instances_with_pending:
         refinements_path = os.path.join(
@@ -2413,12 +2416,11 @@ def online_replay_concept_refinements(
             continue
         with open(refinements_path) as f:
             data = json.load(f)
-        entries_seen = seen_frames_by_obj.get(instance.sam3_obj_id, set())
         changed = False
         for r in data.get("refinements", []):
             if r.get("propagated", True):
                 continue
-            if r.get("frame_idx") in entries_seen:
+            if r.get("frame_idx") in frames_iterated:
                 r["propagated"] = True
                 r["online"] = True
                 changed = True
