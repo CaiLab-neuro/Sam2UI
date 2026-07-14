@@ -853,6 +853,9 @@ class SAM2VideoUI:
         # Toggle point removal mode: R key
         self.root.bind('r', lambda e: self._handle_toggle_removal_shortcut())
 
+        # Play/pause: Space bar
+        self.root.bind('<space>', lambda e: self._handle_play_shortcut())
+
         # Category list navigation: Home/End keys
         self.root.bind('<Home>', lambda e: self._handle_home_shortcut())
         self.root.bind('<End>', lambda e: self._handle_end_shortcut())
@@ -1577,17 +1580,21 @@ class SAM2VideoUI:
 
     def import_masks(self):
         """Load segmentation results: segmented video, annotations, and mask directory"""
+        # Select output directory
+        output_dir = filedialog.askdirectory(
+            title="Select Result Directory to Load",
+            initialdir=self.last_dir_results or self.working_dir
+        )
+        if not output_dir:
+            return
+
+        self.last_dir_results = os.path.dirname(output_dir)
+        self._load_results_from_dir(output_dir)
+
+    def _load_results_from_dir(self, output_dir):
+        """Load segmentation results (segmented video, annotations, masks) from a project/result
+        directory given directly (shared by import_masks()'s file dialog and the --project CLI arg)."""
         try:
-            # Select output directory
-            output_dir = filedialog.askdirectory(
-                title="Select Result Directory to Load",
-                initialdir=self.last_dir_results or self.working_dir
-            )
-            if not output_dir:
-                return
-
-            self.last_dir_results = os.path.dirname(output_dir)
-
             # Detect SAM3 project handoff
             handoff_path = os.path.join(output_dir, "sam2_handoff.json")
             if os.path.exists(handoff_path):
@@ -2002,6 +2009,11 @@ class SAM2VideoUI:
         """Handle 'r' key shortcut for toggling removal mode (only if not typing in text field)"""
         if not self._should_ignore_keyboard_shortcut():
             self.toggle_point_removal_mode()
+
+    def _handle_play_shortcut(self):
+        """Handle Space bar shortcut for play/pause (only if not typing in text field)"""
+        if not self._should_ignore_keyboard_shortcut():
+            self.toggle_play()
 
     def _handle_prev_frame_shortcut(self):
         """Handle Left arrow key for previous frame (only if not typing in text field)"""
@@ -7806,11 +7818,20 @@ def main():
     """Main application entry point"""
     parser = argparse.ArgumentParser(description="SAM2 Video Annotation Tool")
     parser.add_argument(
+        "project", nargs="?", default=None,
+        help="Path to a SAM2 result directory to load on startup (segmented video + processing_metadata.json)",
+    )
+    parser.add_argument(
+        "--project", dest="project_opt", default=None,
+        help="Path to a SAM2 result directory to load on startup (alternative to positional arg)",
+    )
+    parser.add_argument(
         "--working-dir", "-w",
         default=None,
         help="Starting directory for all file/folder dialogs (load video, import/export annotations, etc.)"
     )
     args = parser.parse_args()
+    project_dir = args.project_opt or args.project
 
     working_dir = None
     if args.working_dir:
@@ -7828,7 +7849,12 @@ def main():
     root.geometry(f'{width}x{height}+{x}+{y}')
 
     app = SAM2VideoUI(root, working_dir=working_dir)
-    
+
+    if project_dir:
+        root.update()  # ensure window is realized before loading (status bar, etc.)
+        app.last_dir_results = os.path.dirname(os.path.abspath(project_dir))
+        app._load_results_from_dir(project_dir)
+
     def on_closing():
         # Check for active exports and segmentation
         active_exports = len(app.active_exports) if app.active_exports else 0

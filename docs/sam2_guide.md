@@ -48,6 +48,33 @@ For videos longer than a few hundred frames, using the processing script is reco
 3. Add or adjust annotation points and re-segment the frame to verify
 4. Re-export the updated annotations and re-run the processing script, or run segmentation in refinement mode for a range of frames within the UI
 
+### Mouse Controls
+
+| Action | Effect |
+|--------|--------|
+| Left click on canvas | Add a **positive** point for the current object (or remove a point, in removal mode) |
+| Right click on canvas | Add a **negative** point for the current object (or remove a point, in removal mode) |
+| Mouse wheel | Previous/next frame |
+| Shift + mouse wheel | Jump to previous/next **annotated** frame |
+| Ctrl/Cmd + mouse wheel | Zoom in/out, centered on the cursor |
+
+### Keyboard Shortcuts
+
+| Key | Effect |
+|-----|--------|
+| `←` / `→` | Previous / next frame |
+| `↑` / `↓` | Previous / next object in the object list |
+| `Page Up` / `Page Down` | Jump to previous / next annotated frame |
+| `Home` | Jump to the first object in the list |
+| `End` | Jump to the last named (non-generic) object in the list |
+| `Ctrl/Cmd + Z` | Undo last point |
+| `Ctrl+Y` / `Cmd+Shift+Z` / `Cmd+Y` | Redo last point |
+| `Ctrl/Cmd + +` / `Ctrl/Cmd + -` | Zoom in/out, centered on the cursor |
+| `r` | Toggle point removal mode (click a point to delete it, instead of adding one) |
+| `space` | Play / pause |
+
+Arrow-key and letter shortcuts are ignored while a text field (e.g. an object name entry) has focus, so typing names doesn't accidentally move frames or objects.
+
 ## Processing Script (`sam2_process.py`)
 
 **Purpose**: Process an annotation JSON from the SAM2 Video UI to generate the segmented video and masks.

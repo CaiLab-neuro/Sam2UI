@@ -401,7 +401,7 @@ class ConsoleProgressCallback:
 
 
 class SAM2Processor:
-    def __init__(self, config_file=None, checkpoint_file=None, model_name="sam2.1-base+", offload_to_cpu=False, async_loading=False, smooth_masks=False, device=None, frame_format="jpg", exclusive_masks=False, mask_format="png", vos_optimized=False, no_bfloat16=False):
+    def __init__(self, config_file=None, checkpoint_file=None, model_name="sam2.1-base+", offload_to_cpu=False, async_loading=False, smooth_masks=False, device=None, frame_format="jpg", exclusive_masks=False, mask_format="png", vos_optimized=False, no_bfloat16=False, max_cond_frames_in_attn=-1):
         """
         Initialize SAM2 Processor
 
@@ -419,11 +419,17 @@ class SAM2Processor:
                 Subsequent videos in the same process reuse the cache and run faster.
                 Only useful for SAM2 batch jobs processing many videos; ignored for SAM3.
                 Requires PyTorch 2.5.1+. (default: False)
+            max_cond_frames_in_attn: SAM3 only — how many temporally-closest conditioning
+                (correction) frames the tracker cross-attends to per propagated frame.
+                -1 (default) matches SAM2's own unlimited default; SAM3's model_builder
+                otherwise defaults this to 4, which can let older point corrections fall
+                out of attention as propagation moves away from them. Ignored for SAM2.
         """
         # Store model name for detection
         self.model_name = model_name
         self.vos_optimized = vos_optimized
         self.no_bfloat16 = no_bfloat16
+        self.max_cond_frames_in_attn = max_cond_frames_in_attn
 
         # Check if SAM3 was requested but is not available
         if model_name == "sam3" and not SAM3_AVAILABLE:
@@ -591,6 +597,14 @@ class SAM2Processor:
                 self.video_predictor = sam3_model.tracker
                 # Attach backbone for feature extraction
                 self.video_predictor.backbone = sam3_model.detector.backbone
+                # build_sam3_video_model() defaults max_cond_frames_in_attn to 4 (only the
+                # 4 temporally-closest correction points get cross-attended per frame), unlike
+                # SAM2's own default of -1 (unlimited). Override to self.max_cond_frames_in_attn
+                # (default -1) so point corrections don't fall out of attention as propagation
+                # moves away from them, matching SAM2's default behavior.
+                if hasattr(self.video_predictor, "max_cond_frames_in_attn"):
+                    self.video_predictor.max_cond_frames_in_attn = self.max_cond_frames_in_attn
+                    print(f"  SAM3 tracker: max_cond_frames_in_attn set to {self.max_cond_frames_in_attn}")
 
             else:
                 # SAM2 loading
@@ -1522,6 +1536,10 @@ Examples:
     model_group.add_argument("--model", default=None,
                            choices=list(MODEL_CONFIGS.keys()),
                            help="Preset model name (default: auto-select based on GPU memory)")
+    parser.add_argument("--max-cond-frames-in-attn", type=int, default=-1,
+                       help="SAM3 only: number of temporally-closest correction frames the "
+                            "tracker attends to per propagated frame. -1 (default) = unlimited, "
+                            "matching SAM2's own default. Ignored when using SAM2.")
     model_group.add_argument("--config", help="Custom config YAML path (requires --checkpoint)")
 
     parser.add_argument("--checkpoint", help="Custom checkpoint path (requires --config)")
@@ -1732,7 +1750,8 @@ Examples:
                                      exclusive_masks=args.exclusive_masks,
                                      mask_format=args.mask_format,
                                      vos_optimized=args.vos_optimized,
-                                     no_bfloat16=args.no_bfloat16)
+                                     no_bfloat16=args.no_bfloat16,
+                                     max_cond_frames_in_attn=args.max_cond_frames_in_attn)
         else:
             processor = SAM2Processor(model_name=args.model, offload_to_cpu=args.offload_to_cpu,
                                      async_loading=args.async_loading, smooth_masks=args.smooth_masks,
@@ -1741,7 +1760,8 @@ Examples:
                                      exclusive_masks=args.exclusive_masks,
                                      mask_format=args.mask_format,
                                      vos_optimized=args.vos_optimized,
-                                     no_bfloat16=args.no_bfloat16)
+                                     no_bfloat16=args.no_bfloat16,
+                                     max_cond_frames_in_attn=args.max_cond_frames_in_attn)
 
         # Set no_backward flag
         processor.no_backward_propagation = args.no_backward

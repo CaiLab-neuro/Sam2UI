@@ -18,9 +18,10 @@ Examples:
 
 Windows notes:
   rsync is not built into Windows. This script tries, in order:
-    1. rsync        (available with Git for Windows if rsync was selected, or Cygwin)
-    2. wsl rsync    (available if WSL is installed: wsl --install, then: wsl apt install rsync)
-  If neither is found, install one of the above or use WinSCP / MobaXterm as a GUI alternative.
+    1. rsync         (available with Git for Windows if rsync was selected, or Cygwin)
+    2. rsync-win.exe (standalone Windows rsync port, if present on PATH or in known install dirs)
+    3. wsl rsync     (available if WSL is installed: wsl --install, then: wsl apt install rsync)
+  If none are found, install one of the above or use WinSCP / MobaXterm as a GUI alternative.
 """
 
 import argparse
@@ -42,7 +43,8 @@ EXCLUDES = [
 ]
 
 
-# Common Windows installation paths for standalone rsync ports (cwRsync, DeltaCopy, etc.).
+# Common Windows installation paths for standalone rsync ports (cwRsync, DeltaCopy, etc.),
+# plus rsync-win.exe (https://github.com/nheinemann/rsync-win / similar standalone builds).
 # These are only searched when rsync is not on PATH.
 _WIN_RSYNC_SEARCH_PATHS = [
     r"C:\Program Files\cwRsync\bin\rsync.exe",
@@ -53,24 +55,37 @@ _WIN_RSYNC_SEARCH_PATHS = [
     r"C:\Tools\rsync\rsync.exe",
 ]
 
+_WIN_RSYNC_WIN_SEARCH_PATHS = [
+    r"C:\Tools\rsync-win\rsync-win.exe",
+    r"C:\Program Files\rsync-win\rsync-win.exe",
+    r"C:\Program Files (x86)\rsync-win\rsync-win.exe",
+]
+
 
 def find_rsync():
     """Return the rsync invocation to use, or None if not found.
 
     Search order on Windows:
       1. rsync on PATH (Git for Windows, Cygwin, or any port already configured)
-      2. wsl rsync (WSL must be installed and have rsync)
-      3. Known installation paths for cwRsync / DeltaCopy standalone ports
+      2. Known installation paths for cwRsync / DeltaCopy standalone ports
+      3. rsync-win.exe on PATH, or in known install dirs (fallback standalone port)
+      4. wsl rsync (WSL must be installed and have rsync)
     On Linux/Mac only step 1 is tried.
     """
     if shutil.which("rsync"):
         return ["rsync"]
     if sys.platform == "win32":
-        if shutil.which("wsl") and _wsl_has_rsync():
-            return ["wsl", "rsync"]
         for candidate in _WIN_RSYNC_SEARCH_PATHS:
             if os.path.isfile(candidate):
                 return [candidate]
+        rsync_win = shutil.which("rsync-win.exe") or shutil.which("rsync-win")
+        if rsync_win:
+            return [rsync_win]
+        for candidate in _WIN_RSYNC_WIN_SEARCH_PATHS:
+            if os.path.isfile(candidate):
+                return [candidate]
+        if shutil.which("wsl") and _wsl_has_rsync():
+            return ["wsl", "rsync"]
     return None
 
 
@@ -118,12 +133,16 @@ def main():
             print(
                 "\nOn Windows, install one of:\n"
                 "  - Git for Windows (enable rsync during install)\n"
+                "  - rsync-win.exe standalone port (place it on PATH or in one of the\n"
+                "    paths listed below)\n"
                 "  - WSL:  wsl --install  then  wsl apt install rsync\n"
                 "  - cwRsync standalone: https://itefix.net/cwrsync\n"
                 "  - DeltaCopy (bundles rsync.exe)\n"
                 "  - Cygwin with the rsync package\n"
                 "\nAlso searched these paths and did not find rsync.exe:\n"
                 + "\n".join(f"  {p}" for p in _WIN_RSYNC_SEARCH_PATHS) +
+                "\n\nAnd these paths and did not find rsync-win.exe:\n"
+                + "\n".join(f"  {p}" for p in _WIN_RSYNC_WIN_SEARCH_PATHS) +
                 "\n\nOr use WinSCP / MobaXterm for a graphical alternative."
             )
         sys.exit(1)

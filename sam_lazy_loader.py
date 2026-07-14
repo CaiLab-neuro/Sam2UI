@@ -509,14 +509,7 @@ def enable_lazy_loading(cache_size=20, enable_sam3=True,
         if bugfix_patched:
             patched.extend(bugfix_patched)
 
-    print("=" * 60)
-    print("LAZY LOADING ENABLED")
-    print("=" * 60)
-    print(f"Patched: {', '.join(patched)}")
-    print(f"Cache size: {cache_size} frames")
-    print(f"Approx memory: ~{cache_size * 6 / 1024:.1f} GB  "
-          f"(vs ~{cache_size * 6 / 1024 * (cache_size * 50):.0f} GB eager for large videos)")
-    print()
+    print(f"Lazy loading enabled (cache size: {cache_size} frames)")
 
 
 def disable_lazy_loading():

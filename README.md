@@ -116,7 +116,7 @@ git pull
 - **2025-10 – 2026-01** — Memory optimizations that make long videos (30,000+ frames) feasible on ordinary hardware; segmentation quality metrics to help spot frames that need correction
 - **2026-02** — Gaze-target alignment: turn segmentation masks + eye-tracker data into a gaze-target time course; improved in-UI refinement
 - **2026-05** — GBAT preprint posted on arXiv ([arXiv:2605.22962](https://arxiv.org/abs/2605.22962)) and this repository made public.
-- **2026-07** — SAM3 pipline becomes available. Documentation restructure; scripts renamed for consistency (`process_annotations.py` → `sam2_process.py`, `sync_annotations_sam3.py` → `sam3_sync.py`; the old names still work but please consider calling new script names)
+- **2026-07** — SAM3 pipline becomes available. Doumentation restructure; scripts renamed for consistency (`process_annotations.py` → `sam2_process.py`, `sync_annotations_sam3.py` → `sam3_sync.py`; the old names still work but please consider calling new script names)
 
 ## Feedback and Contributing
 
