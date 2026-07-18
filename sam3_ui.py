@@ -146,7 +146,8 @@ class SAM3VideoUI:
         self._nav_row1: Optional[tk.Frame] = None   # play/pause + frame nav
         self._nav_row2: Optional[tk.Frame] = None   # presence bar
         self._nav_row3: Optional[tk.Frame] = None   # zoom + speed
-        self._nav_row4: Optional[tk.Frame] = None   # quality colorbars
+        self._nav_row4: Optional[tk.Frame] = None   # quality colorbars (overlap + bg)
+        self._nav_row5: Optional[tk.Frame] = None   # quality colorbar (inter-frame change)
         self._export_btn: Optional[tk.Button] = None  # "Export Video/Image" button
 
         # Timeline zoom (slider window)
@@ -168,10 +169,13 @@ class SAM3VideoUI:
         self._quality_overlap_img_id = None
         self._quality_bg_photo = None
         self._quality_bg_img_id = None
+        self._quality_inter_photo = None
+        self._quality_inter_img_id = None
 
         # Quality metrics (loaded from quality_metrics.npz when available)
         self.quality_bg: Optional[List[float]] = None      # background ratio per frame
         self.quality_overlap: Optional[List[float]] = None  # overlap ratio per frame
+        self.quality_inter: Optional[List[float]] = None    # inter-frame change ratio per frame
         # When True, _draw_quality_colorbars() redraws bars from scratch; otherwise
         # only the playhead is moved (same fast-path logic as _presence_bar_dirty).
         self._quality_bars_dirty: bool = True
@@ -241,7 +245,10 @@ class SAM3VideoUI:
 
         # Undo/redo (points and instance deletions)
         self.root.bind('<Control-z>', self.undo_action)
+        self.root.bind('<Command-z>', self.undo_action)  # Mac support
         self.root.bind('<Control-y>', self.redo_action)
+        self.root.bind('<Command-Shift-z>', self.redo_action)  # Mac primary
+        self.root.bind('<Command-y>', self.redo_action)  # Mac alternative
 
         # Ctrl+S: save pending points/annotations to disk (no propagation)
         self.root.bind('<Control-s>', lambda e: self.save_points_for_batch())
@@ -251,6 +258,15 @@ class SAM3VideoUI:
         self.root.bind('<Right>', lambda e: self._handle_next_frame_shortcut())
         self.root.bind('<Up>', lambda e: self._handle_prev_instance_shortcut())
         self.root.bind('<Down>', lambda e: self._handle_next_instance_shortcut())
+
+        # Home/End: jump to first instance / last renamed (non-default-named) instance
+        self.root.bind('<Home>', lambda e: self._handle_home_shortcut())
+        self.root.bind('<End>', lambda e: self._handle_end_shortcut())
+
+        # Page Up/Down: jump to previous/next frame with saved refinement points/boxes
+        # for the selected instance (mirrors the SAM2 UI's annotated-frame jump)
+        self.root.bind('<Prior>', lambda e: self._handle_annotated_frame_shortcut('prev'))
+        self.root.bind('<Next>', lambda e: self._handle_annotated_frame_shortcut('next'))
 
         # Space bar: play / pause
         self.root.bind('<space>', lambda e: self._handle_play_shortcut())
@@ -584,6 +600,17 @@ class SAM3VideoUI:
         self.quality_bg_canvas.grid(row=0, column=3, sticky="ew")
         self.quality_bg_canvas.bind('<Button-1>', self._on_quality_bar_click)
 
+        # ── Row 5 (compact): inter-frame change, spans full width ──────────
+        self._nav_row5 = row5 = tk.Frame(parent)
+        row5.pack(fill=tk.X, padx=5, pady=(0, 3))
+
+        tk.Label(row5, text="Change:", font=("Arial", 7), fg="gray", width=7,
+                 anchor=tk.W).pack(side=tk.LEFT)
+        self.quality_inter_canvas = tk.Canvas(row5, height=8, bg='#2a2a2a',
+                                              relief=tk.FLAT, bd=0)
+        self.quality_inter_canvas.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.quality_inter_canvas.bind('<Button-1>', self._on_quality_bar_click)
+
     def _setup_controls_panel(self, parent):
         """Setup right panel with instance controls"""
 
@@ -692,6 +719,8 @@ class SAM3VideoUI:
                        variable=self.skip_delete_confirm_var).pack(anchor=tk.W)
         tk.Button(ops_frame, text="Absorb Selected Into Target...",
                  command=self.absorb_instance_dialog).pack(fill=tk.X, pady=2)
+        tk.Button(ops_frame, text="Save Displayed Mask As Anchor",
+                 command=self.save_current_mask_as_anchor).pack(fill=tk.X, pady=2)
 
         # Annotation controls (point/box placement and per-instance correction)
         refine_frame = tk.LabelFrame(inner, text="Annotation", padx=10, pady=10)
@@ -1019,21 +1048,70 @@ class SAM3VideoUI:
         if not self._should_ignore_keyboard_shortcut():
             self.toggle_play()
 
-    def _navigate_instances(self, delta: int):
-        """Move to the previous (delta=-1) or next (delta=+1) non-deleted instance."""
-        if not self.project:
+    def _current_concept_instances(self):
+        """Navigable (concept, instance) list scoped to the selected concept only,
+        in the same order the concept tree lists them. Falls back to the first
+        concept in the project if none is selected."""
+        concept = self.selected_concept
+        if concept is None and self.project and self.project.concepts:
+            concept = self.project.concepts[0]
+        if concept is None:
+            return []
+        return [(concept, inst) for inst in concept.instances if not inst.deleted]
+
+    def _handle_home_shortcut(self):
+        """Jump to the first instance within the current concept."""
+        if self._should_ignore_keyboard_shortcut():
             return
-        all_items = [
+        all_items = self._current_concept_instances()
+        if all_items:
+            self._select_instance_at_index(all_items, 0)
+
+    def _handle_end_shortcut(self):
+        """Jump to the last instance within the current concept that has been
+        renamed away from its default "<concept>_<id>" name (mirrors the SAM2
+        UI's End shortcut, which skips auto-generated "Object_N" names). No-op
+        if no instance in the concept has been renamed."""
+        if self._should_ignore_keyboard_shortcut():
+            return
+        all_items = self._current_concept_instances()
+        target_idx = None
+        for i, (concept, inst) in enumerate(all_items):
+            if inst.user_name != f"{concept.name}_{inst.sam3_obj_id}":
+                target_idx = i
+        if target_idx is not None:
+            self._select_instance_at_index(all_items, target_idx)
+
+    def _handle_annotated_frame_shortcut(self, direction: str):
+        """Handle Page Up/Down: jump to the previous/next frame with saved
+        annotations (points, boxes, or mask anchors) for the selected instance.
+        Reuses the same jump_to_prev/next_annotation methods as the toolbar
+        buttons, so behavior (including wraparound) stays identical."""
+        if self._should_ignore_keyboard_shortcut():
+            return
+        if direction == 'prev':
+            self.jump_to_prev_annotation()
+        else:
+            self.jump_to_next_annotation()
+
+    def _all_navigable_instances(self):
+        """Flattened (concept, instance) list of all non-deleted instances, in the
+        same order used by Up/Down/Home/End navigation."""
+        if not self.project:
+            return []
+        return [
             (concept, inst)
             for concept in self.project.concepts
             for inst in concept.instances
             if not inst.deleted
         ]
+
+    def _navigate_instances(self, delta: int):
+        """Move to the previous (delta=-1) or next (delta=+1) non-deleted instance."""
+        all_items = self._all_navigable_instances()
         if not all_items:
             return
         current_idx = None
-        prev_key = ((self.selected_concept.name, self.selected_instance.sam3_obj_id)
-                    if self.selected_concept and self.selected_instance else None)
         if self.selected_instance and self.selected_concept:
             for i, (c, inst) in enumerate(all_items):
                 if (c.name == self.selected_concept.name and
@@ -1041,6 +1119,14 @@ class SAM3VideoUI:
                     current_idx = i
                     break
         new_idx = 0 if current_idx is None else (current_idx + delta) % len(all_items)
+        self._select_instance_at_index(all_items, new_idx)
+
+    def _select_instance_at_index(self, all_items, new_idx: int):
+        """Select all_items[new_idx], updating tree/labels and auto-jumping to its
+        first detected period if enabled. Shared by _navigate_instances and the
+        Home/End shortcuts."""
+        prev_key = ((self.selected_concept.name, self.selected_instance.sam3_obj_id)
+                    if self.selected_concept and self.selected_instance else None)
         new_concept, new_inst = all_items[new_idx]
         self.selected_concept = new_concept
         self.selected_instance = new_inst
@@ -1532,18 +1618,20 @@ class SAM3VideoUI:
         """Load quality_metrics.npz from project_dir into self.quality_bg/overlap."""
         try:
             from utils import load_quality_metrics
-            _inter, bg, overlap = load_quality_metrics(project_dir)
+            inter, bg, overlap = load_quality_metrics(project_dir)
             self.quality_bg = bg
             self.quality_overlap = overlap
+            self.quality_inter = inter
         except Exception as e:
             print(f"[quality] Could not load metrics: {e}")
             self.quality_bg = None
             self.quality_overlap = None
+            self.quality_inter = None
         self._quality_bars_dirty = True
         self._draw_quality_colorbars()
 
     def _draw_quality_colorbars(self):
-        """Render the overlap and background-ratio colorbars with a playhead.
+        """Render the overlap, background-ratio, and inter-frame change colorbars with a playhead.
 
         Background is rendered to a numpy pixel array and cached as a PhotoImage —
         O(canvas_width) numpy ops, zero per-pixel canvas items.  On plain frame
@@ -1618,10 +1706,15 @@ class SAM3VideoUI:
                        _make_bar_image(self.quality_bg_canvas,
                                        self.quality_bg, (42, 42, 42), (30, 120, 200)),
                        '_quality_bg_img_id', '_quality_bg_photo')
+            _put_image(self.quality_inter_canvas,
+                       _make_bar_image(self.quality_inter_canvas,
+                                       self.quality_inter, (42, 42, 42), (60, 200, 90)),
+                       '_quality_inter_img_id', '_quality_inter_photo')
             self._quality_bars_dirty = False
 
         _draw_playhead(self.quality_overlap_canvas)
         _draw_playhead(self.quality_bg_canvas)
+        _draw_playhead(self.quality_inter_canvas)
 
     def _on_quality_bar_click(self, event):
         """Click on a quality colorbar to jump to that frame."""
@@ -2028,6 +2121,7 @@ class SAM3VideoUI:
             (self._nav_row2, dict(fill=tk.X, padx=5, pady=(1, 0))),
             (self._nav_row3, dict(fill=tk.X, padx=5, pady=(1, 3))),
             (self._nav_row4, dict(fill=tk.X, padx=5, pady=(1, 3))),
+            (self._nav_row5, dict(fill=tk.X, padx=5, pady=(0, 3))),
         ]
         if self.is_image_mode:
             for row, _ in rows_and_packs:
@@ -4566,6 +4660,88 @@ class SAM3VideoUI:
         self.status_var.set(f"Removed mask anchor at frame {frame_idx}. Ctrl+Z to undo.")
         return True
 
+    def save_current_mask_as_anchor(self):
+        """Save the currently displayed mask of the selected instance, at the
+        current frame, as a mask anchor for that instance.
+
+        Stored exactly the way rename/absorb self-anchors are stored (PNG under
+        instances/<id>/mask_anchors/, registered in instance.mask_anchor_frames,
+        plus a pending 'mask_anchor' trigger in refinements.json) so it is picked
+        up by _inject_mask_anchors on the next --refine/propagation, and so it
+        carries over as a historical component if this instance is later absorbed
+        into another one.
+        """
+        from datetime import datetime as _dt
+
+        if not self.selected_instance or not self.selected_concept:
+            messagebox.showwarning("Warning", "Please select an instance first.")
+            return
+        concept = self.selected_concept
+        instance = self.selected_instance
+        frame_idx = self.current_frame_idx
+
+        mask_dir = os.path.join(
+            self.project.project_dir, "concepts", concept.name,
+            "instances", str(instance.sam3_obj_id), "masks"
+        )
+        mask_np = load_sam3_mask(mask_dir, frame_idx)
+        if mask_np is None:
+            messagebox.showwarning(
+                "Warning", f"No mask displayed for '{instance.user_name}' at frame "
+                           f"{frame_idx}; nothing to save as an anchor.")
+            return
+
+        anchor_dir = os.path.join(
+            self.project.project_dir, "concepts", concept.name,
+            "instances", str(instance.sam3_obj_id), "mask_anchors"
+        )
+        os.makedirs(anchor_dir, exist_ok=True)
+        dst_path = Path(anchor_dir) / f"{frame_idx:06d}.png"
+
+        # Preserve prior anchor bytes (if any) so undo can restore them exactly.
+        prev_mask_data = None
+        if dst_path.exists():
+            prev_mask_data = cv2.imread(str(dst_path), cv2.IMREAD_GRAYSCALE)
+            if prev_mask_data is not None and prev_mask_data.shape == mask_np.shape:
+                mask_np = np.maximum(mask_np.astype("uint8"), prev_mask_data.astype("uint8"))
+
+        cv2.imwrite(str(dst_path), mask_np)
+        was_new_frame = frame_idx not in instance.mask_anchor_frames
+        if was_new_frame:
+            instance.mask_anchor_frames.append(frame_idx)
+            instance.mask_anchor_frames.sort()
+
+        rel_path = os.path.join(
+            "concepts", concept.name, "instances", str(instance.sam3_obj_id),
+            "mask_anchors", f"{frame_idx:06d}.png"
+        )
+        trigger_entry = {
+            "timestamp": _dt.now().isoformat(),
+            "type": "mask_anchor",
+            "frame_idx": frame_idx,
+            "mask_path": rel_path,
+            "propagated": False,
+            "manual_save_as_anchor": True,
+        }
+        self._stage_anchors_to_cache(concept, instance, [trigger_entry])
+
+        self.undo_stack.append({
+            'type': 'save_mask_anchor',
+            'instance': instance,
+            'concept': concept,
+            'frame_idx': frame_idx,
+            'mask_data': mask_np,
+            'prev_mask_data': prev_mask_data,
+            'was_new_frame': was_new_frame,
+            'anchor_dir': anchor_dir,
+            'trigger_entry': trigger_entry,
+        })
+        self.redo_stack.clear()
+        self._metadata_dirty = True
+        self.display_frame()
+        self.status_var.set(
+            f"Saved mask anchor for '{instance.user_name}' at frame {frame_idx}. Ctrl+Z to undo.")
+
     def merge_instances_dialog(self):
         """Show dialog to merge multiple instances by pixel-union of their masks.
 
@@ -5158,6 +5334,26 @@ class SAM3VideoUI:
             self.display_frame()
             self.status_var.set(f"Restored mask anchor at frame {frame_idx}.")
 
+        elif t == 'save_mask_anchor':
+            inst = action['instance']
+            concept = action['concept']
+            frame_idx = action['frame_idx']
+            anchor_dir = action['anchor_dir']
+            dst = Path(anchor_dir) / f"{frame_idx:06d}.png"
+            if action['prev_mask_data'] is not None:
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                cv2.imwrite(str(dst), action['prev_mask_data'])
+            else:
+                dst.unlink(missing_ok=True)
+            if action['was_new_frame'] and frame_idx in inst.mask_anchor_frames:
+                inst.mask_anchor_frames.remove(frame_idx)
+            self._remove_mask_anchor_triggers(
+                concept.name, inst.sam3_obj_id, [frame_idx])
+            self._metadata_dirty = True
+            self.compositor = DynamicFrameCompositor(self.project)
+            self.display_frame()
+            self.status_var.set(f"Undid saved mask anchor at frame {frame_idx}.")
+
         elif t == 'rename_instance':
             action['instance'].user_name = action['old_name']
             self._metadata_dirty = True
@@ -5392,6 +5588,23 @@ class SAM3VideoUI:
             self._metadata_dirty = True
             self.display_frame()
             self.status_var.set(f"Re-removed mask anchor at frame {frame_idx}.")
+
+        elif t == 'save_mask_anchor':
+            inst = action['instance']
+            concept = action['concept']
+            frame_idx = action['frame_idx']
+            anchor_dir = action['anchor_dir']
+            dst = Path(anchor_dir) / f"{frame_idx:06d}.png"
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            cv2.imwrite(str(dst), action['mask_data'])
+            if frame_idx not in inst.mask_anchor_frames:
+                inst.mask_anchor_frames.append(frame_idx)
+                inst.mask_anchor_frames.sort()
+            self._stage_anchors_to_cache(concept, inst, [action['trigger_entry']])
+            self._metadata_dirty = True
+            self.compositor = DynamicFrameCompositor(self.project)
+            self.display_frame()
+            self.status_var.set(f"Redid mask anchor save at frame {frame_idx}.")
 
         elif t == 'rename_instance':
             action['instance'].user_name = action['new_name']

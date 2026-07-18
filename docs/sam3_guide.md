@@ -94,7 +94,7 @@ You can also prepare many concepts at once: **File → Import Concept List...** 
 - Select a concept or instance in the tree to highlight it; double-click toggles visibility
 - **Rename** instances to meaningful names (e.g., "child", "parent")
 - **Delete Instance** removes false detections
-- **Absorb Selected Into Target...** merges duplicate instances that are actually the same object
+- **Absorb Selected Into Target...** merges duplicate instances that are actually the same object — see [Absorbing Instances](#absorbing-instances) below
 - Navigation: play/pause, frame slider, zoom (in time), **Flash Mask (f)** to blink the selected mask, **Flash Overlap (o)** to reveal where masks overlap, "Focus: selected concept only" to declutter the display
 
 ### 4. Refine
@@ -109,10 +109,53 @@ Corrections from *all* refinement rounds are stored in the project and replayed 
 
 <!-- TODO: screenshot of refinement mode with positive/negative points -->
 
+### Mouse Controls
+
+| Action | Effect |
+|--------|--------|
+| Left click on canvas | Add a **positive** refinement point (or start a box drag, in Box Mode; or remove a point, in removal mode) |
+| Right click on canvas | Add a **negative** refinement point (or remove a point, in removal mode) |
+| Left click + drag on canvas (Box Mode) | Draw a box prompt around the object |
+| Mouse wheel | Previous/next frame |
+| Double-click in concepts tree | Toggle visibility of a concept/instance |
+
+### Keyboard Shortcuts
+
+| Key | Effect |
+|-----|--------|
+| `←` / `→` | Previous / next frame |
+| `↑` / `↓` | Previous / next instance |
+| `space` | Play / pause |
+| `f` | Flash the selected mask |
+| `o` | Flash mask overlap |
+| `r` | Toggle point removal mode |
+| `b` | Toggle Box Mode (drag a box instead of clicking points) |
+| `Home` / `End` | Jump to the first / last (renamed) instance within the current concept |
+| `Page Up` / `Page Down` | Jump to previous / next frame with saved annotations (points, boxes, or mask anchors) for the selected instance |
+| `Ctrl/Cmd + Z` | Undo last point |
+| `Ctrl+Y` / `Cmd+Shift+Z` / `Cmd+Y` | Redo last point |
+| `Ctrl+S` | Save points for batch (queues current refinement points without propagating) |
+| `Delete` (with an instance selected in the tree) | Delete the selected instance |
+
+Note: unlike the SAM2 UI, there is currently no pixel-level zoom on the video canvas in the SAM3 UI (only the time-axis slider zoom used for scrubbing).
+
+Arrow-key and letter shortcuts are ignored while a text field (e.g. a rename entry) has focus.
+
 ### 5. Export
 
 - **Export Video** — render the video with colored mask overlays (just for display - we don't use it often). For a single-image project, this button becomes **Export Image** and saves the overlaid image instead
 - **Export SAM2 Format...** — hand the project off to the SAM2 pipeline if necessary(see [below](#exporting-to-the-sam2-pipeline))
+
+## Absorbing Instances
+
+Text-prompt detection sometimes splits one real-world object into two instances (e.g. it loses and re-acquires the object, or a brief occlusion starts a new track). **Absorb** merges such a pair using a guided wizard, rather than a blind centroid guess:
+
+- **Direction**: you first select the instance you want to get rid of — the **source** (it will be absorbed and deleted) — then choose a **target** from the remaining instances (kept). In the target list, instances with a **higher** ID than the source (i.e. detected *later*) are grayed out: absorbing into a later-detected instance is less reliable, since the earlier instance usually has the cleaner, less-drifted track record. Prefer merging a later-appearing instance into an earlier one.
+- **Mask anchor**: the UI will ask you to *confirm a clean mask* for the source (and, the first time anything is absorbed into it, for the target too). That confirmed frame's mask will serve as an anchor of how this object looks like next next time you re-process the video with a `--refine` argument. It works in similar way as point or bounding box annotations.
+- **Suggested frame — first period**: the wizard jumps you to the instance's **first continuously-detected period** and, within it, the first frame with a non-empty mask. You can accept that mask if it covers the object well (no bleed, not blurry) but you may also consider scrolling to a later frame if the object is more intact or better segmented in that frame or if that frame is less blurry — or click "Add point instead" to fall back to manual point/box placement if no frame in that period looks clean.
+- **Mask union**: if, at the frame you just confirmed for the source, the target (or an instance previously absorbed into it) already has its own mask, the wizard offers to take the **pixel-wise union (OR)** of the two masks as the conditioning anchor instead of just the source's mask — useful when the "two instances" are genuinely two parts of one object that were tracked separately. You can accept the union, skip it (keep only the source's mask), or switch to point/box mode instead.
+
+After confirming, the target is re-propagated and you're offered the option to delete the source.
 
 ## Batch Command Line Processing (`sam3_process.py`)
 
