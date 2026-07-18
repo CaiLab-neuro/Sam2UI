@@ -28,6 +28,11 @@ concepts.json format:
     }
   ]
 }
+Per-concept "max_instances" above is used only if --max-instances is not passed on the
+command line (or passed as -1). An explicit --max-instances N (N > 0) overrides it, and
+every other concept about to run initial detection this invocation, applying uniformly
+in propagation. This only affects initial detection; a later --refine run always keeps
+every instance the user has annotated, even past this cap.
 """
 
 import argparse
@@ -731,6 +736,19 @@ def _process_project_impl(args, project, devices):
         concepts_to_process = [c for c in concepts_to_process if c.name in filter_names]
         print(f"Filter '{args.filter}': {before} -> {len(concepts_to_process)} concept(s)")
 
+    # --max-instances, when explicitly capping (>0), overrides every concept about to
+    # run initial detection here — including a JSON file's per-concept "max_instances"
+    # field and a pre-existing pending/error concept's previously-stored value. This is
+    # the initial-detection path only (--refine never reaches _process_project_impl); a
+    # cap applied here never affects a later --refine run, which replays whatever the
+    # user has kept regardless of this number (see replay_concept_refinements).
+    if args.max_instances > 0:
+        for c in concepts_to_process:
+            if c.max_instances != args.max_instances:
+                print(f"  --max-instances {args.max_instances}: overriding '{c.name}' "
+                      f"(was {c.max_instances})")
+                c.max_instances = args.max_instances
+
     if not concepts_to_process:
         print("No concepts to process")
         return 0
@@ -1330,6 +1348,23 @@ def redo_project(args):
     with_ref = [c for c in targets if ref_counts[c.name] > 0]
     without_ref = [c for c in targets if ref_counts[c.name] == 0]
 
+    # A concept can have a "redetect" sentinel already on disk for a legitimate reason
+    # unrelated to this run: the UI's "Reset & Re-detect" button writes the sentinel on
+    # Save but deliberately leaves instances/refinements.json untouched until some future
+    # --refine/--redo actually consumes it (see sam3_ui.py's flush comment). So a with_ref
+    # concept that ALSO has a pending sentinel is genuinely ambiguous — it could be that
+    # real, not-yet-run reset request, or a stale leftover from an earlier interrupted
+    # redetect. Either way, _refine_project_impl checks the sentinel BEFORE checking for
+    # pending refinements, so if the user now picks "reapply" for this concept, the
+    # sentinel will silently win and the concept will be fully re-detected (fresh obj_ids,
+    # losing names/history) instead of reapplying the listed refinements. We cannot safely
+    # guess which the user wants, so just surface it here rather than deleting or ignoring
+    # the sentinel automatically.
+    sentinel_conflicts = [
+        c for c in with_ref
+        if os.path.exists(os.path.join(project.project_dir, "concepts", c.name, "redetect"))
+    ]
+
     # Summarize and confirm.
     print(f"\n{'='*60}")
     print(f"--redo: re-detecting {len(targets)} concept(s); existing masks will be "
@@ -1338,6 +1373,19 @@ def redo_project(args):
         n = ref_counts[c.name]
         note = f"{n} refinement point(s) will be reapplied" if n else "no refinements"
         print(f"  {c.name}  ({note})")
+    if sentinel_conflicts:
+        print(f"{'='*60}")
+        print("WARNING: the following concept(s) already have a pending 'redetect' "
+              "sentinel on disk (e.g. from the UI's 'Reset & Re-detect' button, or left "
+              "over from an earlier interrupted run). If you choose 'reapply' below, "
+              "that sentinel takes priority and these concept(s) will be FULLY "
+              "re-detected instead — refinements will NOT be reapplied, and current "
+              "instance names/ids will be lost:")
+        for c in sentinel_conflicts:
+            print(f"  {c.name}")
+        print("If that's not what you want, cancel now, decide per-concept "
+              "(--redo person,car for just the ones without a sentinel), or run "
+              "--refine first to resolve the pending sentinel(s).")
     print(f"{'='*60}")
 
     if with_ref:
@@ -1355,6 +1403,15 @@ def redo_project(args):
     #   - fresh (or no refinements): write the redetect sentinel so the concept lands in
     #     the redetect pass. --redo's fresh mode preserves refinements.json across the
     #     wipe; --reset does not.
+    #
+    # Unlike --reset, --redo must NEVER discard mask_anchors/ (user-created anchors are
+    # precious, unlike regenerable masks/). Set this unconditionally, before the sentinel
+    # loop below, so it also covers `without_ref` concepts: they always get a redetect
+    # sentinel regardless of `choice`, so without this flag a "reapply" run would route
+    # them through _refine_project_impl's full `shutil.rmtree(instances_dir)` branch,
+    # which deletes mask_anchors/ along with masks/.
+    args._redo_keep_refinements = True
+
     for c in without_ref:
         sentinel = os.path.join(project.project_dir, "concepts", c.name, "redetect")
         os.makedirs(os.path.dirname(sentinel), exist_ok=True)
@@ -1364,6 +1421,11 @@ def redo_project(args):
         for c in with_ref:
             n = _mark_all_refinements_pending(project, c)
             _delete_concept_masks_keep_refinements(project, c)
+            # NOTE: if this concept has a pending "redetect" sentinel (see
+            # sentinel_conflicts warning above), it deliberately is NOT touched here —
+            # we can't safely tell a stale leftover sentinel apart from a real,
+            # not-yet-run UI reset request, so _refine_project_impl's sentinel-first
+            # check is left to decide, and the user was warned above.
             print(f"  '{c.name}': flagged {n} refinement point(s) for replay, "
                   f"cleared old masks.")
     else:  # fresh
@@ -1371,10 +1433,6 @@ def redo_project(args):
             sentinel = os.path.join(project.project_dir, "concepts", c.name, "redetect")
             os.makedirs(os.path.dirname(sentinel), exist_ok=True)
             open(sentinel, "w").close()
-        # Tell the shared redetect wipe to preserve refinements.json (see
-        # _refine_project_impl). Old obj_ids usually recur (deterministic detection),
-        # so kept refinements stay viewable in sam3_ui.py.
-        args._redo_keep_refinements = True
 
     # Scope the delegated run to exactly these concepts. We already confirmed above, so
     # suppress the inner deletion prompt.
@@ -1941,11 +1999,16 @@ def main():
     parser.add_argument("--filter", default=None,
                         help="Comma-separated concept names to process (subset of --concepts or project).")
     parser.add_argument("--max-instances", type=int, default=-1, dest="max_instances",
-                        help="Cap on how many instances SAM3 may create per concept "
-                             "(default: -1 = no limit). Only applies to NEW concepts created "
-                             "via the comma-separated --concepts shorthand (e.g. "
-                             "--concepts person,car); concepts loaded from a JSON file use "
-                             "the per-concept 'max_instances' field instead.")
+                        help="Cap on how many instances SAM3 may create per concept, "
+                             "applied during initial detection only (default: -1 = no "
+                             "limit). When explicitly set to a positive value, it "
+                             "overrides every concept about to run initial detection "
+                             "this invocation, including a JSON file's per-concept "
+                             "'max_instances' field and a pre-existing pending/error "
+                             "concept's previously-stored value. Has no effect on "
+                             "--refine: a refinement run replays every instance the "
+                             "user has kept regardless of this cap, even if that "
+                             "exceeds it.")
     parser.add_argument("--export", help="Export segmented video to this path")
     parser.add_argument("--refine", nargs="?", const="", default=None,
                         metavar="CONCEPT,...",
@@ -2066,14 +2129,16 @@ def main():
                              "--save-obj-ptr-prior.")
     parser.add_argument("--save-obj-ptr-prior", action="store_true", dest="save_obj_ptr_prior",
                         help="After a refinement round only (never at initial detection), save "
-                             "each instance's obj_ptr — a small 256-d object-identity embedding, "
-                             "averaged over that instance's cond frames where the object was "
-                             "judged present — to concepts/<name>/obj_ptr_priors.npz. Overwritten "
-                             "each refinement round (newer, human-corrected anchors supersede "
-                             "older ones). Intended for a future cross-video object/category "
-                             "prior; unlike --save-cond-states this does not save "
-                             "maskmem_features (~650x larger) and has no effect on tracking or "
-                             "detection today.")
+                             "each instance's obj_ptr — a small 256-d object-identity embedding — "
+                             "from cond frames where the object was judged present, to "
+                             "concepts/<name>/obj_ptr_priors.npz. Saves BOTH the mean over those "
+                             "cond frames ('obj_ptr', one row per instance name) and the raw "
+                             "per-cond-frame vectors ('raw_obj_ptr', with parallel 'raw_names'/"
+                             "'raw_obj_id'/'raw_frame_idx' index arrays). Overwritten each "
+                             "refinement round (newer, human-corrected anchors supersede older "
+                             "ones). Intended for a future cross-video object/category prior; "
+                             "unlike --save-cond-states this does not save maskmem_features "
+                             "(~650x larger) and has no effect on tracking or detection today.")
     parser.add_argument("--delete-frames", action="store_true", dest="delete_frames",
                         help="Delete the persistent frame cache registered for this project "
                              "(shows path and size, then prompts for confirmation unless -f).")

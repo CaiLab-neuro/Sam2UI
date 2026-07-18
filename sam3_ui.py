@@ -719,6 +719,8 @@ class SAM3VideoUI:
                        variable=self.skip_delete_confirm_var).pack(anchor=tk.W)
         tk.Button(ops_frame, text="Absorb Selected Into Target...",
                  command=self.absorb_instance_dialog).pack(fill=tk.X, pady=2)
+        tk.Button(ops_frame, text="Save Displayed Mask As Anchor",
+                 command=self.save_current_mask_as_anchor).pack(fill=tk.X, pady=2)
 
         # Annotation controls (point/box placement and per-instance correction)
         refine_frame = tk.LabelFrame(inner, text="Annotation", padx=10, pady=10)
@@ -4658,6 +4660,88 @@ class SAM3VideoUI:
         self.status_var.set(f"Removed mask anchor at frame {frame_idx}. Ctrl+Z to undo.")
         return True
 
+    def save_current_mask_as_anchor(self):
+        """Save the currently displayed mask of the selected instance, at the
+        current frame, as a mask anchor for that instance.
+
+        Stored exactly the way rename/absorb self-anchors are stored (PNG under
+        instances/<id>/mask_anchors/, registered in instance.mask_anchor_frames,
+        plus a pending 'mask_anchor' trigger in refinements.json) so it is picked
+        up by _inject_mask_anchors on the next --refine/propagation, and so it
+        carries over as a historical component if this instance is later absorbed
+        into another one.
+        """
+        from datetime import datetime as _dt
+
+        if not self.selected_instance or not self.selected_concept:
+            messagebox.showwarning("Warning", "Please select an instance first.")
+            return
+        concept = self.selected_concept
+        instance = self.selected_instance
+        frame_idx = self.current_frame_idx
+
+        mask_dir = os.path.join(
+            self.project.project_dir, "concepts", concept.name,
+            "instances", str(instance.sam3_obj_id), "masks"
+        )
+        mask_np = load_sam3_mask(mask_dir, frame_idx)
+        if mask_np is None:
+            messagebox.showwarning(
+                "Warning", f"No mask displayed for '{instance.user_name}' at frame "
+                           f"{frame_idx}; nothing to save as an anchor.")
+            return
+
+        anchor_dir = os.path.join(
+            self.project.project_dir, "concepts", concept.name,
+            "instances", str(instance.sam3_obj_id), "mask_anchors"
+        )
+        os.makedirs(anchor_dir, exist_ok=True)
+        dst_path = Path(anchor_dir) / f"{frame_idx:06d}.png"
+
+        # Preserve prior anchor bytes (if any) so undo can restore them exactly.
+        prev_mask_data = None
+        if dst_path.exists():
+            prev_mask_data = cv2.imread(str(dst_path), cv2.IMREAD_GRAYSCALE)
+            if prev_mask_data is not None and prev_mask_data.shape == mask_np.shape:
+                mask_np = np.maximum(mask_np.astype("uint8"), prev_mask_data.astype("uint8"))
+
+        cv2.imwrite(str(dst_path), mask_np)
+        was_new_frame = frame_idx not in instance.mask_anchor_frames
+        if was_new_frame:
+            instance.mask_anchor_frames.append(frame_idx)
+            instance.mask_anchor_frames.sort()
+
+        rel_path = os.path.join(
+            "concepts", concept.name, "instances", str(instance.sam3_obj_id),
+            "mask_anchors", f"{frame_idx:06d}.png"
+        )
+        trigger_entry = {
+            "timestamp": _dt.now().isoformat(),
+            "type": "mask_anchor",
+            "frame_idx": frame_idx,
+            "mask_path": rel_path,
+            "propagated": False,
+            "manual_save_as_anchor": True,
+        }
+        self._stage_anchors_to_cache(concept, instance, [trigger_entry])
+
+        self.undo_stack.append({
+            'type': 'save_mask_anchor',
+            'instance': instance,
+            'concept': concept,
+            'frame_idx': frame_idx,
+            'mask_data': mask_np,
+            'prev_mask_data': prev_mask_data,
+            'was_new_frame': was_new_frame,
+            'anchor_dir': anchor_dir,
+            'trigger_entry': trigger_entry,
+        })
+        self.redo_stack.clear()
+        self._metadata_dirty = True
+        self.display_frame()
+        self.status_var.set(
+            f"Saved mask anchor for '{instance.user_name}' at frame {frame_idx}. Ctrl+Z to undo.")
+
     def merge_instances_dialog(self):
         """Show dialog to merge multiple instances by pixel-union of their masks.
 
@@ -5250,6 +5334,26 @@ class SAM3VideoUI:
             self.display_frame()
             self.status_var.set(f"Restored mask anchor at frame {frame_idx}.")
 
+        elif t == 'save_mask_anchor':
+            inst = action['instance']
+            concept = action['concept']
+            frame_idx = action['frame_idx']
+            anchor_dir = action['anchor_dir']
+            dst = Path(anchor_dir) / f"{frame_idx:06d}.png"
+            if action['prev_mask_data'] is not None:
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                cv2.imwrite(str(dst), action['prev_mask_data'])
+            else:
+                dst.unlink(missing_ok=True)
+            if action['was_new_frame'] and frame_idx in inst.mask_anchor_frames:
+                inst.mask_anchor_frames.remove(frame_idx)
+            self._remove_mask_anchor_triggers(
+                concept.name, inst.sam3_obj_id, [frame_idx])
+            self._metadata_dirty = True
+            self.compositor = DynamicFrameCompositor(self.project)
+            self.display_frame()
+            self.status_var.set(f"Undid saved mask anchor at frame {frame_idx}.")
+
         elif t == 'rename_instance':
             action['instance'].user_name = action['old_name']
             self._metadata_dirty = True
@@ -5484,6 +5588,23 @@ class SAM3VideoUI:
             self._metadata_dirty = True
             self.display_frame()
             self.status_var.set(f"Re-removed mask anchor at frame {frame_idx}.")
+
+        elif t == 'save_mask_anchor':
+            inst = action['instance']
+            concept = action['concept']
+            frame_idx = action['frame_idx']
+            anchor_dir = action['anchor_dir']
+            dst = Path(anchor_dir) / f"{frame_idx:06d}.png"
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            cv2.imwrite(str(dst), action['mask_data'])
+            if frame_idx not in inst.mask_anchor_frames:
+                inst.mask_anchor_frames.append(frame_idx)
+                inst.mask_anchor_frames.sort()
+            self._stage_anchors_to_cache(concept, inst, [action['trigger_entry']])
+            self._metadata_dirty = True
+            self.compositor = DynamicFrameCompositor(self.project)
+            self.display_frame()
+            self.status_var.set(f"Redid mask anchor save at frame {frame_idx}.")
 
         elif t == 'rename_instance':
             action['instance'].user_name = action['new_name']

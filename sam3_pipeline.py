@@ -805,17 +805,31 @@ def save_cond_frame_states(sam3_model, session_id: str, concept_dir: str) -> int
     Saves the combined [B, ...] tensors per cond frame so that
     restore_cond_frame_states() can inject them back in a fresh session.
 
-    tracker_inference_states is a list of "ranks" (SAM3's internal object-sharding
-    structure), but in this codebase's usage it is always a single rank covering
-    all objects — so ranks are concatenated together here rather than kept as
-    separate per-rank files; "rank_sizes" in the index records how to split the
-    combined batch back apart on restore if more than one rank is ever present.
+    tracker_inference_states is a flat list of tracker states — despite being
+    loosely called "ranks" elsewhere, each entry is actually a separate batch
+    of objects (SAM3 spins up a new one whenever new_instance_policy="allow"
+    registers objects mid-video), not a GPU shard. Per-frame tensors are read
+    from each object's own `output_dict_per_obj[obj_idx]` slice, NOT sliced by
+    position out of the shared batched `output_dict["cond_frame_outputs"]`
+    tensor: that batched tensor is frozen at whatever object count existed at
+    THAT frame's own consolidation time, which can be smaller than the
+    tracker_state's current/final object count (SAM3 keeps registering new
+    objects into the same tracker_state as detection/refinement continues, and
+    never retroactively re-consolidates older frames to match), so positional
+    slicing by today's obj_ids goes out of bounds or silently mispairs objects
+    with the wrong vectors. `output_dict_per_obj` has no such problem: it's
+    keyed by each object's own stable obj_idx and always stores that object's
+    own [1, ...] slice, populated fresh every time that frame is consolidated
+    for that object, regardless of how many other objects exist. Entries are
+    concatenated here (in tracker_inference_states list order, then ascending
+    obj_idx within each) rather than kept as separate files, and "rank_sizes"
+    in the index records each tracker_state's current obj_ids length so the
+    combined batch can be split back apart on restore.
 
     Returns number of cond frame files written.
     """
     inference_state = sam3_model._all_inference_states[session_id]["state"]
     tracker_states = inference_state.get("tracker_inference_states", [])
-    tracker_metadata = inference_state.get("tracker_metadata", {})
 
     if not tracker_states:
         print("save_cond_frame_states: no tracker states found — nothing to save.")
@@ -824,19 +838,23 @@ def save_cond_frame_states(sam3_model, session_id: str, concept_dir: str) -> int
     cond_states_dir = os.path.join(concept_dir, "cond_states")
     os.makedirs(cond_states_dir, exist_ok=True)
 
-    obj_ids_per_rank = tracker_metadata.get("obj_ids_per_gpu", [[]])
-
-    # Group cond frame outputs across ranks by frame index.
-    frames_data: dict = {}  # frame_t (int) -> [(rank, out), ...] in rank order
+    # Group cond frame outputs across ranks/objects by frame index.
+    # entries: frame_t (int) -> [(rank, obj_idx, obj_id, out), ...] in
+    # (rank, obj_idx) order, matching what restore_cond_frame_states expects
+    # to split back apart via per-rank offsets.
+    frames_data: dict = {}
     for rank, tracker_state in enumerate(tracker_states):
-        cond_outputs = tracker_state.get("output_dict", {}).get("cond_frame_outputs", {})
-        for frame_t, out in cond_outputs.items():
-            if out.get("maskmem_features") is None and out.get("obj_ptr") is None:
-                continue
-            frames_data.setdefault(int(frame_t), []).append((rank, out))
+        obj_id_to_idx = tracker_state.get("obj_id_to_idx", {})
+        output_dict_per_obj = tracker_state.get("output_dict_per_obj", {})
+        for obj_id, obj_idx in obj_id_to_idx.items():
+            cond_outputs = output_dict_per_obj.get(obj_idx, {}).get("cond_frame_outputs", {})
+            for frame_t, out in cond_outputs.items():
+                if out.get("maskmem_features") is None and out.get("obj_ptr") is None:
+                    continue
+                frames_data.setdefault(int(frame_t), []).append((rank, obj_idx, int(obj_id), out))
 
-    def _cat(rank_outs, key, dtype):
-        tensors = [ro[1].get(key) for ro in rank_outs]
+    def _cat(entries, key, dtype):
+        tensors = [e[3].get(key) for e in entries]
         if any(t is None for t in tensors):
             return None
         return torch.cat([t.detach().cpu().to(dtype) for t in tensors], dim=0).numpy()
@@ -845,27 +863,24 @@ def save_cond_frame_states(sam3_model, session_id: str, concept_dir: str) -> int
     total_saved = 0
     saved_frames = []
 
-    for frame_t, rank_outs in sorted(frames_data.items()):
-        rank_outs.sort(key=lambda ro: ro[0])
-        obj_ids = np.concatenate([
-            np.array([int(x) for x in obj_ids_per_rank[r]], dtype=np.int64)
-            for r, _ in rank_outs
-        ]) if rank_outs else np.array([], dtype=np.int64)
+    for frame_t, entries in sorted(frames_data.items()):
+        entries.sort(key=lambda e: (e[0], e[1]))  # (rank, obj_idx) ascending
+        obj_ids = np.array([e[2] for e in entries], dtype=np.int64) if entries else np.array([], dtype=np.int64)
 
         save_dict = {"obj_ids": obj_ids}
-        mf = _cat(rank_outs, "maskmem_features", torch.float16)
+        mf = _cat(entries, "maskmem_features", torch.float16)
         if mf is not None:
             save_dict["maskmem_features"] = mf
-        obj_ptr = _cat(rank_outs, "obj_ptr", torch.float32)
+        obj_ptr = _cat(entries, "obj_ptr", torch.float32)
         if obj_ptr is not None:
             save_dict["obj_ptr"] = obj_ptr
-        pred_masks = _cat(rank_outs, "pred_masks", torch.float16)
+        pred_masks = _cat(entries, "pred_masks", torch.float16)
         if pred_masks is not None:
             save_dict["pred_masks"] = pred_masks
-        obj_score = _cat(rank_outs, "object_score_logits", torch.float32)
+        obj_score = _cat(entries, "object_score_logits", torch.float32)
         if obj_score is not None:
             save_dict["object_score_logits"] = obj_score
-        iou_score = _cat(rank_outs, "iou_score", torch.float32)
+        iou_score = _cat(entries, "iou_score", torch.float32)
         if iou_score is not None:
             save_dict["iou_score"] = iou_score
 
@@ -876,14 +891,14 @@ def save_cond_frame_states(sam3_model, session_id: str, concept_dir: str) -> int
 
         # maskmem_pos_enc is a model constant (same for all frames/objects); save once
         if not maskmem_pos_enc_saved:
-            pos_enc = rank_outs[0][1].get("maskmem_pos_enc")
+            pos_enc = entries[0][3].get("maskmem_pos_enc")
             if pos_enc is not None:
                 torch.save(pos_enc, os.path.join(cond_states_dir, "maskmem_pos_enc.pt"))
                 maskmem_pos_enc_saved = True
 
     index = {
         "saved_at": datetime.now().isoformat(),
-        "rank_sizes": [len(ids) for ids in obj_ids_per_rank],
+        "rank_sizes": [len(ts.get("obj_ids", [])) for ts in tracker_states],
         "frames": sorted(saved_frames),
     }
     with open(os.path.join(cond_states_dir, "index.json"), "w") as f:
@@ -895,18 +910,26 @@ def save_cond_frame_states(sam3_model, session_id: str, concept_dir: str) -> int
 
 def save_refinement_obj_ptrs(sam3_model, session_id: str, concept: "SAM3Concept", concept_dir: str) -> int:
     """
-    Save each instance's obj_ptr (256-d, non-spatial object-identity embedding) as
-    the MEAN over its cond frames in this refinement round — not the full
-    maskmem_features (~650x larger, a spatial map tied to one frame's own layout,
-    not a natural fit for pooling across videos).
+    Save each instance's obj_ptr (256-d, non-spatial object-identity embedding) from
+    its cond frames in this refinement round — not the full maskmem_features (~650x
+    larger, a spatial map tied to one frame's own layout, not a natural fit for
+    pooling across videos).
 
-    Cond frames where object_score_logits <= 0 are excluded from the average.
-    Those are frames where the model judged the instance absent — typically a
-    negative-only correction ("this was wrongly detected here, remove it"), not a
-    positive sighting. Their obj_ptr is gated toward the model's generic
-    `no_obj_ptr` placeholder (see sam3_tracker_base.py's obj_ptr computation), so
-    including them would dilute the average with a non-appearance signal rather
-    than reinforcing the instance's actual identity.
+    Both the MEAN over cond frames (for a cheap single-vector descriptor) and the RAW
+    per-cond-frame vectors (for a future consumer that wants the actual set — e.g.
+    attention-pooling or nearest-neighbor matching the way SAM3's own tracker consumes
+    obj_ptr, as a set of tokens, not a single prototype) are saved. Averaging is a
+    one-way door — the mean can always be recomputed from the raw set later, but not
+    vice versa — and the raw vectors are cheap (256-d each, single-digit to low-double
+    -digit count per instance), so there's no real cost to keeping both.
+
+    Cond frames where object_score_logits <= 0 are excluded from both. Those are
+    frames where the model judged the instance absent — typically a negative-only
+    correction ("this was wrongly detected here, remove it"), not a positive
+    sighting. Their obj_ptr is gated toward the model's generic `no_obj_ptr`
+    placeholder (see sam3_tracker_base.py's obj_ptr computation), so including them
+    would dilute the signal with a non-appearance vector rather than reinforcing the
+    instance's actual identity.
 
     Keyed by the user-assigned instance name (SAM3Instance.user_name), not the
     internal sam3_obj_id: obj_id is an ephemeral tracking artifact (reassigned
@@ -914,10 +937,12 @@ def save_refinement_obj_ptrs(sam3_model, session_id: str, concept: "SAM3Concept"
     human gave the object — the thing worth pooling across runs and videos.
     Nothing currently stops two instances of the same concept from sharing a
     user_name (only concept names are duplicate-checked, see sam3_ui.py
-    rename_instance), so when that happens their per-instance mean obj_ptr
-    vectors are themselves averaged together into one row for that name (each
-    instance counted once, regardless of how many cond frames it had). Deleted
-    instances are skipped, as are any obj_ids with no matching live instance.
+    rename_instance), so when that happens their per-instance mean obj_ptr vectors
+    are themselves averaged together into one row for that name in "obj_ptr" (each
+    instance counted once, regardless of how many cond frames it had), while the raw
+    vectors from both instances are simply concatenated under that name in
+    "raw_obj_ptr" (nothing collapsed). Deleted instances are skipped, as are any
+    obj_ids with no matching live instance.
 
     Intended to be called only from refinement rounds (human-corrected anchors),
     not initial detection. Writes a single file per concept, OVERWRITTEN on every
@@ -930,47 +955,65 @@ def save_refinement_obj_ptrs(sam3_model, session_id: str, concept: "SAM3Concept"
     """
     inference_state = sam3_model._all_inference_states[session_id]["state"]
     tracker_states = inference_state.get("tracker_inference_states", [])
-    tracker_metadata = inference_state.get("tracker_metadata", {})
 
     if not tracker_states:
         print("save_refinement_obj_ptrs: no tracker states found — nothing to save.")
         return 0
 
-    obj_ids_per_rank = tracker_metadata.get("obj_ids_per_gpu", [[]])
-
-    # obj_id -> list of obj_ptr vectors from cond frames judged "object present"
+    # obj_id -> list of (frame_idx, obj_ptr vector) from cond frames judged "object present"
     by_obj_id: dict = {}
-    for rank, tracker_state in enumerate(tracker_states):
-        rank_obj_ids = [int(x) for x in obj_ids_per_rank[rank]] if rank < len(obj_ids_per_rank) else []
-        cond_outputs = tracker_state.get("output_dict", {}).get("cond_frame_outputs", {})
-        for frame_t, out in cond_outputs.items():
-            obj_ptr = out.get("obj_ptr")
-            obj_score = out.get("object_score_logits")
-            if obj_ptr is None or obj_score is None:
-                continue
-            obj_ptr = obj_ptr.detach().cpu().to(torch.float32).numpy()  # [b_rank, 256]
-            obj_score = obj_score.detach().cpu().to(torch.float32).numpy().reshape(-1)  # [b_rank]
-            for i, obj_id in enumerate(rank_obj_ids):
-                if obj_score[i] <= 0:
+    for tracker_state in tracker_states:
+        # Read each object's own slice from output_dict_per_obj, keyed by that
+        # object's stable obj_idx — NOT sliced by position out of the shared
+        # batched cond_frame_outputs tensor. That batched tensor is frozen at
+        # whatever object count existed at THAT frame's own consolidation time,
+        # which can be smaller than the tracker_state's current/final object
+        # count (SAM3 keeps registering new objects into the same tracker_state
+        # as detection/refinement continues, and never retroactively
+        # re-consolidates older frames to match) — using a current-count-sized
+        # id list to index that stale tensor both crashed (index out of
+        # bounds) and would have silently mispaired ids with the wrong obj_ptr
+        # vectors had it not crashed first. output_dict_per_obj has no such
+        # problem: it always stores each object's own [1, ...] slice under its
+        # own obj_idx, populated fresh whenever that frame is consolidated for
+        # that object, regardless of how many other objects exist.
+        obj_id_to_idx = tracker_state.get("obj_id_to_idx", {})
+        output_dict_per_obj = tracker_state.get("output_dict_per_obj", {})
+        for obj_id, obj_idx in obj_id_to_idx.items():
+            obj_id = int(obj_id)
+            cond_outputs = output_dict_per_obj.get(obj_idx, {}).get("cond_frame_outputs", {})
+            for frame_t, out in cond_outputs.items():
+                obj_ptr = out.get("obj_ptr")
+                obj_score = out.get("object_score_logits")
+                if obj_ptr is None or obj_score is None:
+                    continue
+                obj_ptr = obj_ptr.detach().cpu().to(torch.float32).numpy()  # [1, 256]
+                obj_score = obj_score.detach().cpu().to(torch.float32).numpy().reshape(-1)  # [1]
+                if obj_score[0] <= 0:
                     continue  # object judged absent at this frame — skip
-                by_obj_id.setdefault(obj_id, []).append(obj_ptr[i])
+                by_obj_id.setdefault(obj_id, []).append((int(frame_t), obj_ptr[0]))
 
     if not by_obj_id:
         print("save_refinement_obj_ptrs: no present-object obj_ptr found in cond frames — nothing to save.")
         return 0
 
-    # Per-instance mean, then group by user-assigned name (obj_id is not durable/meaningful).
-    by_name: dict = {}       # name -> list of per-instance mean obj_ptr vectors
+    # Group by user-assigned name (obj_id is not durable/meaningful); keep both the
+    # per-instance mean and the raw (frame_idx, vector) pairs.
+    by_name: dict = {}         # name -> list of per-instance mean obj_ptr vectors
+    raw_by_name: dict = {}     # name -> list of (obj_id, frame_idx, vector)
     frames_by_name: dict = {}  # name -> total cond frames pooled across contributing instances
     skipped_obj_ids = []
-    for obj_id, vectors in by_obj_id.items():
+    for obj_id, entries in by_obj_id.items():
         inst = concept.get_instance_by_sam3_id(obj_id)
         if inst is None or inst.deleted:
             skipped_obj_ids.append(obj_id)
             continue
+        vectors = [v for _t, v in entries]
         instance_mean = np.mean(vectors, axis=0)
         by_name.setdefault(inst.user_name, []).append(instance_mean)
         frames_by_name[inst.user_name] = frames_by_name.get(inst.user_name, 0) + len(vectors)
+        for frame_t, v in sorted(entries, key=lambda e: e[0]):
+            raw_by_name.setdefault(inst.user_name, []).append((obj_id, frame_t, v))
 
     if skipped_obj_ids:
         print(f"save_refinement_obj_ptrs: skipping {len(skipped_obj_ids)} obj_id(s) with no "
@@ -981,11 +1024,27 @@ def save_refinement_obj_ptrs(sam3_model, session_id: str, concept: "SAM3Concept"
         return 0
 
     names_sorted = sorted(by_name.keys())
+
+    # Raw vectors are ragged per name (different cond-frame counts), so they're
+    # stored flat with parallel index arrays rather than a jagged/object array
+    # (keeps the file plain float/int dtypes, no allow_pickle needed to read it back).
+    raw_names, raw_obj_ids, raw_frame_idx, raw_vectors = [], [], [], []
+    for name in names_sorted:
+        for obj_id, frame_t, v in raw_by_name[name]:
+            raw_names.append(name)
+            raw_obj_ids.append(obj_id)
+            raw_frame_idx.append(frame_t)
+            raw_vectors.append(v)
+
     save_dict = {
         "names": np.array(names_sorted),
         "num_instances": np.array([len(by_name[n]) for n in names_sorted], dtype=np.int64),
         "num_frames": np.array([frames_by_name[n] for n in names_sorted], dtype=np.int64),
         "obj_ptr": np.stack([np.mean(by_name[n], axis=0) for n in names_sorted], axis=0),
+        "raw_names": np.array(raw_names),
+        "raw_obj_id": np.array(raw_obj_ids, dtype=np.int64),
+        "raw_frame_idx": np.array(raw_frame_idx, dtype=np.int64),
+        "raw_obj_ptr": np.stack(raw_vectors, axis=0),
     }
 
     fname = os.path.join(concept_dir, "obj_ptr_priors.npz")
@@ -994,9 +1053,10 @@ def save_refinement_obj_ptrs(sam3_model, session_id: str, concept: "SAM3Concept"
     dup_names = [n for n in names_sorted if len(by_name[n]) > 1]
     if dup_names:
         print(f"save_refinement_obj_ptrs: averaged {len(dup_names)} duplicate-named "
-              f"instance group(s) together: {dup_names}")
+              f"instance group(s) together in 'obj_ptr' (raw vectors kept separate "
+              f"in 'raw_obj_ptr'): {dup_names}")
     print(f"Saved obj_ptr for {len(names_sorted)} named instance(s) "
-          f"(mean over present-object cond frames) → {fname}")
+          f"({len(raw_vectors)} raw cond-frame vector(s), plus mean per name) → {fname}")
     return len(names_sorted)
 
 
@@ -1153,6 +1213,14 @@ def process_concept_detection(
         save_cond_states: If True, save maskmem cond frame states to disk for a
             future --restore-cond refinement round. Off by default since these
             states are only consumed by that opt-in path and can be sizeable.
+
+    concept.max_instances (set by sam3_process.py, from --max-instances or the JSON
+    "max_instances" field) caps SAM3's model.max_num_objects for the duration of this
+    call only, then restores it. This governs THIS initial-detection propagation and
+    nothing else — a later refinement round (replay_concept_refinements) never reads
+    concept.max_instances and always replays every instance the user has kept, even if
+    that exceeds this cap. See _cap handling below for what happens when detection would
+    otherwise exceed the cap.
 
     Returns:
         Updated concept with instances populated
