@@ -398,6 +398,72 @@ def process_project_parallel(args, project, concepts_to_process, devices):
     return 1 if errors else 0
 
 
+def _finalize_concept_refinement(concept, project_dir):
+    """
+    Post-processing shared by the serial (_refine_project_impl) and parallel
+    (_parallel_refine_worker_main) `--refine` paths, run after
+    replay_concept_refinements() succeeds for a concept.
+
+    1. Drops merge-absorbed source instances from metadata — their masks were
+       already deleted by the pipeline, so keeping stale entries around risks
+       obj_id collisions with SAM3's own detector on a future redetect.
+    2. Marks the concept COMPLETED once no live instance has any unpropagated
+       refinements.json entry left. process_concept_detection is otherwise the
+       only place that ever sets ConceptStatus.COMPLETED, so a concept whose
+       instances were all manually added (never ran text-prompt detection) or
+       that errored out after an earlier detection run would otherwise stay
+       "pending"/"error" forever even once fully refined. This mirrors the
+       same check handle_status() already uses for its [REFINEMENT NEEDED]
+       listing, so --status agrees with what actually happened.
+
+    Mutates `concept` in place. Does not save/persist anything — callers own
+    that (project.save() vs. project._save_concept_metadata()) and their own
+    logging style (plain print vs. worker-tagged print).
+
+    Returns (absorbed_ids_removed: set[int], marked_completed: bool).
+    """
+    absorbed_ids_removed = {
+        inst.sam3_obj_id for inst in concept.instances
+        if inst.deleted and getattr(inst, 'absorbed_source', False)
+    }
+    if absorbed_ids_removed:
+        concept.instances = [
+            inst for inst in concept.instances
+            if not (inst.deleted and getattr(inst, 'absorbed_source', False))
+        ]
+        for inst in concept.instances:
+            inst.absorbed_source_ids = [
+                sid for sid in inst.absorbed_source_ids
+                if sid not in absorbed_ids_removed
+            ]
+
+    still_pending = False
+    for inst in concept.instances:
+        if inst.deleted:
+            continue
+        rpath = os.path.join(
+            project_dir, "concepts", concept.name,
+            "instances", str(inst.sam3_obj_id), "refinements.json"
+        )
+        if not os.path.exists(rpath):
+            continue
+        with open(rpath) as f:
+            refs = json.load(f).get("refinements", [])
+        if any(not r.get("propagated", True) for r in refs):
+            still_pending = True
+            break
+
+    marked_completed = False
+    if not still_pending and concept.status.value != "completed":
+        from sam3_project import ConceptStatus
+        from datetime import datetime
+        concept.status = ConceptStatus.COMPLETED
+        concept.completed_at = datetime.now().isoformat()
+        marked_completed = True
+
+    return absorbed_ids_removed, marked_completed
+
+
 def _parallel_refine_worker_main(
     worker_id, device, project_dir, model_name, use_fa3, max_cond_frames_in_attn,
     restore_cond_states, save_cond_states, save_obj_ptr_prior, preload_original_masks,
@@ -500,22 +566,13 @@ def _parallel_refine_worker_main(
                     preload_original_masks=preload_original_masks,
                     new_instance_policy=new_instance_policy,
                 )
-                # Remove absorbed sources from the concept before saving metadata,
-                # mirroring the cleanup done in _refine_project_impl for the serial path.
-                absorbed_ids_removed = {
-                    inst.sam3_obj_id for inst in concept.instances
-                    if inst.deleted and getattr(inst, 'absorbed_source', False)
-                }
+                absorbed_ids_removed, marked_completed = _finalize_concept_refinement(
+                    concept, project_dir)
                 if absorbed_ids_removed:
-                    concept.instances = [
-                        inst for inst in concept.instances
-                        if not (inst.deleted and getattr(inst, 'absorbed_source', False))
-                    ]
-                    for inst in concept.instances:
-                        inst.absorbed_source_ids = [
-                            sid for sid in inst.absorbed_source_ids
-                            if sid not in absorbed_ids_removed
-                        ]
+                    print(f"{tag} removed {len(absorbed_ids_removed)} absorbed source(s) from "
+                          f"project metadata: obj_ids {sorted(absorbed_ids_removed)}")
+                if marked_completed:
+                    print(f"{tag} concept '{cname}' has no pending annotations left — marking completed.")
                 # Persist updated presence fields and cleaned-up instance list.
                 project._save_concept_metadata(concept)
             result_queue.put(("done", worker_id, cname))
@@ -605,6 +662,20 @@ def refine_project_parallel(args, project, redetect_concepts, refine_concepts, d
         if msg_type == "done":
             remaining -= 1
             cname = payload
+            # Workers write the authoritative concepts/<name>/concept_metadata.json
+            # directly but never send the mutated concept back over the queue, so
+            # the parent's in-memory copy is still the stale pre-refine version.
+            # Re-read it now (mirroring process_project_parallel's merge-back)
+            # so the project.json summary this function's caller saves below
+            # reflects what the worker actually wrote, not stale status/counts.
+            updated = project._load_concept_metadata(cname)
+            if updated is not None:
+                for idx, c in enumerate(project.concepts):
+                    if c.name == cname:
+                        project.concepts[idx] = updated
+                        break
+                else:
+                    project.add_concept(updated)
             print(f"[refine-worker {worker_id}] done: '{cname}' ({remaining} remaining)")
         elif msg_type == "error":
             remaining -= 1
@@ -1707,25 +1778,13 @@ def _refine_project_impl(args, project):
                 preload_original_masks=args.preload_original_masks,
                 new_instance_policy=args.new_instance_policy,
             )
-            # Refinement succeeded: absorbed sources have been incorporated into the
-            # target's anchor-based propagation and their original mask files have been
-            # deleted by the pipeline.  Remove them from project metadata now so their
-            # obj_ids are free to be reused without confusion on future redetections.
-            absorbed_ids_removed = set()
-            concept.instances = [
-                inst for inst in concept.instances
-                if not (inst.deleted and getattr(inst, 'absorbed_source', False))
-                or absorbed_ids_removed.add(inst.sam3_obj_id) or False
-            ]
+            absorbed_ids_removed, marked_completed = _finalize_concept_refinement(
+                concept, project.project_dir)
             if absorbed_ids_removed:
-                # Prune stale IDs from any target's absorbed_source_ids list
-                for inst in concept.instances:
-                    inst.absorbed_source_ids = [
-                        sid for sid in inst.absorbed_source_ids
-                        if sid not in absorbed_ids_removed
-                    ]
                 print(f"  Removed {len(absorbed_ids_removed)} absorbed source(s) from "
                       f"project metadata: obj_ids {sorted(absorbed_ids_removed)}")
+            if marked_completed:
+                print(f"  Concept '{cname}' has no pending annotations left — marking completed.")
         except Exception as e:
             errors.append((cname, str(e)))
             print(f"  Error refining concept '{cname}': {e}")

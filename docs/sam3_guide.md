@@ -148,7 +148,7 @@ Arrow-key and letter shortcuts are ignored while a text field (e.g. a rename ent
 
 ## Absorbing Instances
 
-Text-prompt detection sometimes splits one real-world object into two instances (e.g. it loses and re-acquires the object, or a brief occlusion starts a new track). **Absorb** merges such a pair using a guided wizard, rather than a blind centroid guess:
+Text-prompt detection sometimes splits one real-world object into two instances (e.g. it loses and re-acquires the object, or a brief occlusion starts a new track). **Absorb** merges such a pair using a guided wizard:
 
 - **Direction**: you first select the instance you want to get rid of — the **source** (it will be absorbed and deleted) — then choose a **target** from the remaining instances (kept). In the target list, instances with a **higher** ID than the source (i.e. detected *later*) are grayed out: absorbing into a later-detected instance is less reliable, since the earlier instance usually has the cleaner, less-drifted track record. Prefer merging a later-appearing instance into an earlier one.
 - **Mask anchor**: the UI will ask you to *confirm a clean mask* for the source (and, the first time anything is absorbed into it, for the target too). That confirmed frame's mask will serve as an anchor of how this object looks like next next time you re-process the video with a `--refine` argument. It works in similar way as point or bounding box annotations.
