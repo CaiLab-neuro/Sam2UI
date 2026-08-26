@@ -293,7 +293,7 @@ class SAM3VideoUI:
         menubar.add_cascade(label="File", menu=file_menu)
         file_menu.add_command(label="Load Video", command=self.load_video)
         file_menu.add_command(label="Load Project", command=self.load_project)
-        file_menu.add_command(label="Save Project", command=self.save_project)
+        file_menu.add_command(label="Save Project (Metadata Only)", command=self.save_project)
         file_menu.add_separator()
         file_menu.add_command(label="Extract Frames to Project...",
                               command=self.extract_frames_to_project)

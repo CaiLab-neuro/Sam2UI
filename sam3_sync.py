@@ -155,7 +155,16 @@ def main():
     if rsync_cmd == ["wsl", "rsync"]:
         src = _to_wsl_path(src)
 
-    cmd = rsync_cmd + ["-av", "--update"]
+    # Force group-readable/writable permissions on transferred files and dirs.
+    # rsync -a preserves the source file's mode bits by default, but on Windows
+    # there is no real umask: MSYS/Cygwin/WSL rsync ports synthesize a Unix mode
+    # from the Windows read-only attribute, which commonly comes out owner-only
+    # (e.g. 600). That mode then overwrites whatever shared/group permissions
+    # the file had on a multi-user destination. --chmod here adds group rw
+    # (files) / rwx (dirs) and other r/rx on top of the transferred mode, so
+    # collaborators can still read and edit synced files regardless of what
+    # permissions the source machine reported.
+    cmd = rsync_cmd + ["-av", "--update", "--chmod=Fg+rw,Fo+r,Dg+rwx,Do+rx"]
     if args.dry_run:
         cmd.append("--dry-run")
     for pattern in EXCLUDES:
