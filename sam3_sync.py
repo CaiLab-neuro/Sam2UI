@@ -22,6 +22,16 @@ Windows notes:
     2. rsync-win.exe (standalone Windows rsync port, if present on PATH or in known install dirs)
     3. wsl rsync     (available if WSL is installed: wsl --install, then: wsl apt install rsync)
   If none are found, install one of the above or use WinSCP / MobaXterm as a GUI alternative.
+
+Manual rsync (if this script can't run in your environment):
+  This script runs the equivalent of:
+    rsync -av --update --chmod=Fg+rw,Fo+r,Dg+rwx,Do+rx \
+      --exclude '*/masks/' --exclude '*/cond_states/' --exclude 'inference_state.pkl' \
+      --exclude '*.mp4' --exclude '*.avi' --exclude '*.jpg' --exclude '*.jpeg' --exclude '*.png' \
+      <local_project_dir>/ user@host:/path/to/project
+  The --chmod flag is important on a shared server: without it, files pushed from a
+  single-user machine (especially Windows, which has no real umask) can land
+  owner-only and become unreadable/unwritable by the rest of your group.
 """
 
 import argparse

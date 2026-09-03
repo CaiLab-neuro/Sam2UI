@@ -928,7 +928,7 @@ def handle_quality_metrics(args):
         return 1
 
     from sam3_utils import build_sam3_masks_metadata
-    from utils import calculate_quality_metrics, save_quality_metrics
+    from utils import calculate_quality_metrics_grouped, save_quality_metrics_grouped
 
     print(f"Calculating quality metrics for project: {args.project}")
     masks_by_frame, load_fn, obj_id_to_info = build_sam3_masks_metadata(project)
@@ -939,20 +939,29 @@ def handle_quality_metrics(args):
 
     print(f"Found {len(obj_id_to_info)} object(s) across {len(masks_by_frame)} frame(s).")
     width, height = project.frame_dimensions
-    inter, bg, overlap = calculate_quality_metrics(
+
+    # Inter-frame change and overlap are computed per concept (different concepts
+    # are legitimately allowed to overlap); background ratio stays global.
+    obj_id_to_group = {oid: info["concept"] for oid, info in obj_id_to_info.items()}
+    result = calculate_quality_metrics_grouped(
         masks=masks_by_frame,
         load_mask_func=load_fn,
+        obj_id_to_group=obj_id_to_group,
         frame_dimensions=(height, width),
         num_frames=project.num_frames,
     )
-    save_quality_metrics(args.project, inter, bg, overlap)
+    save_quality_metrics_grouped(args.project, result)
 
     def _mean(lst):
         return sum(lst) / len(lst) if lst else float("nan")
 
-    print(f"Inter-frame change (mean): {_mean(inter):.3f}")
-    print(f"Background ratio   (mean): {_mean(bg):.3f}")
-    print(f"Overlap ratio      (mean): {_mean(overlap):.3f}")
+    print(f"Background ratio         (mean, global): {_mean(result['background_ratios']):.3f}")
+    for g in result['group_names']:
+        print(f"Concept '{g}':")
+        print(f"  Inter-frame change (mean): {_mean(result['inter_frame_changes_by_group'][g]):.3f}")
+        print(f"  Overlap ratio      (mean): {_mean(result['overlap_ratios_by_group'][g]):.3f}")
+    print(f"Inter-frame change (mean, all concepts combined): {_mean(result['inter_frame_changes']):.3f}")
+    print(f"Overlap ratio      (mean, all concepts combined): {_mean(result['overlap_ratios']):.3f}")
     print(f"Saved: {os.path.join(args.project, 'quality_metrics.npz')}")
     return 0
 

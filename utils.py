@@ -1487,6 +1487,126 @@ class QualityMetricsCalculator:
 
         return self.inter_frame_changes, self.background_ratios, self.overlap_ratios
 
+    def calculate_grouped(
+        self,
+        masks: Dict[int, Dict[int, Any]],
+        load_mask_func: Callable[[int, int], Optional[np.ndarray]],
+        obj_id_to_group: Dict[int, Any],
+    ) -> Dict[str, Any]:
+        """
+        Calculate quality metrics with per-group (per-concept) inter-frame change
+        and overlap ratios, plus a single global background ratio.
+
+        Rationale:
+          - Background ratio measures how much of the frame is segmented at all;
+            a single global number is the meaningful summary.
+          - Inter-frame change and overlap are only meaningful *within* a category.
+            Different concepts are legitimately expected to overlap (e.g. "person"
+            and "shirt"), so a global overlap metric mostly measures expected
+            co-occurrence rather than segmentation error.  Likewise a jittery
+            concept should not be averaged away by a stable one.
+
+        Args:
+            masks: {frame_idx: {obj_id: mask_data}}
+            load_mask_func: (frame_idx, obj_id) -> np.ndarray | None
+            obj_id_to_group: {obj_id: group_key} (typically concept name)
+
+        Returns a dict:
+            'background_ratios':            [float] * num_frames  (global)
+            'inter_frame_changes':          [float] * num_frames  (global aggregate,
+                                             identical semantics to calculate(); kept
+                                             for backward compatibility)
+            'overlap_ratios':               [float] * num_frames  (global aggregate)
+            'group_names':                  [group_key, ...]  (stable order)
+            'inter_frame_changes_by_group': {group_key: [float] * num_frames}
+            'overlap_ratios_by_group':      {group_key: [float] * num_frames}
+        """
+        print("Calculating segmentation quality metrics (per-concept)...")
+
+        group_names = list(dict.fromkeys(
+            obj_id_to_group[k] for k in sorted(obj_id_to_group)
+        ))
+        group_of = obj_id_to_group
+
+        bg_ratios: List[float] = []
+        inter_global: List[float] = []
+        overlap_global: List[float] = []
+        inter_by_group: Dict[Any, List[float]] = {g: [] for g in group_names}
+        overlap_by_group: Dict[Any, List[float]] = {g: [] for g in group_names}
+
+        prev_global: Optional[np.ndarray] = None
+        prev_by_group: Dict[Any, Optional[np.ndarray]] = {g: None for g in group_names}
+
+        for frame_idx in range(self.num_frames):
+            global_combined = np.zeros((self.height, self.width), dtype=np.uint16)
+            global_overlap_count = np.zeros((self.height, self.width), dtype=np.int32)
+            group_combined = {
+                g: np.zeros((self.height, self.width), dtype=np.uint16) for g in group_names
+            }
+            group_overlap_count = {
+                g: np.zeros((self.height, self.width), dtype=np.int32) for g in group_names
+            }
+
+            if frame_idx in masks:
+                for obj_id in masks[frame_idx]:
+                    mask = load_mask_func(frame_idx, obj_id)
+                    if mask is None:
+                        continue
+                    if mask.shape != (self.height, self.width):
+                        from PIL import Image as PILImage
+                        mask_pil = PILImage.fromarray(mask)
+                        mask_pil = mask_pil.resize((self.width, self.height), PILImage.NEAREST)
+                        mask = np.array(mask_pil)
+
+                    hit = mask > 0
+                    global_combined[hit] = obj_id
+                    global_overlap_count[hit] += 1
+
+                    g = group_of.get(obj_id)
+                    if g in group_combined:
+                        group_combined[g][hit] = obj_id
+                        group_overlap_count[g][hit] += 1
+
+            # Global background ratio
+            object_pixels = np.count_nonzero(global_combined)
+            bg_ratios.append(1.0 - (object_pixels / self.total_pixels))
+
+            # Global aggregates (backward compatible with calculate())
+            excess = np.where(global_overlap_count > 0, global_overlap_count - 1, 0)
+            overlap_global.append(float(np.sum(excess) / self.total_pixels))
+            if prev_global is None:
+                inter_global.append(0.0)
+            else:
+                changed = np.count_nonzero(global_combined != prev_global)
+                inter_global.append(changed / self.total_pixels)
+            prev_global = global_combined.copy()
+
+            # Per-group metrics
+            for g in group_names:
+                gc = group_combined[g]
+                g_excess = np.where(group_overlap_count[g] > 0, group_overlap_count[g] - 1, 0)
+                overlap_by_group[g].append(float(np.sum(g_excess) / self.total_pixels))
+                if prev_by_group[g] is None:
+                    inter_by_group[g].append(0.0)
+                else:
+                    changed = np.count_nonzero(gc != prev_by_group[g])
+                    inter_by_group[g].append(changed / self.total_pixels)
+                prev_by_group[g] = gc.copy()
+
+        print(f"Calculated per-concept metrics for {self.num_frames} frames, "
+              f"{len(group_names)} concept(s)")
+        if len(bg_ratios) > 1:
+            print(f"  Mean background ratio: {np.mean(bg_ratios):.3f}")
+
+        return {
+            'background_ratios': bg_ratios,
+            'inter_frame_changes': inter_global,
+            'overlap_ratios': overlap_global,
+            'group_names': group_names,
+            'inter_frame_changes_by_group': inter_by_group,
+            'overlap_ratios_by_group': overlap_by_group,
+        }
+
 
 def calculate_quality_metrics(
     masks: Dict[int, Dict[int, Any]],
@@ -1508,6 +1628,23 @@ def calculate_quality_metrics(
     """
     calculator = QualityMetricsCalculator(frame_dimensions, num_frames)
     return calculator.calculate(masks, load_mask_func)
+
+
+def calculate_quality_metrics_grouped(
+    masks: Dict[int, Dict[int, Any]],
+    load_mask_func: Callable[[int, int], Optional[np.ndarray]],
+    obj_id_to_group: Dict[int, Any],
+    frame_dimensions: Tuple[int, int],
+    num_frames: int
+) -> Dict[str, Any]:
+    """
+    Convenience wrapper around QualityMetricsCalculator.calculate_grouped().
+
+    Returns the dict documented on calculate_grouped(): a global background ratio
+    and global aggregates plus per-group inter-frame-change / overlap ratios.
+    """
+    calculator = QualityMetricsCalculator(frame_dimensions, num_frames)
+    return calculator.calculate_grouped(masks, load_mask_func, obj_id_to_group)
 
 
 def save_quality_metrics(
@@ -1548,6 +1685,55 @@ def save_quality_metrics(
         np.savez_compressed(metrics_path, **save_dict)
 
         print(f"Saved quality metrics to {metrics_path}")
+        return True
+    except Exception as e:
+        print(f"WARNING: Failed to save quality metrics: {e}")
+        return False
+
+
+def save_quality_metrics_grouped(output_dir: str, result: Dict[str, Any]) -> bool:
+    """
+    Save the dict produced by calculate_quality_metrics_grouped() to
+    quality_metrics.npz.
+
+    The file stays backward compatible: the global keys ('inter_frame_changes',
+    'background_ratios', 'overlap_ratios', 'frame_count') are written exactly as
+    save_quality_metrics() writes them, so older readers keep working.  Per-concept
+    data is added under extra keys that older readers simply ignore:
+        'group_names'                  1-D unicode array
+        'inter_frame_changes_by_group' 2-D array, shape (n_groups, n_frames)
+        'overlap_ratios_by_group'      2-D array, shape (n_groups, n_frames)
+    """
+    inter = list(result.get('inter_frame_changes') or [])
+    bg = list(result.get('background_ratios') or [])
+    if not inter or not bg:
+        print("No quality metrics to save")
+        return False
+
+    try:
+        metrics_path = os.path.join(output_dir, "quality_metrics.npz")
+        save_dict = {
+            'inter_frame_changes': np.array(inter),
+            'background_ratios': np.array(bg),
+            'frame_count': len(inter),
+        }
+        overlap = result.get('overlap_ratios')
+        if overlap is not None:
+            save_dict['overlap_ratios'] = np.array(overlap)
+
+        group_names = list(result.get('group_names') or [])
+        if group_names:
+            inter_bg = result.get('inter_frame_changes_by_group', {}) or {}
+            overlap_bg = result.get('overlap_ratios_by_group', {}) or {}
+            save_dict['group_names'] = np.array([str(g) for g in group_names])
+            save_dict['inter_frame_changes_by_group'] = np.array(
+                [inter_bg[g] for g in group_names], dtype=float)
+            save_dict['overlap_ratios_by_group'] = np.array(
+                [overlap_bg[g] for g in group_names], dtype=float)
+
+        np.savez_compressed(metrics_path, **save_dict)
+        print(f"Saved quality metrics to {metrics_path}"
+              + (f" ({len(group_names)} concept(s))" if group_names else ""))
         return True
     except Exception as e:
         print(f"WARNING: Failed to save quality metrics: {e}")
@@ -1704,6 +1890,56 @@ def load_quality_metrics(output_dir: str) -> Tuple[Optional[List[float]], Option
     except Exception as e:
         print(f"WARNING: Failed to load quality metrics: {e}")
         return None, None, None
+
+
+def load_quality_metrics_grouped(output_dir: str) -> Optional[Dict[str, Any]]:
+    """
+    Load quality_metrics.npz including per-concept metrics when present.
+
+    Returns a dict with the same shape as calculate_quality_metrics_grouped()'s
+    output, or None if the file is missing/unreadable.  Files written by the
+    older (non-grouped) version load fine: 'group_names' and the *_by_group
+    entries come back as None.
+    """
+    metrics_path = os.path.join(output_dir, "quality_metrics.npz")
+    if not os.path.exists(metrics_path):
+        print("No quality metrics file found (OK for older results)")
+        return None
+
+    try:
+        data = np.load(metrics_path)
+        out: Dict[str, Any] = {
+            'inter_frame_changes': data['inter_frame_changes'].tolist(),
+            'background_ratios': data['background_ratios'].tolist(),
+            'overlap_ratios': (data['overlap_ratios'].tolist()
+                               if 'overlap_ratios' in data else None),
+            'group_names': None,
+            'inter_frame_changes_by_group': None,
+            'overlap_ratios_by_group': None,
+        }
+
+        if 'group_names' in data:
+            names = [str(x) for x in data['group_names'].tolist()]
+            out['group_names'] = names
+            if 'inter_frame_changes_by_group' in data:
+                arr = data['inter_frame_changes_by_group']
+                out['inter_frame_changes_by_group'] = {
+                    n: arr[i].tolist() for i, n in enumerate(names)
+                }
+            if 'overlap_ratios_by_group' in data:
+                arr = data['overlap_ratios_by_group']
+                out['overlap_ratios_by_group'] = {
+                    n: arr[i].tolist() for i, n in enumerate(names)
+                }
+            print(f"Loaded quality metrics: {len(names)} concept(s), "
+                  f"{len(out['inter_frame_changes'])} frames")
+        else:
+            print(f"Loaded quality metrics: "
+                  f"{len(out['inter_frame_changes'])} values (no per-concept data)")
+        return out
+    except Exception as e:
+        print(f"WARNING: Failed to load quality metrics: {e}")
+        return None
 
 
 # =============================================================================

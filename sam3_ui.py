@@ -176,6 +176,15 @@ class SAM3VideoUI:
         self.quality_bg: Optional[List[float]] = None      # background ratio per frame
         self.quality_overlap: Optional[List[float]] = None  # overlap ratio per frame
         self.quality_inter: Optional[List[float]] = None    # inter-frame change ratio per frame
+        # Per-concept metrics ({concept_name: [per-frame ...]}) when the metrics
+        # file was written by the per-concept version; None for older files.
+        self.quality_overlap_by_group: Optional[dict] = None
+        self.quality_inter_by_group: Optional[dict] = None
+        # Global all-concepts-combined fallback tracks (older files / unknown concept).
+        self._quality_overlap_global: Optional[List[float]] = None
+        self._quality_inter_global: Optional[List[float]] = None
+        # Which concept the Overlap/Change bars currently show (None = global).
+        self._quality_bars_concept: Optional[str] = None
         # When True, _draw_quality_colorbars() redraws bars from scratch; otherwise
         # only the playhead is moved (same fast-path logic as _presence_bar_dirty).
         self._quality_bars_dirty: bool = True
@@ -1365,6 +1374,44 @@ class SAM3VideoUI:
         finally:
             self._updating_tree = False
 
+    def _select_instance_in_tree(self, concept_name: str, obj_id: int) -> bool:
+        """Select concept+instance in the tree and fully sync UI state.
+
+        Like _select_instance_for_undo() but also updates selected_instances,
+        the selection label and the per-concept quality bars.  Used after
+        operations that replace the selected instance (merge, absorb) so the
+        result stays highlighted.  Caller is responsible for display_frame().
+        Returns True if the instance was found and selected.
+        """
+        if not self.project:
+            return False
+        concept = self.project.get_concept_by_name(concept_name)
+        if not concept:
+            return False
+        inst = next((i for i in concept.instances
+                     if i.sam3_obj_id == obj_id and not i.deleted), None)
+        if not inst:
+            return False
+        self.selected_concept = concept
+        self.selected_instance = inst
+        self.selected_instances = [(concept, inst)]
+        self.selected_label.config(text=f"{inst.user_name} (ID: {inst.sam3_obj_id})")
+        self._updating_tree = True
+        try:
+            for concept_item in self.concept_tree.get_children():
+                for inst_item in self.concept_tree.get_children(concept_item):
+                    tags = self.concept_tree.item(inst_item, 'tags')
+                    if (len(tags) >= 3 and tags[0] == 'instance'
+                            and tags[1] == concept_name
+                            and int(tags[2]) == obj_id):
+                        self.concept_tree.selection_set(inst_item)
+                        self.concept_tree.see(inst_item)
+                        break
+        finally:
+            self._updating_tree = False
+        self._refresh_concept_quality_bars(redraw=False)
+        return True
+
     def _update_points_cache(self):
         """Sync refinement_points + refinement_boxes → caches for the current frame/instance."""
         key = self._instance_key()
@@ -1615,20 +1662,66 @@ class SAM3VideoUI:
     # ============================================================
 
     def _load_quality_metrics(self, project_dir: str):
-        """Load quality_metrics.npz from project_dir into self.quality_bg/overlap."""
+        """Load quality_metrics.npz from project_dir into self.quality_bg/overlap.
+
+        The Overlap and Change bars are per-concept: they follow the currently
+        selected concept (see _refresh_concept_quality_bars()).  The Background
+        bar is always the single global track.  Older metrics files without
+        per-concept data fall back to the global all-concepts-combined track.
+        """
         try:
-            from utils import load_quality_metrics
-            inter, bg, overlap = load_quality_metrics(project_dir)
-            self.quality_bg = bg
-            self.quality_overlap = overlap
-            self.quality_inter = inter
+            from utils import load_quality_metrics_grouped
+            data = load_quality_metrics_grouped(project_dir)
+            if data is None:
+                self.quality_bg = None
+                self.quality_overlap_by_group = None
+                self.quality_inter_by_group = None
+                self._quality_overlap_global = None
+                self._quality_inter_global = None
+            else:
+                self.quality_bg = data['background_ratios']
+                self.quality_overlap_by_group = data['overlap_ratios_by_group']
+                self.quality_inter_by_group = data['inter_frame_changes_by_group']
+                # Fallback track for older files / concepts missing from the file.
+                self._quality_overlap_global = data['overlap_ratios']
+                self._quality_inter_global = data['inter_frame_changes']
         except Exception as e:
             print(f"[quality] Could not load metrics: {e}")
             self.quality_bg = None
-            self.quality_overlap = None
-            self.quality_inter = None
+            self.quality_overlap_by_group = None
+            self.quality_inter_by_group = None
+            self._quality_overlap_global = None
+            self._quality_inter_global = None
+        self._refresh_concept_quality_bars(redraw=True)
+
+    def _refresh_concept_quality_bars(self, redraw: bool = True):
+        """Point the Overlap/Change bars at the currently selected concept.
+
+        When per-concept metrics exist and a concept is selected, show that
+        concept's tracks; otherwise fall back to the global combined tracks.
+        The Background bar is unaffected (always global).
+        """
+        name = self.selected_concept.name if self.selected_concept else None
+        overlap_by_group = self.quality_overlap_by_group or {}
+        key = name if name in overlap_by_group else None
+
+        # No-op when the displayed concept hasn't changed — avoids marking the
+        # bars dirty (and forcing a full background regen) on every tree click,
+        # frame step, or playback tick that re-runs selection logic.
+        if key == getattr(self, "_quality_bars_concept", "__unset__") and not redraw:
+            return
+        self._quality_bars_concept = key
+
+        if key is not None:
+            self.quality_overlap = overlap_by_group[key]
+            self.quality_inter = (self.quality_inter_by_group or {}).get(key)
+        else:
+            self.quality_overlap = self._quality_overlap_global
+            self.quality_inter = self._quality_inter_global
+
         self._quality_bars_dirty = True
-        self._draw_quality_colorbars()
+        if redraw:
+            self._draw_quality_colorbars()
 
     def _draw_quality_colorbars(self):
         """Render the overlap, background-ratio, and inter-frame change colorbars with a playhead.
@@ -2967,6 +3060,7 @@ class SAM3VideoUI:
         self.name_entry.delete(0, tk.END)
         self.name_entry.insert(0, target_inst.user_name)
         self._update_name_combobox_values()
+        self._refresh_concept_quality_bars(redraw=False)
         self._mark_presence_dirty()
         self._load_annotations_for_current_frame()
 
@@ -3028,6 +3122,9 @@ class SAM3VideoUI:
 
         self._update_name_combobox_values()
         self._update_session_status()
+        # Overlap/Change colorbars track the selected concept; redraw happens in
+        # the display_frame() / _go_to_frame() call below.
+        self._refresh_concept_quality_bars(redraw=False)
         self._mark_presence_dirty()
         self._load_annotations_for_current_frame()
         if not self._updating_tree:
@@ -4584,6 +4681,8 @@ class SAM3VideoUI:
 
         self._metadata_dirty = True
         self.update_concept_tree()
+        # The source is now deleted; keep the surviving target highlighted.
+        self._select_instance_in_tree(target.concept_name, target.sam3_obj_id)
         self.compositor = DynamicFrameCompositor(self.project)
         self.display_frame()
 
@@ -4818,7 +4917,8 @@ class SAM3VideoUI:
 
                 # Close dialog and refresh
                 self.root.after(0, progress_dialog.close)
-                self.root.after(0, self._merge_complete, new_name)
+                self.root.after(0, self._merge_complete, new_name,
+                                concept.name, merged_instance.sam3_obj_id)
 
             except Exception as e:
                 import traceback
@@ -4834,10 +4934,13 @@ class SAM3VideoUI:
         thread = threading.Thread(target=merge_thread, daemon=True)
         thread.start()
 
-    def _merge_complete(self, new_name: str):
+    def _merge_complete(self, new_name: str, concept_name: str = None, merged_id: int = None):
         """Called when merge completes"""
         self._invalidate_presence_cache()
         self.update_concept_tree()
+        # Keep the merged instance highlighted (the source instances are gone).
+        if concept_name is not None and merged_id is not None:
+            self._select_instance_in_tree(concept_name, merged_id)
         self.compositor = DynamicFrameCompositor(self.project)  # Refresh compositor
         self.display_frame()
         self.status_var.set(f"Instances merged into '{new_name}'.")
