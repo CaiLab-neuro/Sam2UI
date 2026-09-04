@@ -1500,11 +1500,21 @@ class QualityMetricsCalculator:
         Rationale:
           - Background ratio measures how much of the frame is segmented at all;
             a single global number is the meaningful summary.
-          - Inter-frame change and overlap are only meaningful *within* a category.
-            Different concepts are legitimately expected to overlap (e.g. "person"
-            and "shirt"), so a global overlap metric mostly measures expected
-            co-occurrence rather than segmentation error.  Likewise a jittery
-            concept should not be averaged away by a stable one.
+          - Inter-frame change is only meaningful *within* a category; a jittery
+            concept should not be averaged away by a stable one.  The per-concept
+            track is normalized by that concept's peak single-frame area (max over
+            all frames of |union of its instances|) rather than by the total frame
+            pixel count, so concepts are comparable regardless of how much of the
+            frame they cover.  The global 'inter_frame_changes' track keeps the
+            old frame-pixel normalization for backward compatibility.
+          - Overlap is measured per concept as a one-vs-rest cross-concept ratio:
+            the fraction of that concept's segmented area that is also claimed by
+            at least one *other* concept.  Within-concept overlap is not measured
+            because SAM3 already enforces pixel-wise mutual exclusivity among the
+            instances of a single concept (Sam3VideoInference._postprocess_output
+            calls _apply_object_wise_non_overlapping_constraints unconditionally),
+            so it is ~0 by construction.  A global excess-assignment overlap track
+            is still returned under 'overlap_ratios' for backward compatibility.
 
         Args:
             masks: {frame_idx: {obj_id: mask_data}}
@@ -1516,10 +1526,18 @@ class QualityMetricsCalculator:
             'inter_frame_changes':          [float] * num_frames  (global aggregate,
                                              identical semantics to calculate(); kept
                                              for backward compatibility)
-            'overlap_ratios':               [float] * num_frames  (global aggregate)
+            'overlap_ratios':               [float] * num_frames  (global excess-
+                                             assignment aggregate, backward compat)
             'group_names':                  [group_key, ...]  (stable order)
             'inter_frame_changes_by_group': {group_key: [float] * num_frames}
+                                             changed concept-label pixels between
+                                             consecutive frames / max single-frame
+                                             union area of that concept
             'overlap_ratios_by_group':      {group_key: [float] * num_frames}
+                                             one-vs-rest cross-concept ratio:
+                                             |concept_area ∩ (claimed by another
+                                             concept)| / |concept_area|; 0.0 when
+                                             the concept is absent on that frame
         """
         print("Calculating segmentation quality metrics (per-concept)...")
 
@@ -1531,7 +1549,13 @@ class QualityMetricsCalculator:
         bg_ratios: List[float] = []
         inter_global: List[float] = []
         overlap_global: List[float] = []
-        inter_by_group: Dict[Any, List[float]] = {g: [] for g in group_names}
+        # Per-concept inter-frame change is stored as a raw changed-pixel count here
+        # and normalized after the loop by that concept's *peak* single-frame area
+        # (max over all frames of |union of the concept's instances|).  Dividing by a
+        # per-concept constant makes concepts comparable regardless of size, without
+        # the small-frame blow-up a per-frame-union denominator would cause.
+        inter_raw_by_group: Dict[Any, List[float]] = {g: [] for g in group_names}
+        max_union_area: Dict[Any, int] = {g: 0 for g in group_names}
         overlap_by_group: Dict[Any, List[float]] = {g: [] for g in group_names}
 
         prev_global: Optional[np.ndarray] = None
@@ -1542,9 +1566,6 @@ class QualityMetricsCalculator:
             global_overlap_count = np.zeros((self.height, self.width), dtype=np.int32)
             group_combined = {
                 g: np.zeros((self.height, self.width), dtype=np.uint16) for g in group_names
-            }
-            group_overlap_count = {
-                g: np.zeros((self.height, self.width), dtype=np.int32) for g in group_names
             }
 
             if frame_idx in masks:
@@ -1565,7 +1586,11 @@ class QualityMetricsCalculator:
                     g = group_of.get(obj_id)
                     if g in group_combined:
                         group_combined[g][hit] = obj_id
-                        group_overlap_count[g][hit] += 1
+
+            # Number of *distinct concepts* covering each pixel (for one-vs-rest overlap)
+            concept_coverage_count = np.zeros((self.height, self.width), dtype=np.int32)
+            for g in group_names:
+                concept_coverage_count += (group_combined[g] > 0)
 
             # Global background ratio
             object_pixels = np.count_nonzero(global_combined)
@@ -1584,14 +1609,30 @@ class QualityMetricsCalculator:
             # Per-group metrics
             for g in group_names:
                 gc = group_combined[g]
-                g_excess = np.where(group_overlap_count[g] > 0, group_overlap_count[g] - 1, 0)
-                overlap_by_group[g].append(float(np.sum(g_excess) / self.total_pixels))
-                if prev_by_group[g] is None:
-                    inter_by_group[g].append(0.0)
+                union = gc > 0
+                area = int(np.count_nonzero(union))
+                if area > max_union_area[g]:
+                    max_union_area[g] = area
+                if area == 0:
+                    overlap_by_group[g].append(0.0)
                 else:
-                    changed = np.count_nonzero(gc != prev_by_group[g])
-                    inter_by_group[g].append(changed / self.total_pixels)
+                    contested = int(np.count_nonzero(union & (concept_coverage_count >= 2)))
+                    overlap_by_group[g].append(contested / area)
+                if prev_by_group[g] is None:
+                    inter_raw_by_group[g].append(0.0)
+                else:
+                    changed = int(np.count_nonzero(gc != prev_by_group[g]))
+                    inter_raw_by_group[g].append(float(changed))
                 prev_by_group[g] = gc.copy()
+
+        # Normalize per-concept inter-frame change by the concept's peak area
+        inter_by_group: Dict[Any, List[float]] = {}
+        for g in group_names:
+            denom = max_union_area[g]
+            if denom > 0:
+                inter_by_group[g] = [c / denom for c in inter_raw_by_group[g]]
+            else:
+                inter_by_group[g] = [0.0 for _ in inter_raw_by_group[g]]
 
         print(f"Calculated per-concept metrics for {self.num_frames} frames, "
               f"{len(group_names)} concept(s)")

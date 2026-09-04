@@ -25,6 +25,32 @@ from sam3_project import (
 from sam3_utils import ensure_frames_extracted
 
 
+def ensure_bf16_autocast():
+    """Guarantee CUDA bf16 autocast is active on the current thread.
+
+    SAM3's tracker enters a process-wide ``torch.autocast`` in its ``__init__``
+    (``bf16_context.__enter__()``, "keep using for the entire model process").
+    But autocast state is *thread-local*, so a worker thread that calls into the
+    model after the thread which built it (e.g. the SAM3 UI spawns a fresh
+    ``threading.Thread`` per operation) runs with autocast disabled and hits
+    "mat1 and mat2 must have the same dtype, but got BFloat16 and Float" — the
+    model's internal maskmem tensors stay bf16 regardless of autocast.
+
+    Call this at the start of any thread that will invoke the SAM3 model. The
+    entered context is intentionally never exited (matching SAM3's own pattern);
+    the UI's worker threads are short-lived and single-purpose.
+    """
+    try:
+        already = torch.is_autocast_enabled("cuda")
+    except TypeError:  # older torch: no device-string arg
+        already = torch.is_autocast_enabled()
+    if already:
+        return None
+    ctx = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+    ctx.__enter__()
+    return ctx
+
+
 def _prune_non_cond_outputs(
     inner_state: dict,
     frame_idx: int,

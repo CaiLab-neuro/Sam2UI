@@ -940,8 +940,9 @@ def handle_quality_metrics(args):
     print(f"Found {len(obj_id_to_info)} object(s) across {len(masks_by_frame)} frame(s).")
     width, height = project.frame_dimensions
 
-    # Inter-frame change and overlap are computed per concept (different concepts
-    # are legitimately allowed to overlap); background ratio stays global.
+    # Inter-frame change is computed per concept; overlap is a per-concept
+    # one-vs-rest cross-concept ratio (fraction of the concept's area also claimed
+    # by another concept). Background ratio stays global.
     obj_id_to_group = {oid: info["concept"] for oid, info in obj_id_to_info.items()}
     result = calculate_quality_metrics_grouped(
         masks=masks_by_frame,
@@ -958,10 +959,12 @@ def handle_quality_metrics(args):
     print(f"Background ratio         (mean, global): {_mean(result['background_ratios']):.3f}")
     for g in result['group_names']:
         print(f"Concept '{g}':")
-        print(f"  Inter-frame change (mean): {_mean(result['inter_frame_changes_by_group'][g]):.3f}")
-        print(f"  Overlap ratio      (mean): {_mean(result['overlap_ratios_by_group'][g]):.3f}")
+        print(f"  Inter-frame change     (mean): {_mean(result['inter_frame_changes_by_group'][g]):.3f}")
+        print(f"  Overlap vs other concepts (mean): {_mean(result['overlap_ratios_by_group'][g]):.3f}")
+    _grp_overlap_means = [_mean(result['overlap_ratios_by_group'][g]) for g in result['group_names']]
     print(f"Inter-frame change (mean, all concepts combined): {_mean(result['inter_frame_changes']):.3f}")
-    print(f"Overlap ratio      (mean, all concepts combined): {_mean(result['overlap_ratios']):.3f}")
+    print(f"Overlap vs other concepts (mean over concepts): {_mean(_grp_overlap_means):.3f}")
+    print(f"Global excess-assignment overlap (backward-compat): {_mean(result['overlap_ratios']):.3f}")
     print(f"Saved: {os.path.join(args.project, 'quality_metrics.npz')}")
     return 0
 

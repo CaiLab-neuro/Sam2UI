@@ -25,6 +25,7 @@ from typing import Optional, Dict, List
 import threading
 import time as _time
 import torch
+import gaze_overlay
 
 # Lightweight performance logger — remove when profiling is done.
 _PERF_LOG: Dict[str, float] = {}
@@ -58,7 +59,7 @@ from sam3_pipeline import (
     load_sam3_model, get_video_info,
     process_concept_detection,
     compute_continuous_periods, online_replay_concept_refinements,
-    replay_concept_refinements,
+    replay_concept_refinements, ensure_bf16_autocast,
 )
 from sam3_utils import DynamicFrameCompositor, generate_concept_color, validate_text_prompt, export_to_sam2_format, load_sam3_mask
 
@@ -108,6 +109,7 @@ class SAM3VideoUI:
         self.num_frames = 0
         self.frame_dimensions = (0, 0)
         self.fps = 0.0
+        self.gaze_points_by_frame = None  # {frame_idx: [(x, y), ...]} from a loaded gaze CSV
 
         # UI state
         self.selected_concept: Optional[SAM3Concept] = None
@@ -303,6 +305,8 @@ class SAM3VideoUI:
         file_menu.add_command(label="Load Video", command=self.load_video)
         file_menu.add_command(label="Load Project", command=self.load_project)
         file_menu.add_command(label="Save Project (Metadata Only)", command=self.save_project)
+        file_menu.add_separator()
+        file_menu.add_command(label="Load Gaze CSV...", command=self.load_gaze_csv)
         file_menu.add_separator()
         file_menu.add_command(label="Extract Frames to Project...",
                               command=self.extract_frames_to_project)
@@ -2229,6 +2233,42 @@ class SAM3VideoUI:
             if self._export_btn:
                 self._export_btn.config(text="Export Video")
 
+    def load_gaze_csv(self):
+        """Load a gaze CSV + world-timestamps CSV and overlay the gaze position."""
+        if self.gaze_points_by_frame is not None:
+            choice = messagebox.askyesnocancel(
+                "Gaze Data Loaded",
+                f"Gaze data is already loaded ({len(self.gaze_points_by_frame)} frames).\n\n"
+                "Yes = load a different pair of CSVs\nNo = clear the current gaze overlay",
+            )
+            if choice is None:
+                return
+            if choice is False:
+                self.gaze_points_by_frame = None
+                self.display_frame()
+                return
+
+        gaze_path = filedialog.askopenfilename(
+            title="Select gaze CSV (timestamp [ns], gaze x [px], gaze y [px])",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")])
+        if not gaze_path:
+            return
+        world_path = filedialog.askopenfilename(
+            title="Select world-timestamps CSV (one row per video frame, timestamp [ns])",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")])
+        if not world_path:
+            return
+
+        try:
+            mapping = gaze_overlay.load_gaze_csv(gaze_path, world_path)
+        except Exception as e:
+            messagebox.showerror("Load Gaze CSV Failed", str(e))
+            return
+
+        self.gaze_points_by_frame = mapping
+        messagebox.showinfo("Gaze CSV Loaded", gaze_overlay.summarize(mapping))
+        self.display_frame()
+
     def load_video(self):
         """Load a video file or image and create new project"""
 
@@ -2287,6 +2327,10 @@ class SAM3VideoUI:
                 is_image=is_image,
                 frames_dir=frames_dir,
             )
+
+            # Carry over any vocabulary already loaded in this session
+            if self.vocabulary_path:
+                self.project.vocabulary_path = self.vocabulary_path
 
             # Save project
             self._safe_project_save()
@@ -2395,6 +2439,20 @@ class SAM3VideoUI:
             self.selected_instances = []
             self.update_concept_tree()
             self._auto_select_first_instance()
+
+            # Auto-load the vocabulary file linked to this project, if any.
+            # load_vocabulary() re-reads the file, so external edits are picked up.
+            self.vocabulary = {}
+            self.vocabulary_path = None
+            linked_vocab = getattr(self.project, "vocabulary_path", None)
+            if linked_vocab:
+                if os.path.isfile(linked_vocab):
+                    self.load_vocabulary(linked_vocab, link_to_project=False)
+                else:
+                    self.status_var.set(
+                        f"Linked vocabulary not found: {os.path.basename(linked_vocab)}"
+                    )
+
             _tp4 = _time.perf_counter()
             self.display_frame()
             _tp5 = _time.perf_counter()
@@ -2471,7 +2529,7 @@ class SAM3VideoUI:
         if stale:
             _warn(
                 "Project Changed On Disk",
-                "This project was modified on disk since it was loaded here — likely by "
+                "This project was modified on disk since it was loaded here - likely by "
                 "a batch refinement job that finished while this window was open. Saving "
                 "now would overwrite those results.\n\n"
                 "Click 'Reload Project', then redo your change."
@@ -2721,9 +2779,12 @@ class SAM3VideoUI:
                 if wiz['mode'] == 'point':
                     for wx, wy, wpos in self._wizard_pending_points:
                         wpx, wpy = int(wx * _scale_x), int(wy * _scale_y)
-                        wcol = (0, 255, 0) if wpos else (255, 0, 0)
-                        cv2.circle(frame_rgb, (wpx, wpy), 5, wcol, -1)
                         cv2.circle(frame_rgb, (wpx, wpy), 7, (255, 255, 255), 2)
+                        if wpos:
+                            cv2.circle(frame_rgb, (wpx, wpy), 5, (60, 220, 90), -1)
+                        else:
+                            cv2.circle(frame_rgb, (wpx, wpy), 5, (150, 20, 20), 2)
+                            cv2.circle(frame_rgb, (wpx, wpy), 2, (150, 20, 20), -1)
                     for bx1, by1, bx2, by2 in self._wizard_pending_boxes:
                         cv2.rectangle(frame_rgb,
                                       (int(bx1 * _scale_x), int(by1 * _scale_y)),
@@ -2809,11 +2870,17 @@ class SAM3VideoUI:
                 halo = radius + 2
                 for x, y, is_pos in self.refinement_points:
                     px, py = int(x * _scale_x), int(y * _scale_y)
-                    color = (0, 255, 0) if is_pos else (255, 0, 0)
+                    # Colour-blind safe: positive and negative differ in luminance AND
+                    # shape (bright filled dot vs. dark hollow ring), not hue alone.
                     if flash_pts:
                         cv2.circle(frame_rgb, (px, py), halo + 3, (255, 255, 255), 3)
-                    cv2.circle(frame_rgb, (px, py), radius, color, -1)
-                    cv2.circle(frame_rgb, (px, py), halo, (255, 255, 255), 2)
+                    if is_pos:
+                        cv2.circle(frame_rgb, (px, py), radius, (60, 220, 90), -1)   # bright green, filled
+                        cv2.circle(frame_rgb, (px, py), halo, (255, 255, 255), 2)
+                    else:
+                        cv2.circle(frame_rgb, (px, py), halo, (255, 255, 255), 2)   # white halo ring
+                        cv2.circle(frame_rgb, (px, py), radius, (150, 20, 20), 2)   # dark red ring (hollow)
+                        cv2.circle(frame_rgb, (px, py), max(1, radius // 3), (150, 20, 20), -1)
                 for x1, y1, x2, y2 in self.refinement_boxes:
                     cv2.rectangle(frame_rgb,
                                   (int(x1 * _scale_x), int(y1 * _scale_y)),
@@ -2823,6 +2890,13 @@ class SAM3VideoUI:
                                   (int(x1 * _scale_x) - 1, int(y1 * _scale_y) - 1),
                                   (int(x2 * _scale_x) + 1, int(y2 * _scale_y) + 1),
                                   (255, 255, 255), 1)
+
+            # Gaze position overlay (gaze x/y are in native video coords -> scale to display)
+            if self.gaze_points_by_frame:
+                gaze_pts = self.gaze_points_by_frame.get(self.current_frame_idx)
+                if gaze_pts:
+                    frame_rgb = np.ascontiguousarray(frame_rgb).copy()
+                    gaze_overlay.draw_gaze_marker(frame_rgb, gaze_pts, _scale_x, _scale_y)
 
             # Wrap in PIL — compositor already returned at canvas size, no resize needed.
             # Fallback PIL resize only when canvas wasn't ready (target_hw is None).
@@ -3248,6 +3322,9 @@ class SAM3VideoUI:
 
         def process_thread():
             try:
+                # SAM3's process-wide bf16 autocast is thread-local; re-enter it
+                # on this worker thread or the model hits bf16/float32 mismatches.
+                ensure_bf16_autocast()
                 # Release any other live sessions before starting (GPU memory)
                 for other_name in list(self.active_sessions.keys()):
                     if other_name != concept_name:
@@ -3337,7 +3414,7 @@ class SAM3VideoUI:
         self.project.add_concept(concept)
         self.project.save()
         self.update_concept_tree()
-        self.status_var.set(f"Concept '{concept_name}' saved (pending — run sam3_process.py to detect).")
+        self.status_var.set(f"Concept '{concept_name}' saved (pending - run sam3_process.py to detect).")
         messagebox.showinfo(
             "Saved",
             f"Concept '{concept_name}' saved as pending.\n\n"
@@ -3759,8 +3836,12 @@ class SAM3VideoUI:
             vocab = self.vocabulary.get(self.selected_concept.name, [])
         self.name_entry['values'] = vocab
 
-    def load_vocabulary(self, path: Optional[str] = None):
-        """Load a vocabulary JSON file (concept_name -> [instance names])."""
+    def load_vocabulary(self, path: Optional[str] = None, link_to_project: bool = True):
+        """Load a vocabulary JSON file (concept_name -> [instance names]).
+
+        When link_to_project is True and a project is open, the path is stored in
+        project.json so it is auto-loaded next time the project is opened.
+        """
         if path is None:
             path = filedialog.askopenfilename(
                 title="Load Vocabulary File",
@@ -3777,8 +3858,20 @@ class SAM3VideoUI:
             self.vocabulary_path = path
             self._update_name_combobox_values()
             self.status_var.set(f"Vocabulary loaded: {os.path.basename(path)}")
+            if link_to_project and self.project is not None:
+                if getattr(self.project, "vocabulary_path", None) != path:
+                    self.project.vocabulary_path = path
+                    self._metadata_dirty = True
         except Exception as e:
             messagebox.showerror("Error", f"Failed to load vocabulary:\n{e}")
+
+    def _link_vocabulary_to_project(self):
+        """Record self.vocabulary_path in the open project so it auto-loads next time."""
+        if self.project is None or not self.vocabulary_path:
+            return
+        if getattr(self.project, "vocabulary_path", None) != self.vocabulary_path:
+            self.project.vocabulary_path = self.vocabulary_path
+            self._metadata_dirty = True
 
     def save_vocabulary(self):
         """Save vocabulary to the current path (prompts for path if none set)."""
@@ -3803,6 +3896,7 @@ class SAM3VideoUI:
             return
         self.vocabulary_path = path
         self.save_vocabulary()
+        self._link_vocabulary_to_project()
 
     def edit_vocabulary_dialog(self):
         """Open the vocabulary editor dialog."""
@@ -4286,7 +4380,7 @@ class SAM3VideoUI:
             period_start, period_end = wiz['target_period']
             title = f"Wizard (2/2): confirm mask for TARGET '{inst.user_name}'"
 
-        instr = (f"Frames {period_start}–{period_end}. Confirm the frame "
+        instr = (f"Frames {period_start}-{period_end}. Confirm the frame "
                  "where the mask cleanly covers the object (no bleed, not blurry). "
                  "Or 'Add point instead' to place a point manually.")
 
@@ -4312,7 +4406,7 @@ class SAM3VideoUI:
             self._wizard_banner.pack(fill=tk.X, padx=5, pady=2, after=self.canvas)
 
         self.status_var.set(
-            f"Wizard: navigate within {period_start}–{period_end}, "
+            f"Wizard: navigate within {period_start}-{period_end}, "
             f"then 'Use this mask' or 'Add point instead'."
         )
 
@@ -6191,7 +6285,7 @@ class SAM3VideoUI:
                     and not os.path.exists(self.project.video_path)):
                 from tkinter import filedialog
                 video_for_extraction = filedialog.askopenfilename(
-                    title="Video not found — locate source video for frame extraction",
+                    title="Video not found - locate source video for frame extraction",
                     filetypes=[
                         ("Video files", "*.mp4 *.avi *.mov *.mkv *.webm *.m4v"),
                         ("All files", "*.*"),
@@ -6213,6 +6307,9 @@ class SAM3VideoUI:
 
         def refine_thread():
             try:
+                # SAM3's process-wide bf16 autocast is thread-local; re-enter it
+                # on this worker thread or the model hits bf16/float32 mismatches.
+                ensure_bf16_autocast()
                 from sam3_utils import extract_frames_from_video
 
                 # Load model if needed
@@ -6928,7 +7025,7 @@ class ExportSAM2Dialog:
                  state="readonly").pack(side=tk.LEFT, padx=5)
         tk.Button(csv_frame, text="Load CSV...", command=self._pick_csv).pack(side=tk.LEFT, padx=2)
         tk.Button(csv_frame, text="Clear", command=self._clear_csv).pack(side=tk.LEFT, padx=2)
-        tk.Label(csv_frame, text="(optional — enables name matching)",
+        tk.Label(csv_frame, text="(optional - enables name matching)",
                  fg="gray", font=("Arial", 8)).pack(side=tk.LEFT, padx=6)
 
         # Instance table (LabelFrame so we can retitle it)
@@ -7441,7 +7538,7 @@ class AbsorbInstanceDialog:
         tk.Label(self.top,
                  text="SAM3 will be guided by a positive point at the centroid of\n"
                       "this instance's most-visible frame in its FIRST period\n"
-                      "(later periods are ignored — they may have drifted), then\n"
+                      "(later periods are ignored - they may have drifted), then\n"
                       "the chosen target below will be re-propagated. You will be\n"
                       "asked whether to delete this instance afterward. Make sure\n"
                       "the first appearance is really the same object as the target.",
@@ -7470,7 +7567,7 @@ class AbsorbInstanceDialog:
 
         if has_higher_id:
             tk.Label(self.top,
-                     text="Grayed entries have a higher ID than the source — they were\n"
+                     text="Grayed entries have a higher ID than the source - they were\n"
                           "detected later and absorbing into them is less reliable.",
                      font=("Arial", 8), fg="#aaaaaa", justify=tk.LEFT).pack(padx=10, anchor=tk.W)
 
@@ -7732,7 +7829,7 @@ class EditPromptDialog:
         self.ui = ui
         self.concept = concept
         self.top = tk.Toplevel(parent)
-        self.top.title(f"Edit Prompt — {concept.name}")
+        self.top.title(f"Edit Prompt - {concept.name}")
         self.top.geometry("420x180")
         self.top.transient(parent)
         self.top.grab_set()
@@ -7813,7 +7910,7 @@ class VocabularyEditorDialog:
         tk.Label(
             self.top,
             text="Map concept names to allowed instance names. "
-                 "Users can still type freely — the list is a suggestion menu.",
+                 "Users can still type freely - the list is a suggestion menu.",
             font=("Arial", 9), fg="gray", wraplength=680, justify=tk.LEFT
         ).pack(fill=tk.X, padx=10, pady=(8, 4))
 
@@ -8041,6 +8138,7 @@ class VocabularyEditorDialog:
                 raise ValueError("Expected a JSON object at top level")
             self._vocab = {str(k): list(v) for k, v in data.items()}
             self.ui.vocabulary_path = path
+            self.ui._link_vocabulary_to_project()
             self._refresh_concept_list()
         except Exception as e:
             messagebox.showerror("Error", f"Failed to load:\n{e}", parent=self.top)
@@ -8060,6 +8158,7 @@ class VocabularyEditorDialog:
             with open(path, 'w') as f:
                 json.dump(self._vocab, f, indent=2)
             self.ui.vocabulary_path = path
+            self.ui._link_vocabulary_to_project()
             messagebox.showinfo("Saved", f"Vocabulary saved to:\n{path}", parent=self.top)
         except Exception as e:
             messagebox.showerror("Error", f"Failed to save:\n{e}", parent=self.top)

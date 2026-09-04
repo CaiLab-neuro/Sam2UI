@@ -19,6 +19,7 @@ import re
 import argparse
 import colorsys
 from collections import deque
+import gaze_overlay
 
 # Import utility functions
 from utils import (
@@ -234,6 +235,7 @@ class SAM2VideoUI:
         self.zoom_center_img_y = 0.5  # Zoom center as fraction of image height (0.0-1.0)
 
         self.click_points = []  # Store click coordinates with object IDs
+        self.gaze_points_by_frame = None  # {frame_idx: [(x, y), ...]} from a loaded gaze CSV
         self.masks = {}  # Store masks for each frame {frame_idx: {obj_id: mask}}
         self.has_segmentation = False  # Track if segmentation has been completed or loaded
         self.playing = False
@@ -524,7 +526,11 @@ class SAM2VideoUI:
                   command=self.import_annotations, width=15).pack(fill=tk.X, pady=2)
         ttk.Button(file_frame, text="Export Annotations",
                   command=self.export_annotations, width=15).pack(fill=tk.X, pady=2)
-        
+
+        self.gaze_button = ttk.Button(file_frame, text="Load Gaze CSV",
+                  command=self.load_gaze_csv, width=15)
+        self.gaze_button.pack(fill=tk.X, pady=2)
+
         # Object Annotation
         obj_frame = ttk.LabelFrame(scrollable_frame, text="Object Annotation", padding=10)
         obj_frame.pack(fill=tk.X, pady=(0, 10))
@@ -1313,6 +1319,44 @@ class SAM2VideoUI:
         except Exception as e:
             messagebox.showerror("Export Error", f"Failed to export object list: {str(e)}")
     
+    def load_gaze_csv(self):
+        """Load a gaze CSV + world-timestamps CSV and overlay the gaze position."""
+        if self.gaze_points_by_frame is not None:
+            choice = messagebox.askyesnocancel(
+                "Gaze Data Loaded",
+                f"Gaze data is already loaded ({len(self.gaze_points_by_frame)} frames).\n\n"
+                "Yes = load a different pair of CSVs\nNo = clear the current gaze overlay",
+            )
+            if choice is None:
+                return
+            if choice is False:
+                self.gaze_points_by_frame = None
+                self.gaze_button.config(text="Load Gaze CSV")
+                self.display_current_frame()
+                return
+
+        gaze_path = filedialog.askopenfilename(
+            title="Select gaze CSV (timestamp [ns], gaze x [px], gaze y [px])",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")])
+        if not gaze_path:
+            return
+        world_path = filedialog.askopenfilename(
+            title="Select world-timestamps CSV (one row per video frame, timestamp [ns])",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")])
+        if not world_path:
+            return
+
+        try:
+            mapping = gaze_overlay.load_gaze_csv(gaze_path, world_path)
+        except Exception as e:
+            messagebox.showerror("Load Gaze CSV Failed", str(e))
+            return
+
+        self.gaze_points_by_frame = mapping
+        self.gaze_button.config(text="Gaze CSV: reload / clear")
+        messagebox.showinfo("Gaze CSV Loaded", gaze_overlay.summarize(mapping))
+        self.display_current_frame()
+
     def export_annotations(self):
         """Export click point annotations to JSON file"""
         if not self.click_points:
@@ -3813,6 +3857,12 @@ class SAM2VideoUI:
                             (int(x + line_length), int(y)),
                             (255, 255, 255), line_thickness)
 
+        # Gaze position overlay (drawn in native image coords; scaled with the frame)
+        if self.gaze_points_by_frame:
+            gaze_pts = self.gaze_points_by_frame.get(self.current_frame_idx)
+            if gaze_pts:
+                gaze_overlay.draw_gaze_marker(display_frame, gaze_pts)
+
         # Convert to PIL and display
         pil_image = Image.fromarray(display_frame)
 
@@ -4129,7 +4179,7 @@ class SAM2VideoUI:
 
         if self.current_object_id in self.sam3_object_ids:
             self.status_label.config(
-                text=f"Object {self.current_object_id} was segmented by SAM3 — select a different object to annotate.")
+                text=f"Object {self.current_object_id} was segmented by SAM3 - select a different object to annotate.")
             return
 
         # Get canvas coordinates
@@ -5407,8 +5457,8 @@ class SAM2VideoUI:
             _use_npz = messagebox.askyesno(
                 "Mask Output Format",
                 "Save masks as NPZ bundles?\n\n"
-                "[Yes] NPZ  — one compressed file per frame (~5× smaller)\n"
-                "[No]  PNG  — one file per object per frame (default)"
+                "[Yes] NPZ  - one compressed file per frame (~5x smaller)\n"
+                "[No]  PNG  - one file per object per frame (default)"
             )
             _mask_format = "npz" if _use_npz else "png"
             print(f"Mask format chosen by user: {_mask_format.upper()}")
@@ -6060,7 +6110,7 @@ class SAM2VideoUI:
                 messagebox.showwarning(
                     "No Updated Annotations",
                     f"No updated annotation points found in frames "
-                    f"{start_frame + 1}–{end_frame + 1}.\n\n"
+                    f"{start_frame + 1}-{end_frame + 1}.\n\n"
                     f"All objects in this range are unchanged since the last segmentation. "
                     f"No re-segmentation needed."
                 )
