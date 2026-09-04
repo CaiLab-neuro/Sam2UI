@@ -318,6 +318,10 @@ class SAM3Project:
     # The UI auto-loads it on project open (re-reading the file each time, so external
     # edits are picked up). None if no vocabulary has been linked.
     vocabulary_path: Optional[str] = None
+    # Last gaze CSV / world-timestamps CSV pair loaded for this project. The UI auto-loads
+    # this pair on project open (re-reading the files each time) if both still exist.
+    gaze_csv_path: Optional[str] = None
+    gaze_world_path: Optional[str] = None
     # Alternative locations tried when the primary video/frames paths are unreachable.
     # Populated automatically by the UI when the user manually locates a missing file.
     # Stored as plain strings; paths from other OSes are skipped gracefully at load time.
@@ -405,6 +409,8 @@ class SAM3Project:
             "alt_frames_dirs": self.alt_frames_dirs,
             "is_image": self.is_image,
             "vocabulary_path": self.vocabulary_path,
+            "gaze_csv_path": self.gaze_csv_path,
+            "gaze_world_path": self.gaze_world_path,
             "last_saved": self.last_saved,
             "concepts": [
                 {
@@ -479,6 +485,8 @@ class SAM3Project:
             alt_frames_dirs=project_data.get("alt_frames_dirs", []),
             is_image=project_data.get("is_image", False),
             vocabulary_path=project_data.get("vocabulary_path"),
+            gaze_csv_path=project_data.get("gaze_csv_path"),
+            gaze_world_path=project_data.get("gaze_world_path"),
             last_saved=project_data.get("last_saved"),
             concept_order=project_data.get("concept_order", []),
             device=project_data.get("global_settings", {}).get("device", "cuda:0"),

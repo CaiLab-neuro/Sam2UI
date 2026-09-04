@@ -110,6 +110,8 @@ class SAM3VideoUI:
         self.frame_dimensions = (0, 0)
         self.fps = 0.0
         self.gaze_points_by_frame = None  # {frame_idx: [(x, y), ...]} from a loaded gaze CSV
+        self.gaze_csv_path: Optional[str] = None
+        self.gaze_world_path: Optional[str] = None
 
         # UI state
         self.selected_concept: Optional[SAM3Concept] = None
@@ -223,6 +225,7 @@ class SAM3VideoUI:
         self.focus_mode_var = tk.BooleanVar(value=True)
         self.skip_delete_confirm_var = tk.BooleanVar(value=False)
         self.auto_jump_var = tk.BooleanVar(value=True)
+        self.show_gaze_var = tk.BooleanVar(value=True)
         self.mask_alpha_var = tk.DoubleVar(value=0.5)
 
         # Rate-limit perf diagnostics: print at most once every 2 seconds
@@ -785,6 +788,12 @@ class SAM3VideoUI:
         tk.Checkbutton(display_frame, text="Focus: selected concept only",
                        variable=self.focus_mode_var,
                        command=self.display_frame).pack(anchor=tk.W)
+        self.show_gaze_checkbutton = tk.Checkbutton(
+            display_frame, text="Show gaze point overlay",
+            variable=self.show_gaze_var,
+            command=self.display_frame,
+            state=tk.NORMAL if self.gaze_points_by_frame else tk.DISABLED)
+        self.show_gaze_checkbutton.pack(anchor=tk.W)
 
         # Flash inspection buttons (shortcut: f / o)
         flash_row = tk.Frame(display_frame)
@@ -2233,40 +2242,69 @@ class SAM3VideoUI:
             if self._export_btn:
                 self._export_btn.config(text="Export Video")
 
-    def load_gaze_csv(self):
-        """Load a gaze CSV + world-timestamps CSV and overlay the gaze position."""
-        if self.gaze_points_by_frame is not None:
-            choice = messagebox.askyesnocancel(
-                "Gaze Data Loaded",
-                f"Gaze data is already loaded ({len(self.gaze_points_by_frame)} frames).\n\n"
-                "Yes = load a different pair of CSVs\nNo = clear the current gaze overlay",
-            )
-            if choice is None:
-                return
-            if choice is False:
-                self.gaze_points_by_frame = None
-                self.display_frame()
-                return
+    def load_gaze_csv(self, gaze_path: Optional[str] = None, world_path: Optional[str] = None,
+                       link_to_project: bool = True, silent: bool = False):
+        """Load a gaze CSV + world-timestamps CSV and overlay the gaze position.
 
-        gaze_path = filedialog.askopenfilename(
-            title="Select gaze CSV (timestamp [ns], gaze x [px], gaze y [px])",
-            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")])
-        if not gaze_path:
-            return
-        world_path = filedialog.askopenfilename(
-            title="Select world-timestamps CSV (one row per video frame, timestamp [ns])",
-            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")])
-        if not world_path:
-            return
+        When link_to_project is True and a project is open, the pair of paths is stored in
+        project.json so it is auto-loaded (silently) next time the project is opened.
+        """
+        if gaze_path is None or world_path is None:
+            if self.gaze_points_by_frame is not None:
+                choice = messagebox.askyesnocancel(
+                    "Gaze Data Loaded",
+                    f"Gaze data is already loaded ({len(self.gaze_points_by_frame)} frames).\n\n"
+                    "Yes = load a different pair of CSVs\nNo = clear the current gaze overlay",
+                )
+                if choice is None:
+                    return
+                if choice is False:
+                    self.gaze_points_by_frame = None
+                    self.show_gaze_checkbutton.config(state=tk.DISABLED)
+                    self.display_frame()
+                    return
+
+            initial_dir = os.path.dirname(self.gaze_csv_path) if self.gaze_csv_path else None
+            gaze_path = filedialog.askopenfilename(
+                title="Select gaze CSV (timestamp [ns], gaze x [px], gaze y [px])",
+                initialdir=initial_dir,
+                filetypes=[("CSV files", "*.csv"), ("All files", "*.*")])
+            if not gaze_path:
+                return
+            initial_dir = os.path.dirname(self.gaze_world_path) if self.gaze_world_path else os.path.dirname(gaze_path)
+            world_path = filedialog.askopenfilename(
+                title="Select world-timestamps CSV (one row per video frame, timestamp [ns])",
+                initialdir=initial_dir,
+                filetypes=[("CSV files", "*.csv"), ("All files", "*.*")])
+            if not world_path:
+                return
 
         try:
             mapping = gaze_overlay.load_gaze_csv(gaze_path, world_path)
         except Exception as e:
+            if silent:
+                self.status_var.set(f"Linked gaze CSV failed to load: {e}")
+                return
             messagebox.showerror("Load Gaze CSV Failed", str(e))
             return
 
         self.gaze_points_by_frame = mapping
-        messagebox.showinfo("Gaze CSV Loaded", gaze_overlay.summarize(mapping))
+        self.gaze_csv_path = gaze_path
+        self.gaze_world_path = world_path
+        self.show_gaze_var.set(True)
+        self.show_gaze_checkbutton.config(state=tk.NORMAL)
+
+        if link_to_project and self.project is not None:
+            if (getattr(self.project, "gaze_csv_path", None) != gaze_path
+                    or getattr(self.project, "gaze_world_path", None) != world_path):
+                self.project.gaze_csv_path = gaze_path
+                self.project.gaze_world_path = world_path
+                self._metadata_dirty = True
+
+        if silent:
+            self.status_var.set(f"Gaze CSV auto-loaded: {os.path.basename(gaze_path)}")
+        else:
+            messagebox.showinfo("Gaze CSV Loaded", gaze_overlay.summarize(mapping))
         self.display_frame()
 
     def load_video(self):
@@ -2451,6 +2489,23 @@ class SAM3VideoUI:
                 else:
                     self.status_var.set(
                         f"Linked vocabulary not found: {os.path.basename(linked_vocab)}"
+                    )
+
+            # Auto-load the gaze CSV pair linked to this project, if any.
+            self.gaze_points_by_frame = None
+            self.gaze_csv_path = None
+            self.gaze_world_path = None
+            self.show_gaze_var.set(True)
+            self.show_gaze_checkbutton.config(state=tk.DISABLED)
+            linked_gaze_csv = getattr(self.project, "gaze_csv_path", None)
+            linked_gaze_world = getattr(self.project, "gaze_world_path", None)
+            if linked_gaze_csv and linked_gaze_world:
+                if os.path.isfile(linked_gaze_csv) and os.path.isfile(linked_gaze_world):
+                    self.load_gaze_csv(linked_gaze_csv, linked_gaze_world,
+                                        link_to_project=False, silent=True)
+                else:
+                    self.status_var.set(
+                        f"Linked gaze CSV not found: {os.path.basename(linked_gaze_csv)}"
                     )
 
             _tp4 = _time.perf_counter()
@@ -2892,7 +2947,7 @@ class SAM3VideoUI:
                                   (255, 255, 255), 1)
 
             # Gaze position overlay (gaze x/y are in native video coords -> scale to display)
-            if self.gaze_points_by_frame:
+            if self.gaze_points_by_frame and self.show_gaze_var.get():
                 gaze_pts = self.gaze_points_by_frame.get(self.current_frame_idx)
                 if gaze_pts:
                     frame_rgb = np.ascontiguousarray(frame_rgb).copy()
