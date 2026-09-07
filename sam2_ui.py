@@ -549,9 +549,10 @@ class SAM2VideoUI:
                                         bg='#404040', fg='white', insertbackground='white')
         self.object_spinbox.pack(side=tk.LEFT, padx=(5, 5))
 
-        # Object color indicator
-        self.object_color_label = ttk.Label(current_obj_frame, text="",
-                                           foreground='cyan', font=('Arial', 16))
+        # Object color indicator (a real colored swatch - the unicode block char
+        # renders as an empty box in the default Linux Tk font)
+        self.object_color_label = tk.Label(current_obj_frame, text="  ",
+                                           relief=tk.SOLID, borderwidth=1)
         self.object_color_label.pack(side=tk.LEFT, padx=(5, 0))
 
         # Object name entry
@@ -598,6 +599,9 @@ class SAM2VideoUI:
 
         self.object_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         tree_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # SAM3-covered objects are read-only in this UI - show them greyed out
+        self.object_tree.tag_configure("covered", foreground="gray")
 
         self.object_tree.bind('<ButtonRelease-1>', self.on_object_tree_select)
 
@@ -1214,12 +1218,17 @@ class SAM2VideoUI:
 
             # Insert into tree (show [SAM3] and/or * markers)
             display_name = self.object_names[obj_id]
-            if obj_id in self.sam3_object_ids:
+            row_tags = ()
+            if obj_id in self.sam2_covered_ids:
+                display_name += " [SAM3-covered]"
+                row_tags = ("covered",)
+            elif obj_id in self.sam3_object_ids:
                 display_name += " [SAM3]"
             if obj_id in self.updated_objects:
                 display_name += " *"
             item = self.object_tree.insert("", "end", text=str(obj_id),
-                                          values=(display_name, point_count))
+                                          values=(display_name, point_count),
+                                          tags=row_tags)
             
             # Highlight current object
             if obj_id == self.current_object_id:
@@ -2761,9 +2770,12 @@ class SAM2VideoUI:
 
     def update_object_color_display(self):
         """Update the color indicator for the current object"""
-        color = self.object_colors[self.current_object_id]
-        # Display a colored square using unicode block character
-        self.object_color_label.config(text="■", foreground=self._rgb_to_hex(color))
+        if self.current_object_id in self.sam2_covered_ids:
+            # SAM3-covered object: read-only here, shown greyed out
+            self.object_color_label.config(background='#808080')
+        else:
+            color = self.object_colors[self.current_object_id]
+            self.object_color_label.config(background=self._rgb_to_hex(color))
     def add_new_object(self):
         """Add a new object for segmentation"""
         self.max_object_id += 1
